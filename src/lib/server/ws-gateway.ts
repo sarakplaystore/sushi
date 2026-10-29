@@ -3,7 +3,7 @@ import type { Duplex } from "node:stream";
 import { WebSocketServer, type WebSocket } from "ws";
 import type { ClientChannel } from "ssh2";
 import type { ConnectionCredentials } from "@/types/connection";
-import { verifyGatewayTokenFromHeaders } from "./security";
+import { verifyRequestAccess } from "./security";
 import { connectSsh, type ConnectedSshSession } from "./ssh-client";
 import { bridgeRdpToGuacd } from "./guacd-bridge";
 
@@ -82,10 +82,13 @@ export function createGatewayWebSockets(): GatewayUpgradeDispatcher {
       }
 
       if (msg.type === "auth" && !authenticated) {
-        const tokenCheck = verifyGatewayTokenFromHeaders(
-          req.headers,
-          (typeof msg.gatewayToken === "string" ? msg.gatewayToken : null) || queryToken
-        );
+        const querySession = reqUrl.searchParams.get("session");
+        const explicitToken =
+          (typeof msg.sessionToken === "string" ? msg.sessionToken : null) ||
+          (typeof msg.gatewayToken === "string" ? msg.gatewayToken : null) ||
+          querySession ||
+          queryToken;
+        const tokenCheck = await verifyRequestAccess(req.headers, explicitToken);
         if (!tokenCheck.ok) {
           sendJson({ type: "error", message: tokenCheck.error });
           ws.close(1008, "Unauthorized");
@@ -192,8 +195,9 @@ export function createGatewayWebSockets(): GatewayUpgradeDispatcher {
 
   rdpWss.on("connection", async (ws: WebSocket, req: IncomingMessage) => {
     const reqUrl = new URL(req.url || "/ws/rdp", "http://localhost");
-    const queryToken = reqUrl.searchParams.get("token");
-    const auth = verifyGatewayTokenFromHeaders(req.headers, queryToken);
+    const queryToken =
+      reqUrl.searchParams.get("session") || reqUrl.searchParams.get("token");
+    const auth = await verifyRequestAccess(req.headers, queryToken);
 
     if (!auth.ok) {
       ws.close(1008, "769");

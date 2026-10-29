@@ -9,7 +9,7 @@ import {
   sftpRenameItem,
   sftpWriteBuffer,
 } from "@/lib/server/ssh-client";
-import { getCorsHeaders, verifyGatewayTokenFromHeaders } from "@/lib/server/security";
+import { getCorsHeaders, verifyRequestAccess } from "@/lib/server/security";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -59,7 +59,7 @@ type SftpOperationPayload =
 
 export async function POST(req: NextRequest) {
   const cors = getCorsHeaders(req.headers.get("origin"));
-  const auth = verifyGatewayTokenFromHeaders(req.headers);
+  const auth = await verifyRequestAccess(req.headers);
   if (!auth.ok) {
     return NextResponse.json({ ok: false, error: auth.error }, { status: 401, headers: cors });
   }

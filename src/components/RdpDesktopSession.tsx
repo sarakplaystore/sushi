@@ -23,6 +23,7 @@ import {
   buildWebSocketUrl,
   getAuthHeaders,
 } from "@/lib/client/gateway";
+import { getStoredSessionToken } from "@/lib/client/auth-storage";
 import { downloadRdpFile } from "@/lib/client/rdp-file";
 
 interface RdpDesktopSessionProps {
@@ -269,6 +270,10 @@ export function RdpDesktopSession({
       );
 
       const queryParts = [`payload=${encodeURIComponent(payload)}`];
+      const sessionToken = getStoredSessionToken();
+      if (sessionToken) {
+        queryParts.push(`session=${encodeURIComponent(sessionToken)}`);
+      }
       if (gatewaySettings.gatewayToken) {
         queryParts.push(
           `token=${encodeURIComponent(gatewaySettings.gatewayToken)}`

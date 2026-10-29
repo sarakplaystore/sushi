@@ -28,6 +28,7 @@ import {
 } from "lucide-react";
 import type { HostProfile, SftpEntry } from "@/types/connection";
 import { type GatewaySettings, getAuthHeaders } from "@/lib/client/gateway";
+import { getStoredSessionToken } from "@/lib/client/auth-storage";
 
 interface SftpBrowserSessionProps {
   profile: HostProfile;
@@ -333,6 +334,10 @@ export function SftpBrowserSession({
       }
 
       const headers: Record<string, string> = {};
+      const sessionToken = getStoredSessionToken();
+      if (sessionToken) {
+        headers["X-Sushi-Session"] = sessionToken;
+      }
       if (gatewaySettings.gatewayToken) {
         headers["X-Sushi-Token"] = gatewaySettings.gatewayToken;
       }

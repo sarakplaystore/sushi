@@ -22,6 +22,15 @@ import {
   parseGuacDaemonStream,
 } from "../src/lib/server/guacd-bridge";
 import { createGatewayWebSockets } from "../src/lib/server/ws-gateway";
+import {
+  createChallengeToken,
+  createSessionToken,
+  getEffectiveAuthConfig,
+  issueSignedPasskeyCertificate,
+  verifyChallengeToken,
+  verifyIncomingAuth,
+  verifySignedPasskeyCertificates,
+} from "../src/lib/server/auth";
 
 const OPEN_MODE = {
   READ: 0x00000001,
@@ -329,7 +338,64 @@ async function runTests() {
   assert.equal(rdpRes.reachable, true);
   assert.ok(rdpRes.supportedProtocols.includes("Standard RDP"));
 
-  console.log("==> [4/5] Testing WebSocket SSH PTY & Guacamole RDP Bridge (/ws/ssh & /ws/rdp)...");
+  console.log("==> [4/6] Testing Username/Password + Passkey Certificate & Session Protection...");
+  process.env.SUSHI_AUTH_USERNAME = "sushiadmin";
+  process.env.SUSHI_AUTH_PASSWORD = "correct-horse-battery";
+  process.env.SUSHI_AUTH_SECRET = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+  const authCfg = await getEffectiveAuthConfig();
+  assert.equal(authCfg.initialized, true);
+  assert.equal(await authCfg.verifyPassword("correct-horse-battery"), true);
+  assert.equal(await authCfg.verifyPassword("wrong-password"), false);
+
+  // Verify unauthenticated request is rejected
+  const unauthCheck = await verifyIncomingAuth(new Headers());
+  assert.equal(unauthCheck.ok, false);
+
+  // Issue valid session token and verify access
+  const validSessionToken = createSessionToken(authCfg.username, authCfg.authSecret);
+  const authedHeaders = new Headers({ "x-sushi-session": validSessionToken });
+  const authedCheck = await verifyIncomingAuth(authedHeaders);
+  assert.equal(authedCheck.ok, true);
+  assert.equal(authedCheck.username, "sushiadmin");
+
+  // Verify WebAuthn challenge signing & stateless Passkey HMAC certificate
+  const chTok = createChallengeToken(
+    {
+      challenge: "test-webauthn-challenge-xyz",
+      rpID: "localhost",
+      origin: "http://localhost:3000",
+      purpose: "login",
+    },
+    authCfg.authSecret
+  );
+  const verifiedCh = verifyChallengeToken(chTok, "login", authCfg.authSecret);
+  assert.equal(verifiedCh?.challenge, "test-webauthn-challenge-xyz");
+  assert.equal(verifyChallengeToken(chTok, "register", authCfg.authSecret), null);
+
+  const signedCert = issueSignedPasskeyCertificate(
+    {
+      id: "cred-id-123",
+      publicKey: "cHVibGljLWtleS1ieXRlcw",
+      counter: 1,
+      label: "Test YubiKey",
+      deviceType: "singleDevice",
+      backedUp: false,
+      createdAt: Date.now(),
+    },
+    authCfg.username,
+    authCfg.authSecret
+  );
+  const tamperedCert = signedCert.slice(0, -4) + "AAAA";
+  const verifiedCerts = verifySignedPasskeyCertificates(
+    [signedCert, tamperedCert],
+    authCfg.username,
+    authCfg.authSecret
+  );
+  assert.equal(verifiedCerts.length, 1);
+  assert.equal(verifiedCerts[0].id, "cred-id-123");
+
+  console.log("==> [5/6] Testing Protected WebSocket SSH PTY & Guacamole RDP Bridge (/ws/ssh & /ws/rdp)...");
   // Start mock guacd daemon
   const guacdMock = net.createServer({ allowHalfOpen: true }, (sock) => {
     sock.setEncoding("utf8");
@@ -377,7 +443,22 @@ async function runTests() {
   await new Promise<void>((resolve) => httpServer.listen(0, "127.0.0.1", () => resolve()));
   const gwPort = (httpServer.address() as net.AddressInfo).port;
 
-  // Test /ws/ssh interactive shell
+  // Verify unauthenticated /ws/ssh is rejected!
+  await new Promise<void>((resolve, reject) => {
+    const ws = new WebSocket(`ws://127.0.0.1:${gwPort}/ws/ssh`);
+    ws.on("error", reject);
+    ws.on("open", () => {
+      ws.send(JSON.stringify({ type: "auth", cols: 80, rows: 24, credentials: creds }));
+    });
+    ws.on("message", (raw) => {
+      const msg = JSON.parse(raw.toString("utf8"));
+      if (msg.type === "error" && /Authentication required|Unauthorized/i.test(msg.message)) {
+        resolve();
+      }
+    });
+  });
+
+  // Test authenticated /ws/ssh interactive shell
   await new Promise<void>((resolve, reject) => {
     const ws = new WebSocket(`ws://127.0.0.1:${gwPort}/ws/ssh`);
     let outputAcc = "";
@@ -386,6 +467,7 @@ async function runTests() {
       ws.send(
         JSON.stringify({
           type: "auth",
+          sessionToken: validSessionToken,
           cols: 100,
           rows: 30,
           credentials: creds,
@@ -421,7 +503,7 @@ async function runTests() {
     ).toString("base64url");
 
     const ws = new WebSocket(
-      `ws://127.0.0.1:${gwPort}/ws/rdp?payload=${encodeURIComponent(payload)}`,
+      `ws://127.0.0.1:${gwPort}/ws/rdp?payload=${encodeURIComponent(payload)}&session=${encodeURIComponent(validSessionToken)}`,
       "guacamole"
     );
 
@@ -450,12 +532,12 @@ async function runTests() {
     });
   });
 
-  console.log("==> [5/5] Cleaning up test servers...");
+  console.log("==> [6/6] Cleaning up test servers...");
   httpServer.close();
   guacdMock.close();
   rdpMock.close();
   sshServer.close();
-  console.log("ALL SSH, SFTP, AND RDP E2E PROTOCOL TESTS PASSED!");
+  console.log("ALL AUTH, PASSKEY, SSH, SFTP, AND RDP E2E TESTS PASSED!");
 }
 
 runTests().catch((err) => {

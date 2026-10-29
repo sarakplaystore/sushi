@@ -10,6 +10,10 @@ It is designed around a **Hybrid VPS + Serverless Architecture**:
 
 ## Features
 
+- **Username, Password & WebAuthn Passkey Protection**
+  - Full login gate guarding the Sushi UI, SSH/SFTP/RDP API routes, Vault sync, and `/ws/ssh` & `/ws/rdp` WebSockets
+  - First-run interactive admin setup on VPS (`scrypt`-hashed in `/data/auth.json`) + environment variable setup (`SUSHI_AUTH_USERNAME` / `SUSHI_AUTH_PASSWORD` / `SUSHI_AUTH_SECRET`) on Vercel
+  - **FIDO2 / WebAuthn Passkeys** (`@simplewebauthn/server` & `@simplewebauthn/browser`) for Touch ID, Face ID, Windows Hello, and YubiKey — stored on disk on VPS and backed by HMAC-signed passkey certificates (`+ optional SUSHI_PASSKEYS_JSON`) on stateless Vercel
 - **SSH Terminal (`@xterm/xterm` + `ssh2`)**
   - Live bidirectional **WebSocket PTY** (`/ws/ssh`) on VPS/Gateway (`vim`, `htop`, `tmux`, resize, 256-color ANSI)
   - Automatic **Serverless HTTP Streaming Shell** (`/api/ssh/exec`) fallback on Vercel with persistent working directory (`cd`), command history, and Ctrl+C cancellation

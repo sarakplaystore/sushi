@@ -1,0 +1,9 @@
+node_modules
+.next
+.git
+.vercel
+npm-debug.log*
+.env
+.env*.local
+data/*.json
+data/*.enc*

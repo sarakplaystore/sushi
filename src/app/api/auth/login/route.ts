@@ -1,10 +1,12 @@
 import crypto from "node:crypto";
 import { NextRequest, NextResponse } from "next/server";
 import {
+  attachAdminProfileCookie,
   attachSessionCookie,
   checkLoginRateLimit,
   clearLoginFailures,
   createSessionToken,
+  extractAdminCertFromHeaders,
   getEffectiveAuthConfig,
   recordLoginFailure,
 } from "@/lib/server/auth";
@@ -39,7 +41,13 @@ export async function POST(req: NextRequest) {
   }
 
   try {
-    const cfg = await getEffectiveAuthConfig();
+    const body = (await req.json()) as {
+      username?: string;
+      password?: string;
+      adminProfileCert?: string;
+    };
+
+    const cfg = await getEffectiveAuthConfig(req.headers, body?.adminProfileCert);
     if (!cfg.initialized) {
       return NextResponse.json(
         {
@@ -50,16 +58,17 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const body = (await req.json()) as {
-      username?: string;
-      password?: string;
-    };
-
     const providedUser = (body?.username || "").trim();
     const providedPass = body?.password ?? "";
 
-    const userHashA = crypto.createHash("sha256").update(providedUser, "utf8").digest();
-    const userHashB = crypto.createHash("sha256").update(cfg.username, "utf8").digest();
+    const userHashA = crypto
+      .createHash("sha256")
+      .update(providedUser, "utf8")
+      .digest();
+    const userHashB = crypto
+      .createHash("sha256")
+      .update(cfg.username, "utf8")
+      .digest();
     const userMatches = crypto.timingSafeEqual(userHashA, userHashB);
     const passMatches = await cfg.verifyPassword(providedPass);
 
@@ -83,12 +92,20 @@ export async function POST(req: NextRequest) {
       { headers: cors }
     );
     attachSessionCookie(res, sessionToken, req);
+
+    const activeAdminCert = extractAdminCertFromHeaders(
+      req.headers,
+      body?.adminProfileCert
+    );
+    if (activeAdminCert) {
+      attachAdminProfileCookie(res, activeAdminCert, req);
+    }
     return res;
   } catch (err) {
     return NextResponse.json(
       {
         ok: false,
-        error: err instanceof Error ? err.message : "Authentication error.",
+        error: err instanceof Error ? err.message : "Authentication failed.",
       },
       { status: 500, headers: cors }
     );

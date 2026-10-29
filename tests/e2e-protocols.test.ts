@@ -23,6 +23,7 @@ import {
 } from "../src/lib/server/guacd-bridge";
 import { createGatewayWebSockets } from "../src/lib/server/ws-gateway";
 import {
+  bootstrapAdminAccount,
   createChallengeToken,
   createSessionToken,
   getEffectiveAuthConfig,
@@ -31,6 +32,15 @@ import {
   verifyIncomingAuth,
   verifySignedPasskeyCertificates,
 } from "../src/lib/server/auth";
+import {
+  generateEd25519KeyPair,
+  verifyPrivateKeyAgainstWhitelist,
+} from "../src/lib/server/ssh-key-utils";
+import {
+  exportToTermixFile,
+  importFromTermixContent,
+} from "../src/lib/client/termix-porter";
+import { resolveProfileWithKeychain } from "../src/lib/client/crypto-vault";
 
 const OPEN_MODE = {
   READ: 0x00000001,
@@ -395,7 +405,194 @@ async function runTests() {
   assert.equal(verifiedCerts.length, 1);
   assert.equal(verifiedCerts[0].id, "cred-id-123");
 
-  console.log("==> [5/6] Testing Protected WebSocket SSH PTY & Guacamole RDP Bridge (/ws/ssh & /ws/rdp)...");
+  // Verify Interactive Stateless Vercel Setup (VERCEL="1" without SUSHI_AUTH_USERNAME)
+  delete process.env.SUSHI_AUTH_USERNAME;
+  delete process.env.SUSHI_AUTH_PASSWORD;
+  process.env.VERCEL = "1";
+  const uninitVercelCfg = await getEffectiveAuthConfig(new Headers());
+  assert.equal(uninitVercelCfg.initialized, false);
+  assert.equal(uninitVercelCfg.canBootstrapInteractive, true);
+
+  const loginKp = generateEd25519KeyPair("vercel-admin@sushi");
+  const rogueKp = generateEd25519KeyPair("rogue@attacker");
+  const bootstrappedVercel = await bootstrapAdminAccount(
+    "verceladmin",
+    "vercel-pass-123",
+    [loginKp.record]
+  );
+  assert.equal(bootstrappedVercel.persistedOnDisk, false);
+  assert.ok(bootstrappedVercel.adminProfileCert);
+
+  const vercelHeaders = new Headers({
+    "x-sushi-admin-cert": bootstrappedVercel.adminProfileCert,
+  });
+  const initVercelCfg = await getEffectiveAuthConfig(vercelHeaders);
+  assert.equal(initVercelCfg.initialized, true);
+  assert.equal(initVercelCfg.username, "verceladmin");
+  assert.equal(await initVercelCfg.verifyPassword("vercel-pass-123"), true);
+  assert.equal(await initVercelCfg.verifyPassword("wrong"), false);
+
+  // Verify Whitelisted Private Key Cryptographic Login
+  const okKeyAuth = verifyPrivateKeyAgainstWhitelist(
+    loginKp.privateKey,
+    undefined,
+    initVercelCfg.authorizedKeys
+  );
+  assert.equal(okKeyAuth.ok, true);
+  if (okKeyAuth.ok) {
+    assert.equal(okKeyAuth.matchedKey.fingerprint, loginKp.record.fingerprint);
+  }
+  // Rogue private key must be rejected
+  const rogueKeyAuth = verifyPrivateKeyAgainstWhitelist(
+    rogueKp.privateKey,
+    undefined,
+    initVercelCfg.authorizedKeys
+  );
+  assert.equal(rogueKeyAuth.ok, false);
+  // Submitting only the public key must be rejected!
+  const pubOnlyAttempt = verifyPrivateKeyAgainstWhitelist(
+    loginKp.publicKey,
+    undefined,
+    initVercelCfg.authorizedKeys
+  );
+  assert.equal(pubOnlyAttempt.ok, false);
+
+  // Restore env for WS tests below
+  delete process.env.VERCEL;
+  process.env.SUSHI_AUTH_USERNAME = "sushiadmin";
+  process.env.SUSHI_AUTH_PASSWORD = "correct-horse-battery";
+
+  // Verify Vault SSH Key Whitelist Enforcement & Termix Export/Import Round-Trip
+  console.log("==> [5/7] Testing Vault Key Whitelist Enforcement & Termix File Export/Import...");
+  const whitelistedVaultKey = {
+    id: "vault-key-1",
+    name: "Prod Ed25519",
+    privateKey: loginKp.privateKey,
+    publicKey: loginKp.publicKey,
+    fingerprint: loginKp.record.fingerprint,
+    keyType: "ssh-ed25519",
+    createdAt: Date.now(),
+  };
+
+  // Unwhitelisted inline key blocked when enforceKeyWhitelist = true
+  const blockedInline = resolveProfileWithKeychain(
+    {
+      id: "h1",
+      name: "rogue-host",
+      protocol: "ssh",
+      host: "10.0.0.5",
+      port: 22,
+      username: "ubuntu",
+      authMethod: "privateKey",
+      privateKey: rogueKp.privateKey,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    },
+    [whitelistedVaultKey],
+    true
+  );
+  assert.equal(blockedInline.ok, false);
+
+  // Linked whitelisted key succeeds when enforceKeyWhitelist = true
+  const allowedLinked = resolveProfileWithKeychain(
+    {
+      id: "h2",
+      name: "prod-ssh",
+      protocol: "ssh",
+      host: "10.0.0.10",
+      port: 2222,
+      username: "deploy",
+      authMethod: "privateKey",
+      sshKeyId: "vault-key-1",
+      group: "Production",
+      tags: ["web", "tokyo"],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    },
+    [whitelistedVaultKey],
+    true
+  );
+  assert.equal(allowedLinked.ok, true);
+  if (allowedLinked.ok) {
+    assert.equal(allowedLinked.profile.privateKey, loginKp.privateKey);
+  }
+
+  // Termix Export -> Import round-trip (SSH Key + RDP protocolAuth)
+  const sampleRdpHost = {
+    id: "h3",
+    name: "win-bastion",
+    protocol: "rdp" as const,
+    host: "10.0.0.50",
+    port: 3389,
+    username: "Administrator",
+    authMethod: "password" as const,
+    password: "WinPass!99",
+    domain: "CORP",
+    rdpSecurity: "nla" as const,
+    ignoreCert: true,
+    group: "Windows",
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+  };
+  const exportedTermix = exportToTermixFile(
+    [allowedLinked.ok ? allowedLinked.profile : sampleRdpHost, sampleRdpHost],
+    [whitelistedVaultKey],
+    { shareMode: false }
+  );
+  assert.equal(exportedTermix.hosts.length, 2);
+  assert.equal(exportedTermix.credentials?.length, 1);
+
+  const reimported = importFromTermixContent(
+    JSON.stringify(exportedTermix),
+    []
+  );
+  assert.equal(reimported.detectedFormat, "termix-host-export");
+  assert.equal(reimported.hosts.length, 2);
+  assert.equal(reimported.sshKeys.length, 1);
+  assert.equal(reimported.hosts[0].host, "10.0.0.10");
+  assert.equal(reimported.hosts[0].port, 2222);
+  assert.equal(reimported.hosts[0].authMethod, "privateKey");
+  assert.equal(reimported.hosts[1].protocol, "rdp");
+  assert.equal(reimported.hosts[1].domain, "CORP");
+  assert.equal(reimported.hosts[1].password, "WinPass!99");
+
+  // Also test Termix v2.0 User Data Export format
+  const termixV2 = JSON.stringify({
+    version: "v2.0",
+    exportedAt: new Date().toISOString(),
+    userData: {
+      sshCredentials: [
+        {
+          id: 77,
+          name: "Cluster Key",
+          authType: "key",
+          username: "ec2-user",
+          key: loginKp.privateKey,
+        },
+      ],
+      sshHosts: [
+        {
+          id: 1,
+          name: "aws-node-01",
+          ip: "198.51.100.88",
+          port: 22,
+          authType: "credential",
+          credentialId: 77,
+          folder: "AWS",
+          tags: "prod,k8s",
+        },
+      ],
+    },
+    metadata: { encrypted: false },
+  });
+  const importedV2 = importFromTermixContent(termixV2, []);
+  assert.equal(importedV2.detectedFormat, "termix-user-data-v2");
+  assert.equal(importedV2.hosts.length, 1);
+  assert.equal(importedV2.hosts[0].username, "ec2-user");
+  assert.equal(importedV2.hosts[0].authMethod, "privateKey");
+  assert.deepEqual(importedV2.hosts[0].tags, ["prod", "k8s"]);
+
+  console.log("==> [6/7] Testing Protected WebSocket SSH PTY & Guacamole RDP Bridge (/ws/ssh & /ws/rdp)...");
   // Start mock guacd daemon
   const guacdMock = net.createServer({ allowHalfOpen: true }, (sock) => {
     sock.setEncoding("utf8");
@@ -532,12 +729,12 @@ async function runTests() {
     });
   });
 
-  console.log("==> [6/6] Cleaning up test servers...");
+  console.log("==> [7/7] Cleaning up test servers...");
   httpServer.close();
   guacdMock.close();
   rdpMock.close();
   sshServer.close();
-  console.log("ALL AUTH, PASSKEY, SSH, SFTP, AND RDP E2E TESTS PASSED!");
+  console.log("ALL AUTH, PASSKEY, KEY WHITELIST, TERMIX, SSH, SFTP, AND RDP E2E TESTS PASSED!");
 }
 
 runTests().catch((err) => {

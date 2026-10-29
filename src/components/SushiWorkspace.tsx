@@ -22,6 +22,9 @@ import {
   CheckCircle2,
   Fingerprint,
   Loader2,
+  ArrowLeftRight,
+  KeyRound,
+  AlertCircle,
 } from "lucide-react";
 import type { AuthStatusResponse } from "@/types/auth";
 import type {
@@ -30,6 +33,7 @@ import type {
   ProtocolType,
   SessionTab,
   SystemCapabilities,
+  WhitelistedSshKey,
 } from "@/types/connection";
 import {
   DEFAULT_SNIPPETS,
@@ -38,6 +42,7 @@ import {
   decryptVaultEnvelope,
   encryptVaultData,
   loadLocalEnvelope,
+  resolveProfileWithKeychain,
   saveLocalEnvelope,
 } from "@/lib/client/crypto-vault";
 import {
@@ -50,13 +55,17 @@ import {
 } from "@/lib/client/gateway";
 import { HostProfileModal } from "./HostProfileModal";
 import { GatewaySetupModal } from "./GatewaySetupModal";
-import { VaultSecurityModal } from "./VaultSecurityModal";
+import { VaultSecurityModal, type VaultModalTab } from "./VaultSecurityModal";
 import { AuthGateScreen } from "./AuthGateScreen";
 import { AccountPasskeysModal } from "./AccountPasskeysModal";
 import { SshTerminalSession } from "./SshTerminalSession";
 import { SftpBrowserSession } from "./SftpBrowserSession";
 import { RdpDesktopSession } from "./RdpDesktopSession";
-import { getStoredPasskeyCertificates } from "@/lib/client/auth-storage";
+import {
+  getStoredAdminProfileCert,
+  getStoredAuthorizedKeyCertificates,
+  getStoredPasskeyCertificates,
+} from "@/lib/client/auth-storage";
 
 export function SushiWorkspace() {
   // Authentication & Passkey Gate state
@@ -85,6 +94,11 @@ export function SushiWorkspace() {
 
   const [hosts, setHosts] = useState<HostProfile[]>([]);
   const [snippets, setSnippets] = useState<CommandSnippet[]>(DEFAULT_SNIPPETS);
+  const [sshKeys, setSshKeys] = useState<WhitelistedSshKey[]>([]);
+  const [enforceKeyWhitelist, setEnforceKeyWhitelist] = useState(false);
+  const [whitelistBannerError, setWhitelistBannerError] = useState<string | null>(
+    null
+  );
 
   // Navigation & Tabs
   const [sidebarOpen, setSidebarOpen] = useState(true);
@@ -101,6 +115,8 @@ export function SushiWorkspace() {
     useState<Partial<HostProfile> | null>(null);
   const [gatewayModalOpen, setGatewayModalOpen] = useState(false);
   const [vaultModalOpen, setVaultModalOpen] = useState(false);
+  const [vaultModalTab, setVaultModalTab] =
+    useState<VaultModalTab>("security");
 
   const searchInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -123,10 +139,16 @@ export function SushiWorkspace() {
     const gw = loadGatewaySettings();
     try {
       const certs = getStoredPasskeyCertificates().map((c) => c.cert);
+      const keyCerts = getStoredAuthorizedKeyCertificates().map((c) => c.cert);
+      const adminCert = getStoredAdminProfileCert();
       const res = await fetch("/api/auth/status", {
         method: "POST",
         headers: getAuthHeaders(gw),
-        body: JSON.stringify({ signedCertificates: certs }),
+        body: JSON.stringify({
+          signedCertificates: certs,
+          signedKeyCertificates: keyCerts,
+          adminProfileCert: adminCert || undefined,
+        }),
       });
       if (res.ok) {
         const statusData = (await res.json()) as AuthStatusResponse;
@@ -210,6 +232,8 @@ export function SushiWorkspace() {
         const plain = await decryptVaultEnvelope(envelope);
         setHosts(plain.hosts);
         setSnippets(plain.snippets);
+        setSshKeys(plain.sshKeys || []);
+        setEnforceKeyWhitelist(Boolean(plain.enforceKeyWhitelist));
       } catch {
         setHosts([]);
       }
@@ -233,7 +257,9 @@ export function SushiWorkspace() {
       nextHosts: HostProfile[],
       nextSnippets: CommandSnippet[],
       passphraseOverride?: string | null,
-      explicitMode?: "device" | "passphrase"
+      explicitMode?: "device" | "passphrase",
+      nextSshKeys?: WhitelistedSshKey[],
+      nextEnforceWhitelist?: boolean
     ) => {
       const targetMode = explicitMode ?? vaultMode;
       const passToUse =
@@ -246,6 +272,8 @@ export function SushiWorkspace() {
           version: 1,
           hosts: nextHosts,
           snippets: nextSnippets,
+          sshKeys: nextSshKeys ?? sshKeys,
+          enforceKeyWhitelist: nextEnforceWhitelist ?? enforceKeyWhitelist,
         },
         passToUse
       );
@@ -264,7 +292,14 @@ export function SushiWorkspace() {
         }
       }
     },
-    [activePassphrase, gatewaySettings, localCaps?.serverVault, vaultMode]
+    [
+      activePassphrase,
+      enforceKeyWhitelist,
+      gatewaySettings,
+      localCaps?.serverVault,
+      sshKeys,
+      vaultMode,
+    ]
   );
 
   const openSessionTab = useCallback(
@@ -274,19 +309,31 @@ export function SushiWorkspace() {
       overrideInitialPath?: string
     ) => {
       const proto = overrideProtocol || profile.protocol;
+      const resolved = resolveProfileWithKeychain(
+        { ...profile, protocol: proto },
+        sshKeys,
+        enforceKeyWhitelist
+      );
+      if (!resolved.ok) {
+        setWhitelistBannerError(resolved.error);
+        setActiveTabId("launchpad");
+        return;
+      }
+      setWhitelistBannerError(null);
+
       const tabId = `tab-${crypto.randomUUID()}`;
       const newTab: SessionTab = {
         id: tabId,
         title: `${profile.name}`,
         protocol: proto,
-        profile: { ...profile, protocol: proto },
+        profile: resolved.profile,
         initialPath: overrideInitialPath ?? profile.initialPath,
         createdAt: Date.now(),
       };
       setTabs((prev) => [...prev, newTab]);
       setActiveTabId(tabId);
     },
-    []
+    [enforceKeyWhitelist, sshKeys]
   );
 
   const closeSessionTab = (tabId: string, e?: React.MouseEvent) => {
@@ -357,6 +404,8 @@ export function SushiWorkspace() {
       const plain = await decryptVaultEnvelope(pendingEnvelope, unlockInput);
       setHosts(plain.hosts);
       setSnippets(plain.snippets);
+      setSshKeys(plain.sshKeys || []);
+      setEnforceKeyWhitelist(Boolean(plain.enforceKeyWhitelist));
       setActivePassphrase(unlockInput);
       setUnlockInput("");
       setVaultLocked(false);
@@ -417,8 +466,10 @@ export function SushiWorkspace() {
             authenticated: false,
             initialized: false,
             canBootstrapOnDisk: true,
+            canBootstrapInteractive: true,
             mode: "vps",
             passkeyCount: 0,
+            authorizedKeyCount: 0,
             envConfigured: false,
           }
         }
@@ -724,22 +775,38 @@ export function SushiWorkspace() {
               </span>
             </button>
 
-            <div className="grid grid-cols-2 gap-1.5">
+            <div className="grid grid-cols-3 gap-1.5">
               <button
                 type="button"
-                onClick={() => setGatewayModalOpen(true)}
-                className="flex items-center justify-center gap-1.5 rounded-xl border border-white/8 bg-[#131823] px-2.5 py-2 text-xs font-medium text-slate-200 transition hover:border-white/18 hover:bg-white/8"
+                onClick={() => {
+                  setVaultModalTab("termix");
+                  setVaultModalOpen(true);
+                }}
+                className="flex items-center justify-center gap-1 rounded-xl border border-white/8 bg-[#131823] px-2 py-2 text-[11px] font-medium text-slate-200 transition hover:border-white/18 hover:bg-white/8"
+                title="Import or Export Termix JSON"
               >
-                <Radio className="h-3.5 w-3.5 text-[#ff6b57]" />
-                Gateway
+                <ArrowLeftRight className="h-3.5 w-3.5 text-[#ff6b57]" />
+                Termix
               </button>
               <button
                 type="button"
-                onClick={() => setVaultModalOpen(true)}
-                className="flex items-center justify-center gap-1.5 rounded-xl border border-white/8 bg-[#131823] px-2.5 py-2 text-xs font-medium text-slate-200 transition hover:border-white/18 hover:bg-white/8"
+                onClick={() => {
+                  setVaultModalTab("keys");
+                  setVaultModalOpen(true);
+                }}
+                className="flex items-center justify-center gap-1 rounded-xl border border-white/8 bg-[#131823] px-2 py-2 text-[11px] font-medium text-slate-200 transition hover:border-white/18 hover:bg-white/8"
+                title="Whitelisted SSH Keys & Vault"
               >
-                <Shield className="h-3.5 w-3.5 text-emerald-400" />
-                Vault
+                <KeyRound className="h-3.5 w-3.5 text-emerald-400" />
+                Keys
+              </button>
+              <button
+                type="button"
+                onClick={() => setGatewayModalOpen(true)}
+                className="flex items-center justify-center gap-1 rounded-xl border border-white/8 bg-[#131823] px-2 py-2 text-[11px] font-medium text-slate-200 transition hover:border-white/18 hover:bg-white/8"
+              >
+                <Radio className="h-3.5 w-3.5 text-sky-400" />
+                Gateway
               </button>
             </div>
           </div>
@@ -842,6 +909,26 @@ export function SushiWorkspace() {
             }
           >
             <div className="mx-auto max-w-5xl space-y-8">
+              {whitelistBannerError && (
+                <div className="flex items-center justify-between gap-3 rounded-xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-xs text-rose-200">
+                  <span className="flex items-center gap-2">
+                    <AlertCircle className="h-4 w-4 shrink-0 text-rose-400" />
+                    {whitelistBannerError}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setWhitelistBannerError(null);
+                      setVaultModalTab("keys");
+                      setVaultModalOpen(true);
+                    }}
+                    className="shrink-0 rounded-lg bg-rose-500/20 px-3 py-1 font-semibold text-rose-100 hover:bg-rose-500/30"
+                  >
+                    Open Key Whitelist
+                  </button>
+                </div>
+              )}
+
               {/* Hero & Quick Connect Command Bar */}
               <div className="rounded-2xl border border-white/10 bg-gradient-to-b from-[#131824] to-[#0e121b] p-6 shadow-xl sm:p-7">
                 <div className="flex flex-wrap items-center justify-between gap-4">
@@ -857,11 +944,33 @@ export function SushiWorkspace() {
                   <div className="flex flex-wrap items-center gap-2">
                     <button
                       type="button"
+                      onClick={() => {
+                        setVaultModalTab("termix");
+                        setVaultModalOpen(true);
+                      }}
+                      className="inline-flex items-center gap-1.5 rounded-xl border border-white/12 bg-white/5 px-3.5 py-2 text-xs font-medium text-slate-200 transition hover:bg-white/10"
+                    >
+                      <ArrowLeftRight className="h-3.5 w-3.5 text-[#ff6b57]" />
+                      Termix Import / Export
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setVaultModalTab("keys");
+                        setVaultModalOpen(true);
+                      }}
+                      className="inline-flex items-center gap-1.5 rounded-xl border border-white/12 bg-white/5 px-3.5 py-2 text-xs font-medium text-slate-200 transition hover:bg-white/10"
+                    >
+                      <KeyRound className="h-3.5 w-3.5 text-emerald-400" />
+                      SSH Key Whitelist ({sshKeys.length})
+                    </button>
+                    <button
+                      type="button"
                       onClick={() => setAccountModalOpen(true)}
                       className="inline-flex items-center gap-1.5 rounded-xl border border-white/12 bg-white/5 px-3.5 py-2 text-xs font-medium text-slate-200 transition hover:bg-white/10"
                     >
                       <Fingerprint className="h-3.5 w-3.5 text-[#ff6b57]" />
-                      Account &amp; Passkeys
+                      Account &amp; Login Keys
                     </button>
                     <button
                       type="button"
@@ -1153,6 +1262,20 @@ export function SushiWorkspace() {
         isOpen={hostModalOpen}
         initialProfile={editingProfile}
         gatewaySettings={gatewaySettings}
+        sshKeys={sshKeys}
+        enforceKeyWhitelist={enforceKeyWhitelist}
+        onAddWhitelistedKey={async (newKey) => {
+          const nextKeys = [...sshKeys, newKey];
+          setSshKeys(nextKeys);
+          await persistVault(
+            hosts,
+            snippets,
+            undefined,
+            undefined,
+            nextKeys,
+            enforceKeyWhitelist
+          );
+        }}
         onClose={() => {
           setHostModalOpen(false);
           setEditingProfile(null);
@@ -1179,9 +1302,13 @@ export function SushiWorkspace() {
 
       <VaultSecurityModal
         isOpen={vaultModalOpen}
+        initialTab={vaultModalTab}
         vaultMode={vaultMode}
         serverVaultEnabled={Boolean(localCaps?.serverVault)}
-        hostCount={hosts.length}
+        hosts={hosts}
+        sshKeys={sshKeys}
+        enforceKeyWhitelist={enforceKeyWhitelist}
+        gatewaySettings={gatewaySettings}
         onClose={() => setVaultModalOpen(false)}
         onSetPassphrase={async (pass) => {
           if (pass) {
@@ -1202,9 +1329,57 @@ export function SushiWorkspace() {
         onExportEnvelope={() => loadLocalEnvelope()}
         onImportEnvelope={async (env, pass) => {
           const plain = await decryptVaultEnvelope(env, pass);
+          const nextKeys = plain.sshKeys || [];
+          const nextEnforce = Boolean(plain.enforceKeyWhitelist);
           setHosts(plain.hosts);
           setSnippets(plain.snippets);
-          await persistVault(plain.hosts, plain.snippets);
+          setSshKeys(nextKeys);
+          setEnforceKeyWhitelist(nextEnforce);
+          await persistVault(
+            plain.hosts,
+            plain.snippets,
+            undefined,
+            undefined,
+            nextKeys,
+            nextEnforce
+          );
+        }}
+        onUpdateKeychain={async (nextKeys, nextEnforce) => {
+          setSshKeys(nextKeys);
+          setEnforceKeyWhitelist(nextEnforce);
+          await persistVault(
+            hosts,
+            snippets,
+            undefined,
+            undefined,
+            nextKeys,
+            nextEnforce
+          );
+        }}
+        onApplyTermixImport={async (
+          importedHosts,
+          importedKeys,
+          replaceExisting
+        ) => {
+          const mergedHosts = replaceExisting
+            ? importedHosts
+            : [...importedHosts, ...hosts];
+          const mergedKeys = [...sshKeys];
+          for (const k of importedKeys) {
+            if (!mergedKeys.some((ek) => ek.privateKey.trim() === k.privateKey.trim())) {
+              mergedKeys.push(k);
+            }
+          }
+          setHosts(mergedHosts);
+          setSshKeys(mergedKeys);
+          await persistVault(
+            mergedHosts,
+            snippets,
+            undefined,
+            undefined,
+            mergedKeys,
+            enforceKeyWhitelist
+          );
         }}
       />
 

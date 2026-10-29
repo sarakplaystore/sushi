@@ -40,7 +40,16 @@ import {
   exportToTermixFile,
   importFromTermixContent,
 } from "../src/lib/client/termix-porter";
+import {
+  importTermixSqliteDatabase,
+  looksLikeTermixDatabaseFile,
+  parseTermixEnvSecrets,
+} from "../src/lib/client/termix-sqlite";
 import { resolveProfileWithKeychain } from "../src/lib/client/crypto-vault";
+import {
+  buildTermixFixture,
+  termixEncryptDatabaseTwoFile,
+} from "./fixtures/termix-sqlite-fixture";
 
 const OPEN_MODE = {
   READ: 0x00000001,
@@ -63,7 +72,7 @@ interface MemNode {
 }
 
 async function runTests() {
-  console.log("==> [1/5] Starting ephemeral SSH2 + SFTP test server...");
+  console.log("==> [1/8] Starting ephemeral SSH2 + SFTP test server...");
   const { privateKey } = crypto.generateKeyPairSync("rsa", {
     modulusLength: 2048,
     privateKeyEncoding: { type: "pkcs1", format: "pem" },
@@ -273,7 +282,7 @@ async function runTests() {
   await new Promise<void>((resolve) => sshServer.listen(0, "127.0.0.1", () => resolve()));
   const sshPort = (sshServer.address() as net.AddressInfo).port;
 
-  console.log("==> [2/5] Testing SSH password + Ed25519 private key authentication & SFTP operations...");
+  console.log("==> [2/8] Testing SSH password + Ed25519 private key authentication & SFTP operations...");
   const passTest = await testSshConnection({
     host: "127.0.0.1",
     port: sshPort,
@@ -321,7 +330,7 @@ async function runTests() {
   const listAfterDel = await sftpListDirectory(creds, "/");
   assert.equal(listAfterDel.entries.some((e) => e.name === "configs"), false);
 
-  console.log("==> [3/5] Testing MS-RDPBCGR X.224 RDP Server Probe...");
+  console.log("==> [3/8] Testing MS-RDPBCGR X.224 RDP Server Probe...");
   const rdpMock = net.createServer((sock) => {
     sock.once("data", (data) => {
       // Verify TPKT v3 & X.224 CR (0xE0)
@@ -348,7 +357,7 @@ async function runTests() {
   assert.equal(rdpRes.reachable, true);
   assert.ok(rdpRes.supportedProtocols.includes("Standard RDP"));
 
-  console.log("==> [4/6] Testing Username/Password + Passkey Certificate & Session Protection...");
+  console.log("==> [4/8] Testing Username/Password + Passkey Certificate & Session Protection...");
   process.env.SUSHI_AUTH_USERNAME = "sushiadmin";
   process.env.SUSHI_AUTH_PASSWORD = "correct-horse-battery";
   process.env.SUSHI_AUTH_SECRET = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -463,7 +472,7 @@ async function runTests() {
   process.env.SUSHI_AUTH_PASSWORD = "correct-horse-battery";
 
   // Verify Vault SSH Key Whitelist Enforcement & Termix Export/Import Round-Trip
-  console.log("==> [5/7] Testing Vault Key Whitelist Enforcement & Termix File Export/Import...");
+  console.log("==> [5/8] Testing Vault Key Whitelist Enforcement & Termix File Export/Import...");
   const whitelistedVaultKey = {
     id: "vault-key-1",
     name: "Prod Ed25519",
@@ -592,7 +601,148 @@ async function runTests() {
   assert.equal(importedV2.hosts[0].authMethod, "privateKey");
   assert.deepEqual(importedV2.hosts[0].tags, ["prod", "k8s"]);
 
-  console.log("==> [6/7] Testing Protected WebSocket SSH PTY & Guacamole RDP Bridge (/ws/ssh & /ws/rdp)...");
+  console.log("==> [6/8] Testing Termix SQLite database import (db.sqlite & db.sqlite.encrypted)...");
+  const termixFx = await buildTermixFixture({ sshTestPort: sshPort });
+  assert.equal(looksLikeTermixDatabaseFile(termixFx.encryptedFile, "db.sqlite.encrypted"), true);
+  assert.equal(looksLikeTermixDatabaseFile(termixFx.sqlite, "backup.bin"), true);
+  assert.equal(looksLikeTermixDatabaseFile(new TextEncoder().encode(termixV2), "export.json"), false);
+
+  // .env parsing: Termix .env file, docker-compose style, and a bare hex key
+  const parsedEnv = parseTermixEnvSecrets(termixFx.envFile);
+  assert.equal(Buffer.from(parsedEnv.databaseKey!).toString("hex"), termixFx.databaseKeyHex);
+  assert.equal(Buffer.from(parsedEnv.encryptionKey!).toString("hex"), termixFx.encryptionKeyHex);
+  const composeEnv = parseTermixEnvSecrets(`  - DATABASE_KEY: "${termixFx.databaseKeyHex}"`);
+  assert.equal(Buffer.from(composeEnv.databaseKey!).toString("hex"), termixFx.databaseKeyHex);
+  assert.equal(parseTermixEnvSecrets(termixFx.databaseKeyHex).bareKey, true);
+
+  // Encrypted at rest: needs DATABASE_KEY and rejects a wrong one
+  const lockedDb = await importTermixSqliteDatabase(termixFx.encryptedFile);
+  assert.equal(lockedDb.status, "needs_database_key");
+  assert.equal(lockedDb.fileKind, "termix-encrypted-v2");
+  const wrongKeyDb = await importTermixSqliteDatabase(termixFx.encryptedFile, {
+    termixEnv: `DATABASE_KEY=${"ab".repeat(32)}`,
+  });
+  assert.equal(wrongKeyDb.status, "needs_database_key");
+  assert.match(wrongKeyDb.message ?? "", /could not decrypt/);
+
+  // DATABASE_KEY alone opens the file, but per-user secrets stay sealed
+  const dbKeyOnly = await importTermixSqliteDatabase(termixFx.encryptedFile, {
+    termixEnv: termixFx.databaseKeyHex,
+  });
+  assert.equal(dbKeyOnly.status, "ok");
+  assert.equal(dbKeyOnly.secrets.decrypted, 0);
+  assert.ok(dbKeyOnly.secrets.locked > 0);
+  assert.ok(dbKeyOnly.warnings.some((w) => w.includes("ENCRYPTION_KEY")));
+  assert.ok(dbKeyOnly.warnings.some((w) => w.includes("bob") && w.includes("password")));
+
+  // Full Termix .env (v3 ENCRYPTION_KEY data keys) + Termix 2.x account password
+  const termixDb = await importTermixSqliteDatabase(termixFx.encryptedFile, {
+    termixEnv: termixFx.envFile,
+    termixPassword: termixFx.bobPassword,
+  });
+  assert.equal(termixDb.status, "ok");
+  assert.equal(termixDb.fileKind, "termix-encrypted-v2");
+  assert.equal(termixDb.secrets.locked, 0);
+  assert.equal(termixDb.skippedHosts, 1); // VNC-only host
+  assert.equal(termixDb.hosts.length, 8);
+  const tHost = (name: string) => termixDb.hosts.find((h) => h.name === name);
+  assert.equal(tHost("web-01")?.password, "Sup3rSecret!");
+  assert.equal(tHost("web-01")?.group, "Production/Web");
+  assert.deepEqual(tHost("web-01")?.tags, ["web", "prod", "pinned"]);
+  assert.equal(tHost("web-01")?.notes, "Primary nginx node");
+  assert.equal(tHost("db-01")?.username, "deploy");
+  assert.equal(tHost("db-01")?.authMethod, "privateKey");
+  assert.match(tHost("db-01")?.notes ?? "", /jump hosts: web-01/);
+  assert.equal(tHost("build-box")?.port, 2222);
+  assert.equal(tHost("build-box")?.passphrase, "kp-123");
+  assert.equal(tHost("win-bastion")?.protocol, "rdp");
+  assert.equal(tHost("win-bastion")?.username, "Administrator");
+  assert.equal(tHost("win-bastion")?.password, "WinCred!42");
+  assert.equal(tHost("win-bastion")?.domain, "CORP");
+  assert.equal(tHost("win-bastion")?.rdpSecurity, "nla");
+  assert.equal(tHost("win-bastion")?.ignoreCert, true);
+  assert.equal(tHost("dual-stack")?.protocol, "ssh");
+  assert.equal(tHost("dual-stack")?.password, "ssh-dual-pass");
+  assert.equal(tHost("dual-stack (RDP)")?.port, 3390);
+  assert.equal(tHost("dual-stack (RDP)")?.username, "rdpuser");
+  assert.equal(tHost("dual-stack (RDP)")?.password, "rdp-dual-pass");
+  assert.equal(tHost("dual-stack (RDP)")?.domain, "LAB");
+  assert.equal(tHost("dual-stack (RDP)")?.rdpSecurity, "tls");
+  assert.match(tHost("dual-stack")?.notes ?? "", /SOCKS5 proxy: proxy\.lan:1080/);
+  assert.equal(tHost("bob-pi")?.password, "raspberry");
+  assert.equal(termixDb.sshKeys.length, 2);
+  const importedClusterKey = termixDb.sshKeys.find((k) => k.name === "Prod Cluster Key");
+  assert.equal(importedClusterKey?.fingerprint, termixFx.clusterKey.fingerprint);
+  assert.equal(importedClusterKey?.keyType, "ssh-ed25519");
+  assert.equal(
+    importedClusterKey?.publicKey?.split(" ").slice(0, 2).join(" "),
+    termixFx.clusterKey.publicKey.split(" ").slice(0, 2).join(" ")
+  );
+  assert.equal(tHost("db-01")?.sshKeyId, importedClusterKey?.id);
+  assert.equal(
+    termixDb.sshKeys.find((k) => k.id === tHost("build-box")?.sshKeyId)?.fingerprint,
+    termixFx.buildKey.fingerprint
+  );
+  assert.deepEqual(termixDb.snippets.map((s) => s.command).sort(), ["df -h", "vcgencmd measure_temp"]);
+  const termixAdmin = termixDb.users.find((u) => u.username === "admin");
+  const termixBob = termixDb.users.find((u) => u.username === "bob");
+  assert.equal(termixAdmin?.unlockMethod, "encryption_key");
+  assert.equal(termixBob?.unlockMethod, "password");
+
+  // An imported Termix host connects through the enforced Vault key whitelist
+  const termixE2eHost = tHost("sushi-e2e");
+  assert.ok(termixE2eHost);
+  assert.equal(termixE2eHost.username, "tester"); // override_credential_username
+  const resolvedTermixHost = resolveProfileWithKeychain(termixE2eHost, termixDb.sshKeys, true);
+  assert.equal(resolvedTermixHost.ok, true);
+  if (resolvedTermixHost.ok) {
+    const termixSshTest = await testSshConnection({
+      host: resolvedTermixHost.profile.host,
+      port: resolvedTermixHost.profile.port,
+      username: resolvedTermixHost.profile.username,
+      authMethod: "privateKey",
+      privateKey: resolvedTermixHost.profile.privateKey,
+    });
+    assert.equal(termixSshTest.ok, true);
+  }
+
+  // Per-user scope on a plain db.sqlite, keychain de-duplication & legacy two-file layout
+  const bobOnly = await importTermixSqliteDatabase(termixFx.sqlite, {
+    termixEnv: termixFx.envFile,
+    termixPassword: termixFx.bobPassword,
+    onlyUserId: termixBob!.id,
+  });
+  assert.equal(bobOnly.fileKind, "sqlite");
+  assert.deepEqual(bobOnly.hosts.map((h) => h.name), ["bob-pi"]);
+  assert.deepEqual(bobOnly.snippets.map((s) => s.title), ["Pi temp"]);
+  assert.equal(bobOnly.sshKeys.length, 0);
+
+  const existingClusterKey = {
+    id: "existing-cluster",
+    name: "Cluster (already whitelisted)",
+    privateKey: termixFx.clusterKey.privateKey,
+    fingerprint: termixFx.clusterKey.fingerprint,
+    createdAt: Date.now(),
+  };
+  const dedupedDb = await importTermixSqliteDatabase(termixFx.sqlite, {
+    termixEnv: termixFx.envFile,
+    existingSshKeys: [existingClusterKey],
+  });
+  assert.equal(dedupedDb.sshKeys.length, 1);
+  assert.equal(dedupedDb.hosts.find((h) => h.name === "db-01")?.sshKeyId, "existing-cluster");
+
+  const twoFileDb = termixEncryptDatabaseTwoFile(
+    termixFx.sqlite,
+    Buffer.from(termixFx.databaseKeyHex, "hex")
+  );
+  const twoFileImport = await importTermixSqliteDatabase(twoFileDb.encrypted, {
+    termixEnv: termixFx.envFile,
+    metaJson: twoFileDb.metaJson,
+  });
+  assert.equal(twoFileImport.status, "ok");
+  assert.equal(twoFileImport.hosts.length, termixDb.hosts.length);
+
+  console.log("==> [7/8] Testing Protected WebSocket SSH PTY & Guacamole RDP Bridge (/ws/ssh & /ws/rdp)...");
   // Start mock guacd daemon
   const guacdMock = net.createServer({ allowHalfOpen: true }, (sock) => {
     sock.setEncoding("utf8");
@@ -729,7 +879,7 @@ async function runTests() {
     });
   });
 
-  console.log("==> [7/7] Cleaning up test servers...");
+  console.log("==> [8/8] Cleaning up test servers...");
   httpServer.close();
   guacdMock.close();
   rdpMock.close();

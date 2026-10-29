@@ -1,4 +1,5 @@
 import type {
+  CommandSnippet,
   HostProfile,
   ProtocolType,
   RdpSecurityMode,
@@ -69,9 +70,12 @@ export interface TermixExportFile {
 export interface TermixImportSummary {
   hosts: HostProfile[];
   sshKeys: WhitelistedSshKey[];
+  /** Command snippets (Termix SQLite databases include the `snippets` table). */
+  snippets?: CommandSnippet[];
   detectedFormat:
     | "termix-host-export"
     | "termix-user-data-v2"
+    | "termix-sqlite"
     | "ssh-config"
     | "sushi-hosts";
   warnings: string[];

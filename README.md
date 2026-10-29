@@ -14,7 +14,8 @@ It is designed around a **Hybrid VPS + Serverless Architecture**:
   - Interactive first-run Admin Setup directly in the browser on **both VPS and Vercel** (no manual env copy-paste required!), plus optional `SUSHI_AUTH_USERNAME` / `SUSHI_AUTH_PASSWORD` / `SUSHI_AUTHORIZED_KEYS` environment overrides
   - **Whitelisted Private Key Login & SSH Keychain**: Sign in to Sushi using an `ed25519` / `rsa` / `ecdsa` private key verified via cryptographic challenge signature against whitelisted public keys, and optionally enforce a strict **Vault SSH Key Whitelist** across all SSH/SFTP server connections
   - **FIDO2 / WebAuthn Passkeys** (`@simplewebauthn/server` & `@simplewebauthn/browser`) for Touch ID, Face ID, Windows Hello, and YubiKey
-- **Termix File Import & Export (`Termix-SSH/Termix`)**
+- **Termix Import & Export (`Termix-SSH/Termix`)**
+  - **Termix SQLite database import**: drop in Termix's `db.sqlite` or its default encrypted-at-rest `db.sqlite.encrypted` (plus the legacy `.meta` two-file layout) to import hosts, SSH/RDP logins, credential-library keys, and command snippets
   - Seamless import from Termix Host Export (`.json`), Termix Share Export, Termix v2.0 User Data Export, and OpenSSH `~/.ssh/config` — plus 1-click export to Termix JSON (with or without secrets)
 - **SSH Terminal (`@xterm/xterm` + `ssh2`)**
   - Live bidirectional **WebSocket PTY** (`/ws/ssh`) on VPS/Gateway (`vim`, `htop`, `tmux`, resize, 256-color ANSI)
@@ -32,6 +33,23 @@ It is designed around a **Hybrid VPS + Serverless Architecture**:
 - **AES-256-GCM Encrypted Credential Vault**
   - Client-side WebCrypto `AES-256-GCM` encryption (automatic device key or `PBKDF2-SHA256` Master Passphrase lock)
   - Portable encrypted JSON backup import/export + automatic `/data/vault.enc.json` sync when self-hosted on a VPS
+
+---
+
+## Importing a Termix SQLite Database
+
+1. Copy the database and its key file from your Termix server (Docker data dir `/app/data`):
+   ```bash
+   docker cp termix:/app/data/db.sqlite.encrypted .
+   docker cp termix:/app/data/.env termix.env
+   ```
+2. In Sushi, open **Vault → Termix Import / Export**, drop `db.sqlite.encrypted`, and paste (or load) `termix.env`:
+   - `DATABASE_KEY` decrypts the `db.sqlite.encrypted` file itself.
+   - `ENCRYPTION_KEY` unwraps each Termix user's data key, decrypting saved passwords, private keys, key passphrases, and RDP logins.
+   - Older **Termix 2.x** accounts whose data key is still wrapped by the account password can be unlocked by entering that Termix password.
+3. Pick which Termix user to import (or all users), review the preview, then **Merge** or **Replace**. Re-importing skips hosts that already exist.
+
+The database is parsed with SQLite compiled to WebAssembly (`sql.js`) and decrypted with WebCrypto **entirely in your browser** — the file, your Termix keys, and the decrypted secrets are never uploaded to the Sushi server, so there's no Vercel request-size limit either. Termix SSH and SFTP hosts become Sushi SSH/SFTP profiles, RDP logins (`host_protocol_auth` and legacy 2.8 `rdp_*` columns) become RDP profiles, credential-library private keys are added to the Vault SSH Key Whitelist (with `SHA256:` fingerprints), and jump-host/SOCKS5 settings are kept in host notes. VNC/Telnet-only hosts are skipped.
 
 ---
 

@@ -783,7 +783,7 @@ export function SushiWorkspace() {
                   setVaultModalOpen(true);
                 }}
                 className="flex items-center justify-center gap-1 rounded-xl border border-white/8 bg-[#131823] px-2 py-2 text-[11px] font-medium text-slate-200 transition hover:border-white/18 hover:bg-white/8"
-                title="Import or Export Termix JSON"
+                title="Import a Termix SQLite database or JSON export, or export to Termix"
               >
                 <ArrowLeftRight className="h-3.5 w-3.5 text-[#ff6b57]" />
                 Termix
@@ -1359,27 +1359,87 @@ export function SushiWorkspace() {
         onApplyTermixImport={async (
           importedHosts,
           importedKeys,
-          replaceExisting
+          replaceExisting,
+          importedSnippets = []
         ) => {
-          const mergedHosts = replaceExisting
-            ? importedHosts
-            : [...importedHosts, ...hosts];
+          // 1. Merge SSH keys, re-pointing hosts at an existing keychain entry
+          //    when the same key (text or fingerprint) is already whitelisted.
           const mergedKeys = [...sshKeys];
+          const keyIdRemap = new Map<string, string>();
+          let addedKeys = 0;
           for (const k of importedKeys) {
-            if (!mergedKeys.some((ek) => ek.privateKey.trim() === k.privateKey.trim())) {
+            const existing = mergedKeys.find(
+              (ek) =>
+                ek.privateKey.trim() === k.privateKey.trim() ||
+                Boolean(k.fingerprint && ek.fingerprint === k.fingerprint)
+            );
+            if (existing) {
+              if (existing.id !== k.id) keyIdRemap.set(k.id, existing.id);
+            } else {
               mergedKeys.push(k);
+              addedKeys++;
             }
           }
+
+          // 2. Merge hosts, skipping exact duplicates of hosts already in Sushi
+          const hostSignature = (h: HostProfile) =>
+            [
+              h.protocol,
+              h.host.trim().toLowerCase(),
+              h.port,
+              h.username.trim().toLowerCase(),
+              h.name.trim().toLowerCase(),
+            ].join("|");
+          const baseHosts = replaceExisting ? [] : hosts;
+          const seen = new Set(baseHosts.map(hostSignature));
+          const newHosts: HostProfile[] = [];
+          let skippedHosts = 0;
+          for (const h of importedHosts) {
+            const sig = hostSignature(h);
+            if (seen.has(sig)) {
+              skippedHosts++;
+              continue;
+            }
+            seen.add(sig);
+            newHosts.push(
+              h.sshKeyId && keyIdRemap.has(h.sshKeyId)
+                ? { ...h, sshKeyId: keyIdRemap.get(h.sshKeyId) }
+                : h
+            );
+          }
+          const mergedHosts = [...newHosts, ...baseHosts];
+
+          // 3. Merge command snippets (Termix SQLite `snippets` table)
+          const mergedSnippets = [...snippets];
+          let addedSnippets = 0;
+          for (const s of importedSnippets) {
+            if (
+              !mergedSnippets.some(
+                (es) => es.title === s.title && es.command === s.command
+              )
+            ) {
+              mergedSnippets.push(s);
+              addedSnippets++;
+            }
+          }
+
           setHosts(mergedHosts);
           setSshKeys(mergedKeys);
+          setSnippets(mergedSnippets);
           await persistVault(
             mergedHosts,
-            snippets,
+            mergedSnippets,
             undefined,
             undefined,
             mergedKeys,
             enforceKeyWhitelist
           );
+          return {
+            addedHosts: newHosts.length,
+            skippedHosts,
+            addedKeys,
+            addedSnippets,
+          };
         }}
       />
 

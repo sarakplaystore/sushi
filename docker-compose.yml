@@ -1,0 +1,42 @@
+services:
+  sushi:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: sushi
+    restart: unless-stopped
+    ports:
+      - "${PORT:-3000}:3000"
+    environment:
+      - NODE_ENV=production
+      - HOST=0.0.0.0
+      - PORT=3000
+      - GUACD_HOST=guacd
+      - GUACD_PORT=4822
+      - DATA_DIR=/app/data
+      - SUSHI_SERVER_VAULT=${SUSHI_SERVER_VAULT:-true}
+      - SUSHI_GATEWAY_TOKEN=${SUSHI_GATEWAY_TOKEN:-}
+      - ALLOWED_ORIGIN=${ALLOWED_ORIGIN:-*}
+      - BLOCK_PRIVATE_NETWORKS=${BLOCK_PRIVATE_NETWORKS:-false}
+    volumes:
+      - sushi-data:/app/data
+    depends_on:
+      - guacd
+    networks:
+      - sushi-net
+
+  guacd:
+    image: guacamole/guacd:1.5.5
+    container_name: sushi-guacd
+    restart: unless-stopped
+    environment:
+      - GUACD_LOG_LEVEL=info
+    networks:
+      - sushi-net
+
+volumes:
+  sushi-data:
+
+networks:
+  sushi-net:
+    driver: bridge

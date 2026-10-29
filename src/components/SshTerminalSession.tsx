@@ -23,6 +23,7 @@ import {
   buildWebSocketUrl,
   getAuthHeaders,
 } from "@/lib/client/gateway";
+import { getStoredSessionToken } from "@/lib/client/auth-storage";
 
 interface SshTerminalSessionProps {
   profile: HostProfile;
@@ -455,6 +456,7 @@ export function SshTerminalSession({
           ws.send(
             JSON.stringify({
               type: "auth",
+              sessionToken: getStoredSessionToken() || undefined,
               gatewayToken: gatewaySettings.gatewayToken || undefined,
               cols: term.cols || 100,
               rows: term.rows || 30,

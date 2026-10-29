@@ -1,4 +1,5 @@
 import type { ProtocolType } from "@/types/connection";
+import { getStoredSessionToken } from "./auth-storage";
 
 export interface GatewaySettings {
   gatewayUrl: string; // e.g. "" (local/same-origin) or "https://sushi-gw.example.com"
@@ -85,6 +86,10 @@ export function getAuthHeaders(settings: GatewaySettings): Record<string, string
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
   };
+  const sessionToken = getStoredSessionToken();
+  if (sessionToken) {
+    headers["X-Sushi-Session"] = sessionToken;
+  }
   if (settings.gatewayToken) {
     headers["X-Sushi-Token"] = settings.gatewayToken;
   }

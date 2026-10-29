@@ -1,6 +1,7 @@
 import dns from "node:dns/promises";
 import net from "node:net";
 import type { IncomingMessage } from "node:http";
+import { verifyIncomingAuth } from "./auth";
 
 const METADATA_IPS = new Set([
   "169.254.169.254",
@@ -82,48 +83,32 @@ export async function validateTargetHost(host: string, port: number): Promise<vo
     if (err instanceof Error && err.message.includes("BLOCK_PRIVATE_NETWORKS")) {
       throw err;
     }
-    // Allow connection attempt to surface a clear socket/DNS error downstream
   }
 }
 
-export function verifyGatewayTokenFromHeaders(
+export async function verifyRequestAccess(
   headers: Headers | IncomingMessage["headers"],
-  queryToken?: string | null
-): { ok: boolean; error?: string } {
-  const configuredToken = process.env.SUSHI_GATEWAY_TOKEN?.trim();
-  if (!configuredToken) {
-    return { ok: true };
-  }
-
-  let provided = queryToken?.trim() || "";
-  if (!provided) {
-    if (headers instanceof Headers) {
-      provided =
-        headers.get("x-sushi-token")?.trim() ||
-        headers.get("authorization")?.replace(/^Bearer\s+/i, "").trim() ||
-        "";
-    } else {
-      const rawHeader = headers["x-sushi-token"] || headers["authorization"];
-      const val = Array.isArray(rawHeader) ? rawHeader[0] : rawHeader;
-      provided = (val || "").replace(/^Bearer\s+/i, "").trim();
-    }
-  }
-
-  if (!provided || provided !== configuredToken) {
-    return {
-      ok: false,
-      error: "Unauthorized: valid SUSHI_GATEWAY_TOKEN required.",
-    };
-  }
-  return { ok: true };
+  explicitSessionOrToken?: string | null
+): Promise<{ ok: boolean; username?: string; error?: string }> {
+  return verifyIncomingAuth(headers, explicitSessionOrToken);
 }
 
 export function getCorsHeaders(origin?: string | null): Record<string, string> {
-  const allowedOrigin = process.env.ALLOWED_ORIGIN?.trim() || origin || "*";
-  return {
-    "Access-Control-Allow-Origin": allowedOrigin,
+  const configuredOrigin = process.env.ALLOWED_ORIGIN?.trim();
+  const effectiveOrigin =
+    configuredOrigin && configuredOrigin !== "*"
+      ? configuredOrigin
+      : origin || "*";
+
+  const headers: Record<string, string> = {
+    "Access-Control-Allow-Origin": effectiveOrigin,
     "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Sushi-Token",
+    "Access-Control-Allow-Headers":
+      "Content-Type, Authorization, X-Sushi-Token, X-Sushi-Session",
     "Access-Control-Max-Age": "86400",
   };
+  if (effectiveOrigin !== "*") {
+    headers["Access-Control-Allow-Credentials"] = "true";
+  }
+  return headers;
 }

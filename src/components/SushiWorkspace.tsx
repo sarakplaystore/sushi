@@ -20,7 +20,10 @@ import {
   Server,
   Cloud,
   CheckCircle2,
+  Fingerprint,
+  Loader2,
 } from "lucide-react";
+import type { AuthStatusResponse } from "@/types/auth";
 import type {
   CommandSnippet,
   HostProfile,
@@ -48,11 +51,20 @@ import {
 import { HostProfileModal } from "./HostProfileModal";
 import { GatewaySetupModal } from "./GatewaySetupModal";
 import { VaultSecurityModal } from "./VaultSecurityModal";
+import { AuthGateScreen } from "./AuthGateScreen";
+import { AccountPasskeysModal } from "./AccountPasskeysModal";
 import { SshTerminalSession } from "./SshTerminalSession";
 import { SftpBrowserSession } from "./SftpBrowserSession";
 import { RdpDesktopSession } from "./RdpDesktopSession";
+import { getStoredPasskeyCertificates } from "@/lib/client/auth-storage";
 
 export function SushiWorkspace() {
+  // Authentication & Passkey Gate state
+  const [authChecking, setAuthChecking] = useState(true);
+  const [authStatus, setAuthStatus] = useState<AuthStatusResponse | null>(null);
+  const [authUsername, setAuthUsername] = useState<string>("admin");
+  const [accountModalOpen, setAccountModalOpen] = useState(false);
+
   // Capabilities & Gateway settings
   const [localCaps, setLocalCaps] = useState<SystemCapabilities | null>(null);
   const [remoteCaps, setRemoteCaps] = useState<SystemCapabilities | null>(null);
@@ -107,82 +119,114 @@ export function SushiWorkspace() {
     return () => window.removeEventListener("keydown", handler);
   }, [activeTabId]);
 
-  // Boot capabilities + encrypted vault
-  useEffect(() => {
-    async function init() {
-      const gw = loadGatewaySettings();
-      setGatewaySettings(gw);
+  const refreshAuthStatus = useCallback(async () => {
+    const gw = loadGatewaySettings();
+    try {
+      const certs = getStoredPasskeyCertificates().map((c) => c.cert);
+      const res = await fetch("/api/auth/status", {
+        method: "POST",
+        headers: getAuthHeaders(gw),
+        body: JSON.stringify({ signedCertificates: certs }),
+      });
+      if (res.ok) {
+        const statusData = (await res.json()) as AuthStatusResponse;
+        setAuthStatus(statusData);
+        if (statusData.username) {
+          setAuthUsername(statusData.username);
+        }
+        return statusData;
+      }
+    } catch {
+      // ignore
+    } finally {
+      setAuthChecking(false);
+    }
+    return null;
+  }, []);
 
-      let fetchedLocalCaps: SystemCapabilities | null = null;
+  const bootAuthenticatedWorkspace = useCallback(async () => {
+    const gw = loadGatewaySettings();
+    setGatewaySettings(gw);
+
+    let fetchedLocalCaps: SystemCapabilities | null = null;
+    try {
+      const res = await fetch("/api/system/capabilities", {
+        headers: getAuthHeaders(gw),
+      });
+      if (res.ok) {
+        fetchedLocalCaps = (await res.json()) as SystemCapabilities;
+        setLocalCaps(fetchedLocalCaps);
+      }
+    } catch {
+      // ignore
+    }
+
+    if (gw.gatewayUrl) {
       try {
-        const res = await fetch("/api/system/capabilities");
-        if (res.ok) {
-          fetchedLocalCaps = (await res.json()) as SystemCapabilities;
-          setLocalCaps(fetchedLocalCaps);
+        const httpBase = resolveGatewayHttpBase(gw.gatewayUrl);
+        const rRes = await fetch(`${httpBase}/api/system/capabilities`, {
+          headers: getAuthHeaders(gw),
+        });
+        if (rRes.ok) {
+          setRemoteCaps((await rRes.json()) as SystemCapabilities);
         }
       } catch {
         // ignore
       }
+    }
 
-      if (gw.gatewayUrl) {
-        try {
-          const httpBase = resolveGatewayHttpBase(gw.gatewayUrl);
-          const rRes = await fetch(`${httpBase}/api/system/capabilities`, {
-            headers: getAuthHeaders(gw),
-          });
-          if (rRes.ok) {
-            setRemoteCaps((await rRes.json()) as SystemCapabilities);
+    // Load local encrypted vault, or fallback to VPS /api/vault if local is empty
+    let envelope = loadLocalEnvelope();
+    if (!envelope && fetchedLocalCaps?.serverVault) {
+      try {
+        const vRes = await fetch("/api/vault", {
+          headers: getAuthHeaders(gw),
+        });
+        if (vRes.ok) {
+          const vData = await vRes.json();
+          if (vData?.envelope?.ciphertext) {
+            envelope = vData.envelope as EncryptedVaultEnvelope;
+            saveLocalEnvelope(envelope);
           }
-        } catch {
-          // ignore
         }
-      }
-
-      // Load local encrypted vault, or fallback to VPS /api/vault if local is empty
-      let envelope = loadLocalEnvelope();
-      if (!envelope && fetchedLocalCaps?.serverVault) {
-        try {
-          const vRes = await fetch("/api/vault", {
-            headers: getAuthHeaders(gw),
-          });
-          if (vRes.ok) {
-            const vData = await vRes.json();
-            if (vData?.envelope?.ciphertext) {
-              envelope = vData.envelope as EncryptedVaultEnvelope;
-              saveLocalEnvelope(envelope);
-            }
-          }
-        } catch {
-          // ignore
-        }
-      }
-
-      if (!envelope) {
-        setVaultMode("device");
-        setVaultReady(true);
-        return;
-      }
-
-      setVaultMode(envelope.mode);
-      if (envelope.mode === "passphrase") {
-        setPendingEnvelope(envelope);
-        setVaultLocked(true);
-        setVaultReady(true);
-      } else {
-        try {
-          const plain = await decryptVaultEnvelope(envelope);
-          setHosts(plain.hosts);
-          setSnippets(plain.snippets);
-        } catch {
-          // Device key mismatch (e.g. synced from another browser without passphrase)
-          setHosts([]);
-        }
-        setVaultReady(true);
+      } catch {
+        // ignore
       }
     }
 
-    void init();
+    if (!envelope) {
+      setVaultMode("device");
+      setVaultReady(true);
+      return;
+    }
+
+    setVaultMode(envelope.mode);
+    if (envelope.mode === "passphrase") {
+      setPendingEnvelope(envelope);
+      setVaultLocked(true);
+      setVaultReady(true);
+    } else {
+      try {
+        const plain = await decryptVaultEnvelope(envelope);
+        setHosts(plain.hosts);
+        setSnippets(plain.snippets);
+      } catch {
+        setHosts([]);
+      }
+      setVaultReady(true);
+    }
   }, []);
+
+  // Boot auth check + workspace
+  useEffect(() => {
+    async function init() {
+      const statusData = await refreshAuthStatus();
+      if (statusData?.authenticated) {
+        await bootAuthenticatedWorkspace();
+      }
+    }
+    void init();
+  }, [refreshAuthStatus, bootAuthenticatedWorkspace]);
 
   const persistVault = useCallback(
     async (
@@ -354,6 +398,44 @@ export function SushiWorkspace() {
     },
     {}
   );
+
+  // Authentication & Passkey Gate
+  if (authChecking) {
+    return (
+      <div className="flex h-full w-full items-center justify-center bg-[#090b10]">
+        <Loader2 className="h-6 w-6 animate-spin text-[#ff6b57]" />
+      </div>
+    );
+  }
+
+  if (!authStatus?.authenticated) {
+    return (
+      <AuthGateScreen
+        authStatus={
+          authStatus || {
+            ok: true,
+            authenticated: false,
+            initialized: false,
+            canBootstrapOnDisk: true,
+            mode: "vps",
+            passkeyCount: 0,
+            envConfigured: false,
+          }
+        }
+        onAuthenticated={async (loggedInUser) => {
+          setAuthUsername(loggedInUser);
+          await refreshAuthStatus();
+          await bootAuthenticatedWorkspace();
+        }}
+        onRefreshStatus={async () => {
+          const s = await refreshAuthStatus();
+          if (s?.authenticated) {
+            await bootAuthenticatedWorkspace();
+          }
+        }}
+      />
+    );
+  }
 
   // Vault Unlock Gate
   if (vaultReady && vaultLocked) {
@@ -627,23 +709,39 @@ export function SushiWorkspace() {
           </div>
 
           {/* Sidebar Bottom Controls */}
-          <div className="grid grid-cols-2 gap-1.5 border-t border-white/8 p-3">
+          <div className="space-y-1.5 border-t border-white/8 p-3">
             <button
               type="button"
-              onClick={() => setGatewayModalOpen(true)}
-              className="flex items-center justify-center gap-1.5 rounded-xl border border-white/8 bg-[#131823] px-2.5 py-2 text-xs font-medium text-slate-200 transition hover:border-white/18 hover:bg-white/8"
+              onClick={() => setAccountModalOpen(true)}
+              className="flex w-full items-center justify-between rounded-xl border border-white/8 bg-[#131823] px-3 py-2 text-xs font-medium text-slate-200 transition hover:border-white/18 hover:bg-white/8"
             >
-              <Radio className="h-3.5 w-3.5 text-[#ff6b57]" />
-              Gateway
+              <span className="flex min-w-0 items-center gap-2 truncate">
+                <Fingerprint className="h-3.5 w-3.5 shrink-0 text-[#ff6b57]" />
+                <span className="truncate">{authUsername}</span>
+              </span>
+              <span className="rounded bg-white/8 px-1.5 py-0.5 text-[10px] text-slate-400">
+                Passkeys
+              </span>
             </button>
-            <button
-              type="button"
-              onClick={() => setVaultModalOpen(true)}
-              className="flex items-center justify-center gap-1.5 rounded-xl border border-white/8 bg-[#131823] px-2.5 py-2 text-xs font-medium text-slate-200 transition hover:border-white/18 hover:bg-white/8"
-            >
-              <Shield className="h-3.5 w-3.5 text-emerald-400" />
-              Vault
-            </button>
+
+            <div className="grid grid-cols-2 gap-1.5">
+              <button
+                type="button"
+                onClick={() => setGatewayModalOpen(true)}
+                className="flex items-center justify-center gap-1.5 rounded-xl border border-white/8 bg-[#131823] px-2.5 py-2 text-xs font-medium text-slate-200 transition hover:border-white/18 hover:bg-white/8"
+              >
+                <Radio className="h-3.5 w-3.5 text-[#ff6b57]" />
+                Gateway
+              </button>
+              <button
+                type="button"
+                onClick={() => setVaultModalOpen(true)}
+                className="flex items-center justify-center gap-1.5 rounded-xl border border-white/8 bg-[#131823] px-2.5 py-2 text-xs font-medium text-slate-200 transition hover:border-white/18 hover:bg-white/8"
+              >
+                <Shield className="h-3.5 w-3.5 text-emerald-400" />
+                Vault
+              </button>
+            </div>
           </div>
         </aside>
       )}
@@ -756,7 +854,15 @@ export function SushiWorkspace() {
                       RDP client — built for VPS self-hosting and Vercel.
                     </p>
                   </div>
-                  <div className="flex items-center gap-2">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setAccountModalOpen(true)}
+                      className="inline-flex items-center gap-1.5 rounded-xl border border-white/12 bg-white/5 px-3.5 py-2 text-xs font-medium text-slate-200 transition hover:bg-white/10"
+                    >
+                      <Fingerprint className="h-3.5 w-3.5 text-[#ff6b57]" />
+                      Account &amp; Passkeys
+                    </button>
                     <button
                       type="button"
                       onClick={() => setGatewayModalOpen(true)}
@@ -1099,6 +1205,29 @@ export function SushiWorkspace() {
           setHosts(plain.hosts);
           setSnippets(plain.snippets);
           await persistVault(plain.hosts, plain.snippets);
+        }}
+      />
+
+      <AccountPasskeysModal
+        isOpen={accountModalOpen}
+        username={authUsername}
+        runtimeMode={localCaps?.mode}
+        gatewaySettings={gatewaySettings}
+        onClose={() => {
+          setAccountModalOpen(false);
+          void refreshAuthStatus();
+        }}
+        onUsernameUpdated={(nextUser) => {
+          setAuthUsername(nextUser);
+          void refreshAuthStatus();
+        }}
+        onSignedOut={() => {
+          setAccountModalOpen(false);
+          setTabs([]);
+          setActiveTabId("launchpad");
+          setAuthStatus((prev) =>
+            prev ? { ...prev, authenticated: false } : null
+          );
         }}
       />
     </div>

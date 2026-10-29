@@ -10,7 +10,7 @@ const METADATA_IPS = new Set([
   "fd00:ec2::254",
 ]);
 
-function isPrivateIp(ip: string): boolean {
+export function isPrivateIp(ip: string): boolean {
   if (METADATA_IPS.has(ip.toLowerCase())) {
     return true;
   }
@@ -38,6 +38,17 @@ export async function validateTargetHost(host: string, port: number): Promise<vo
     throw new Error("Host is required.");
   }
   const trimmed = host.trim();
+  if (/^[^@\s]+@[^@\s]+$/.test(trimmed)) {
+    const [user] = trimmed.split("@");
+    throw new Error(
+      `Enter only the hostname or IP address in the Host field — put the username ("${user}") in the Username field.`
+    );
+  }
+  if (/^[^:\s]+:\d{1,5}$/.test(trimmed)) {
+    throw new Error(
+      'Remove ":port" from the Host field and enter the port number in the Port field.'
+    );
+  }
   if (!trimmed || trimmed.length > 255 || /[\s/\\]/.test(trimmed)) {
     throw new Error("Invalid hostname or IP address.");
   }
@@ -104,7 +115,7 @@ export function getCorsHeaders(origin?: string | null): Record<string, string> {
     "Access-Control-Allow-Origin": effectiveOrigin,
     "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
     "Access-Control-Allow-Headers":
-      "Content-Type, Authorization, X-Sushi-Token, X-Sushi-Session",
+      "Content-Type, Authorization, X-Sushi-Token, X-Sushi-Session, X-Sushi-Admin-Cert",
     "Access-Control-Max-Age": "86400",
   };
   if (effectiveOrigin !== "*") {

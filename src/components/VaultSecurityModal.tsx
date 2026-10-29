@@ -44,6 +44,8 @@ import {
   type TermixSqliteUserInfo,
 } from "@/lib/client/termix-sqlite";
 import { type GatewaySettings, getAuthHeaders } from "@/lib/client/gateway";
+import { randomUUID } from "@/lib/client/web-crypto";
+import { copyTextToClipboard } from "@/lib/client/clipboard";
 
 export type VaultModalTab = "termix" | "keys" | "security";
 
@@ -356,7 +358,7 @@ export function VaultSecurityModal({
       }
 
       const nextKey: WhitelistedSshKey = {
-        id: crypto.randomUUID(),
+        id: randomUUID(),
         name: cleanName,
         privateKey: keyPrivateText.trim(),
         passphrase: keyPassphrase || undefined,
@@ -403,7 +405,7 @@ export function VaultSecurityModal({
       }
 
       const nextKey: WhitelistedSshKey = {
-        id: crypto.randomUUID(),
+        id: randomUUID(),
         name: cleanName,
         privateKey: data.privateKey,
         publicKey: data.publicKeyOpenSSH,
@@ -1299,7 +1301,7 @@ export function VaultSecurityModal({
                             <button
                               type="button"
                               onClick={() => {
-                                navigator.clipboard.writeText(k.publicKey!);
+                                void copyTextToClipboard(k.publicKey!);
                                 setCopiedPubKeyId(k.id);
                                 setTimeout(() => setCopiedPubKeyId(null), 2000);
                               }}

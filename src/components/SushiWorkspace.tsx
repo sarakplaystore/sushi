@@ -25,6 +25,7 @@ import {
   ArrowLeftRight,
   KeyRound,
   AlertCircle,
+  ShieldAlert,
 } from "lucide-react";
 import type { AuthStatusResponse } from "@/types/auth";
 import type {
@@ -66,6 +67,7 @@ import {
   getStoredAuthorizedKeyCertificates,
   getStoredPasskeyCertificates,
 } from "@/lib/client/auth-storage";
+import { isInsecureBrowserContext, randomUUID } from "@/lib/client/web-crypto";
 
 export function SushiWorkspace() {
   // Authentication & Passkey Gate state
@@ -96,6 +98,19 @@ export function SushiWorkspace() {
   const [snippets, setSnippets] = useState<CommandSnippet[]>(DEFAULT_SNIPPETS);
   const [sshKeys, setSshKeys] = useState<WhitelistedSshKey[]>([]);
   const [enforceKeyWhitelist, setEnforceKeyWhitelist] = useState(false);
+  const [insecureHttp, setInsecureHttp] = useState(false);
+  const [insecureNoticeDismissed, setInsecureNoticeDismissed] = useState(false);
+  useEffect(() => {
+    if (!isInsecureBrowserContext()) return;
+    setInsecureHttp(true);
+    try {
+      setInsecureNoticeDismissed(
+        sessionStorage.getItem("sushi_http_notice_dismissed") === "1"
+      );
+    } catch {
+      // ignore storage errors
+    }
+  }, []);
   const [whitelistBannerError, setWhitelistBannerError] = useState<string | null>(
     null
   );
@@ -321,7 +336,7 @@ export function SushiWorkspace() {
       }
       setWhitelistBannerError(null);
 
-      const tabId = `tab-${crypto.randomUUID()}`;
+      const tabId = `tab-${randomUUID()}`;
       const newTab: SessionTab = {
         id: tabId,
         title: `${profile.name}`,
@@ -909,6 +924,37 @@ export function SushiWorkspace() {
             }
           >
             <div className="mx-auto max-w-5xl space-y-8">
+              {insecureHttp && !insecureNoticeDismissed && (
+                <div className="flex items-start justify-between gap-3 rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-xs text-amber-100">
+                  <span className="flex items-start gap-2">
+                    <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0 text-amber-400" />
+                    <span>
+                      <span className="font-semibold text-amber-200">
+                        You&apos;re using Sushi over plain HTTP.
+                      </span>{" "}
+                      SSH, SFTP, RDP and the vault work, but your Sushi login and the
+                      server passwords/keys you send travel unencrypted between this
+                      browser and Sushi, and passkeys are disabled. Put Sushi behind
+                      HTTPS (e.g. Caddy or Nginx with a domain) for production use.
+                    </span>
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setInsecureNoticeDismissed(true);
+                      try {
+                        sessionStorage.setItem("sushi_http_notice_dismissed", "1");
+                      } catch {
+                        // ignore storage errors
+                      }
+                    }}
+                    className="shrink-0 rounded-lg bg-amber-500/20 px-3 py-1 font-semibold text-amber-100 hover:bg-amber-500/30"
+                  >
+                    Dismiss
+                  </button>
+                </div>
+              )}
+
               {whitelistBannerError && (
                 <div className="flex items-center justify-between gap-3 rounded-xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-xs text-rose-200">
                   <span className="flex items-center gap-2">

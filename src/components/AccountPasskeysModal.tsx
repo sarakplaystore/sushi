@@ -31,6 +31,8 @@ import {
   setStoredSessionToken,
 } from "@/lib/client/auth-storage";
 import { type GatewaySettings, getAuthHeaders } from "@/lib/client/gateway";
+import { copyTextToClipboard } from "@/lib/client/clipboard";
+import { isInsecureBrowserContext } from "@/lib/client/web-crypto";
 
 interface AccountPasskeysModalProps {
   isOpen: boolean;
@@ -296,6 +298,11 @@ export function AccountPasskeysModal({
       const { browserSupportsWebAuthn, startRegistration } = await import(
         "@simplewebauthn/browser"
       );
+      if (isInsecureBrowserContext()) {
+        throw new Error(
+          "Passkeys need HTTPS: browsers disable WebAuthn on plain-HTTP pages. Serve Sushi over HTTPS (Caddy / Nginx) or open it via http://localhost to register a passkey."
+        );
+      }
       if (!browserSupportsWebAuthn()) {
         throw new Error("WebAuthn Passkeys are not supported in this browser.");
       }
@@ -672,7 +679,7 @@ export function AccountPasskeysModal({
                     <button
                       type="button"
                       onClick={() => {
-                        navigator.clipboard.writeText(authorizedKeysEnvBlock);
+                        void copyTextToClipboard(authorizedKeysEnvBlock);
                         setCopiedAuthKeysEnv(true);
                         setTimeout(() => setCopiedAuthKeysEnv(false), 2000);
                       }}
@@ -786,7 +793,7 @@ export function AccountPasskeysModal({
                       <button
                         type="button"
                         onClick={() => {
-                          navigator.clipboard.writeText(passkeysEnvJson);
+                          void copyTextToClipboard(passkeysEnvJson);
                           setCopiedEnv(true);
                           setTimeout(() => setCopiedEnv(false), 2000);
                         }}

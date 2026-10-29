@@ -27,6 +27,10 @@ import {
   setStoredAdminProfileCert,
   setStoredSessionToken,
 } from "@/lib/client/auth-storage";
+import { isInsecureBrowserContext } from "@/lib/client/web-crypto";
+
+const PASSKEY_HTTPS_REQUIRED =
+  "Passkeys need HTTPS: browsers disable WebAuthn on plain-HTTP pages like this one. Sign in with your password or whitelisted private key, or serve Sushi over HTTPS (Caddy / Nginx) to use passkeys.";
 
 interface AuthGateScreenProps {
   authStatus: AuthStatusResponse;
@@ -201,6 +205,9 @@ export function AuthGateScreen({
     setPasskeyBusy(true);
     setError(null);
     try {
+      if (isInsecureBrowserContext()) {
+        throw new Error(PASSKEY_HTTPS_REQUIRED);
+      }
       const { startRegistration } = await import("@simplewebauthn/browser");
       const existingCerts = getStoredPasskeyCertificates().map((c) => c.cert);
       const adminCert = getStoredAdminProfileCert();
@@ -349,6 +356,9 @@ export function AuthGateScreen({
     setError(null);
 
     try {
+      if (isInsecureBrowserContext()) {
+        throw new Error(PASSKEY_HTTPS_REQUIRED);
+      }
       const { startAuthentication } = await import("@simplewebauthn/browser");
       const certs = getStoredPasskeyCertificates().map((c) => c.cert);
       const adminCert = getStoredAdminProfileCert();

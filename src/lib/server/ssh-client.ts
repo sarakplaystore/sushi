@@ -6,7 +6,9 @@ import type {
   SftpEntry,
   SshTestResult,
 } from "@/types/connection";
-import { validateTargetHost } from "./security";
+import net from "node:net";
+import { isPrivateIp, validateTargetHost } from "./security";
+import { normalizePrivateKeyForSsh } from "./ssh-key-utils";
 
 export interface ConnectedSshSession {
   client: Client;
@@ -55,6 +57,80 @@ export function formatPermissions(mode: number): {
   };
 }
 
+const RUNNING_ON_VERCEL = process.env.VERCEL === "1";
+
+/** Private, link-local, CGNAT/Tailscale (100.64/10) or LAN-only hostnames. */
+function isNonPublicHost(host: string): boolean {
+  const h = host.trim().toLowerCase().replace(/^\[|\]$/g, "");
+  if (
+    h === "localhost" ||
+    /\.(local|lan|internal|home\.arpa|localdomain)$/.test(h)
+  ) {
+    return true;
+  }
+  if (net.isIP(h)) {
+    if (isPrivateIp(h)) return true;
+    if (net.isIPv4(h)) {
+      const [a, b] = h.split(".").map(Number);
+      if (a === 100 && b >= 64 && b <= 127) return true;
+    }
+  }
+  return false;
+}
+
+function reachabilityHint(host: string): string {
+  if (RUNNING_ON_VERCEL && isNonPublicHost(host)) {
+    return ` ${host} is a private / LAN / Tailscale address, which Sushi on Vercel cannot reach. Run Sushi on that network (VPS / Docker install) or attach a VPS gateway that can reach it.`;
+  }
+  if (RUNNING_ON_VERCEL) {
+    return " Check the IP and port, and that the server's firewall allows SSH from the internet (Vercel connects from changing AWS IP addresses).";
+  }
+  return " Check the IP and port, and any firewall between this Sushi server and the host.";
+}
+
+/**
+ * Turns low-level ssh2 / socket errors into actionable messages for the UI.
+ */
+export function describeSshError(
+  err: unknown,
+  target: { host: string; port: number; username?: string; authMethod?: string }
+): string {
+  const raw = err instanceof Error ? err.message : String(err ?? "");
+  const code = String((err as NodeJS.ErrnoException | undefined)?.code ?? "");
+  const probe = `${code} ${raw}`;
+  const where = `${target.host}:${target.port}`;
+
+  if (/ECONNREFUSED/.test(probe)) {
+    return `Connection refused by ${where} — nothing is accepting SSH connections on that port. Check the port number and that the SSH server (sshd) is running.`;
+  }
+  if (/ENOTFOUND|EAI_AGAIN|EAI_NODATA|EAI_NONAME/.test(probe)) {
+    return `Could not resolve the hostname "${target.host}" (DNS lookup failed).${
+      RUNNING_ON_VERCEL && isNonPublicHost(target.host)
+        ? " Local network hostnames can't be resolved from Vercel."
+        : ""
+    }`;
+  }
+  if (/ETIMEDOUT|EHOSTUNREACH|ENETUNREACH|timed out|waiting for handshake/i.test(probe)) {
+    return `Could not reach ${where} (connection timed out).${reachabilityHint(target.host)}`;
+  }
+  if (/ECONNRESET|EPIPE|socket hang up/i.test(probe)) {
+    return `The connection to ${where} was reset before SSH finished connecting. Usual causes: a firewall or network that blocks outbound SSH, a fail2ban / IP ban, or a service on that port that isn't SSH.`;
+  }
+  if (/All configured authentication methods failed/i.test(raw)) {
+    const who = `${target.username || "user"}@${target.host}`;
+    return target.authMethod === "privateKey"
+      ? `Authentication failed for ${who}: the server rejected this private key. Make sure its public key is in ~/.ssh/authorized_keys for "${target.username}".`
+      : `Authentication failed for ${who}: wrong username or password, or the server has password logins disabled (PasswordAuthentication no) — use SSH key authentication instead.`;
+  }
+  if (/no matching|Handshake failed/i.test(raw)) {
+    return `SSH algorithm negotiation with ${where} failed (${raw}). The server only offers algorithms this client does not support.`;
+  }
+  if (/Cannot parse privateKey|Unsupported key format/i.test(raw)) {
+    return "Unsupported private key format — paste an OpenSSH, PEM or PKCS#8 private key.";
+  }
+  return raw || "SSH connection failed.";
+}
+
 export async function connectSsh(
   creds: ConnectionCredentials,
   timeoutMs = 15000
@@ -72,11 +148,25 @@ export async function connectSsh(
     let fingerprint: string | undefined;
     let serverBanner: string | undefined;
 
+    const target = {
+      host: creds.host.trim(),
+      port,
+      username: creds.username.trim(),
+      authMethod: creds.authMethod,
+    };
+
     const timer = setTimeout(() => {
       if (!settled) {
         settled = true;
         client.destroy();
-        reject(new Error(`SSH connection timed out after ${Math.round(timeoutMs / 1000)}s.`));
+        reject(
+          new Error(
+            describeSshError(
+              new Error(`SSH connection timed out after ${Math.round(timeoutMs / 1000)}s.`),
+              target
+            )
+          )
+        );
       }
     }, timeoutMs);
 
@@ -110,7 +200,7 @@ export async function connectSsh(
       settled = true;
       clearTimeout(timer);
       client.destroy();
-      reject(new Error(err.message || "SSH connection failed."));
+      reject(new Error(describeSshError(err, target)));
     });
 
     const config: ConnectConfig = {
@@ -144,9 +234,20 @@ export async function connectSsh(
         reject(new Error("Private key is required when using key authentication."));
         return;
       }
-      config.privateKey = creds.privateKey.trim();
-      if (creds.passphrase) {
-        config.passphrase = creds.passphrase;
+      try {
+        const normalized = normalizePrivateKeyForSsh(
+          creds.privateKey,
+          creds.passphrase || undefined
+        );
+        config.privateKey = normalized.privateKey;
+        if (normalized.passphrase) {
+          config.passphrase = normalized.passphrase;
+        }
+      } catch (err) {
+        clearTimeout(timer);
+        settled = true;
+        reject(err instanceof Error ? err : new Error("Invalid private key."));
+        return;
       }
     } else {
       config.password = creds.password ?? "";
@@ -157,7 +258,14 @@ export async function connectSsh(
     } catch (err) {
       clearTimeout(timer);
       settled = true;
-      reject(err instanceof Error ? err : new Error("Failed to initiate SSH connection."));
+      reject(
+        new Error(
+          describeSshError(
+            err instanceof Error ? err : new Error("Failed to initiate SSH connection."),
+            target
+          )
+        )
+      );
     }
   });
 }

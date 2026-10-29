@@ -85,6 +85,64 @@ function decodeBase64Bytes(b64: string): Uint8Array {
   return out;
 }
 
+/* ------------------------------------------------------------------ */
+/* Serverless-mode guards                                              */
+/* ------------------------------------------------------------------ */
+
+/** Full-screen TUIs that can never work without a live, keystroke-forwarding PTY. */
+const FULLSCREEN_PROGRAMS = new Set([
+  "vim", "vi", "nvim", "view", "vimdiff", "nano", "pico", "emacs", "joe", "micro",
+  "mcedit", "ne", "less", "more", "most", "top", "htop", "btop", "atop", "iotop",
+  "iftop", "nload", "nethogs", "glances", "ctop", "nvtop", "tmux", "screen", "byobu",
+  "mc", "ranger", "nnn", "vifm", "ncdu", "tig", "lazygit", "lazydocker", "k9s",
+  "nmtui", "alsamixer", "cfdisk", "mutt", "neomutt", "irssi", "weechat", "w3m",
+  "lynx", "watch", "visudo", "vipw", "vigr", "sudoedit",
+]);
+
+/** Shells / REPLs that only become interactive when started without arguments. */
+const BARE_INTERACTIVE_PROGRAMS = new Set([
+  "bash", "sh", "zsh", "fish", "dash", "ksh", "python", "python3", "ipython", "node",
+  "irb", "php", "mysql", "mariadb", "psql", "redis-cli", "mongo", "mongosh",
+  "sqlite3", "ssh", "telnet", "ftp", "sftp", "su",
+]);
+
+const COMMAND_WRAPPERS = new Set(["sudo", "doas", "exec", "nohup", "time", "command", "env"]);
+const SUDO_FLAGS_WITH_VALUE = new Set(["-u", "-g", "-C", "-h", "-p", "-U", "-r", "-t"]);
+
+/**
+ * Returns the program name when `command` would start an interactive full-screen
+ * program (vim, top, less, tmux, a bare REPL ...) that serverless SSH cannot drive.
+ */
+function detectFullscreenProgram(command: string): string | null {
+  for (const segment of command.split(/&&|\|\||;|\|/)) {
+    const words = segment.trim().split(/\s+/).filter(Boolean);
+    while (
+      words.length > 0 &&
+      (/^[A-Za-z_][A-Za-z0-9_]*=/.test(words[0]) || COMMAND_WRAPPERS.has(words[0]))
+    ) {
+      const wrapper = words.shift();
+      if (wrapper === "sudo" || wrapper === "doas") {
+        while (words.length > 0 && words[0].startsWith("-")) {
+          const flag = words.shift() as string;
+          if (SUDO_FLAGS_WITH_VALUE.has(flag)) words.shift();
+        }
+      }
+    }
+    if (words.length === 0) continue;
+    const program = (words[0].replace(/^\\/, "").split("/").pop() || "").toLowerCase();
+    const args = words.slice(1);
+    if (program === "top" && args.some((a) => /^-\w*b/.test(a))) continue; // batch mode
+    if (FULLSCREEN_PROGRAMS.has(program)) return program;
+    if (program === "crontab" && args.includes("-e")) return "crontab -e";
+    if (program === "systemctl" && args[0] === "edit") return "systemctl edit";
+    if (BARE_INTERACTIVE_PROGRAMS.has(program) && args.length === 0) return program;
+  }
+  return null;
+}
+
+const PASSWORD_PROMPT_RE = /(?:password|passphrase|passcode)[^\r\n]{0,60}:\s*$/i;
+const CONFIRM_PROMPT_RE = /\[(?:Y\/n|y\/N|yes\/no|Y\/N)\]\s*\??\s*$/;
+
 export function SshTerminalSession({
   profile,
   isActive,
@@ -161,10 +219,25 @@ export function SshTerminalSession({
         return;
       }
 
+      const fullscreen = detectFullscreenProgram(trimmed);
+      if (fullscreen) {
+        term.writeln(
+          `\x1b[33m"${fullscreen}" is an interactive full-screen program. Serverless SSH runs each command on its own and can't forward keystrokes, so it would hang.\x1b[0m`
+        );
+        term.writeln(
+          "\x1b[90mFor vim/nano/top/htop/less/tmux use a live PTY: a self-hosted Sushi (VPS / Docker) or Attach VPS Gateway. Alternatives here: cat / tail -n 100 / sed -i, top -bn1.\x1b[0m"
+        );
+        writePrompt(term);
+        return;
+      }
+
       execBusyRef.current = true;
       const controller = new AbortController();
       abortExecRef.current = controller;
       const utf8Decoder = new TextDecoder("utf-8");
+      let gotReady = false;
+      let promptHintShown = false;
+      let outputTail = "";
 
       try {
         const res = await fetch("/api/ssh/exec", {
@@ -214,6 +287,7 @@ export function SshTerminalSession({
             try {
               const evt = JSON.parse(line);
               if (evt.type === "ready") {
+                gotReady = true;
                 setStatus("connected");
                 if (evt.fingerprint) setFingerprint(evt.fingerprint);
               } else if (evt.type === "data" && typeof evt.data === "string") {
@@ -221,12 +295,25 @@ export function SshTerminalSession({
                   stream: true,
                 });
                 term.write(decoded);
+                outputTail = (outputTail + decoded).slice(-200);
+                if (!promptHintShown && PASSWORD_PROMPT_RE.test(outputTail)) {
+                  promptHintShown = true;
+                  term.write(
+                    "\r\n\x1b[33m↳ This command is waiting for a password, but serverless SSH can't send keystrokes. Press Ctrl+C to cancel; use a live PTY (self-hosted Sushi or Attach VPS Gateway) or passwordless sudo for this.\x1b[0m\r\n"
+                  );
+                } else if (!promptHintShown && CONFIRM_PROMPT_RE.test(outputTail)) {
+                  promptHintShown = true;
+                  term.write(
+                    "\r\n\x1b[33m↳ This command is waiting for an answer, but serverless SSH can't send keystrokes. Press Ctrl+C and re-run it non-interactively (e.g. apt -y …) or use a live PTY.\x1b[0m\r\n"
+                  );
+                }
               } else if (evt.type === "meta") {
                 if (typeof evt.cwd === "string" && evt.cwd) {
                   cwdRef.current = evt.cwd;
                   setCurrentCwd(evt.cwd);
                 }
               } else if (evt.type === "error") {
+                if (!gotReady) setStatus("error");
                 term.writeln(`\r\n\x1b[31m${evt.message}\x1b[0m`);
               }
             } catch {
@@ -448,6 +535,10 @@ export function SshTerminalSession({
         );
 
         let openedReady = false;
+        let fellBack = false;
+        let gotServerMessage = false;
+        let lastServerError = "";
+        const usingRemoteGateway = Boolean(gatewaySettings.gatewayUrl.trim());
         const utf8Decoder = new TextDecoder("utf-8");
         const ws = new WebSocket(wsUrl);
         wsRef.current = ws;
@@ -482,6 +573,7 @@ export function SshTerminalSession({
         ws.onmessage = (event) => {
           try {
             const msg = JSON.parse(event.data);
+            if (msg.type !== "pong") gotServerMessage = true;
             if (msg.type === "ready") {
               openedReady = true;
               setStatus("connected");
@@ -501,8 +593,13 @@ export function SshTerminalSession({
               });
               term.write(text);
             } else if (msg.type === "error") {
-              setStatus("error");
-              term.writeln(`\r\n\x1b[31mSSH Error: ${msg.message}\x1b[0m`);
+              lastServerError = String(msg.message || "");
+              // A remote gateway that refuses our tokens closes with 1008 next;
+              // onclose falls back to serverless SSH instead of showing a dead end.
+              if (!(usingRemoteGateway && !openedReady)) {
+                setStatus("error");
+                term.writeln(`\r\n\x1b[31mSSH Error: ${msg.message}\x1b[0m`);
+              }
             } else if (msg.type === "exit") {
               setStatus("disconnected");
               term.writeln("\r\n\x1b[33mRemote SSH session ended.\x1b[0m");
@@ -513,17 +610,44 @@ export function SshTerminalSession({
         };
 
         ws.onerror = () => {
-          if (!openedReady && !disposed) {
+          if (!openedReady && !disposed && !fellBack) {
+            fellBack = true;
             ws.close();
             switchToServerlessShell(
-              "WebSocket endpoint unavailable on this host — falling back to Serverless HTTP Streaming SSH."
+              usingRemoteGateway
+                ? "Could not reach the VPS gateway WebSocket — falling back to Serverless HTTP Streaming SSH."
+                : "WebSocket endpoint unavailable on this host — falling back to Serverless HTTP Streaming SSH."
             );
           }
         };
 
-        ws.onclose = () => {
-          if (openedReady && !disposed) {
+        ws.onclose = (event) => {
+          if (disposed) return;
+          if (openedReady) {
             setStatus("disconnected");
+            return;
+          }
+          if (fellBack) return;
+          if (usingRemoteGateway && (event.code === 1008 || !gotServerMessage)) {
+            // Gateway rejected the session (e.g. missing / wrong SUSHI_GATEWAY_TOKEN)
+            fellBack = true;
+            switchToServerlessShell(
+              `VPS gateway refused the session${
+                lastServerError ? `: ${lastServerError}` : ""
+              } — falling back to Serverless HTTP Streaming SSH.`
+            );
+            return;
+          }
+          if (usingRemoteGateway && lastServerError) {
+            setStatus("error");
+            term.writeln(`\r\n\x1b[31mSSH Error: ${lastServerError}\x1b[0m`);
+            return;
+          }
+          if (!gotServerMessage) {
+            fellBack = true;
+            switchToServerlessShell(
+              "WebSocket closed before the SSH session started — falling back to Serverless HTTP Streaming SSH."
+            );
           }
         };
       } else {

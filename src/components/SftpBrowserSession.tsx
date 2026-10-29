@@ -28,7 +28,6 @@ import {
 } from "lucide-react";
 import type { HostProfile, SftpEntry } from "@/types/connection";
 import { type GatewaySettings, getAuthHeaders } from "@/lib/client/gateway";
-import { getStoredSessionToken } from "@/lib/client/auth-storage";
 
 interface SftpBrowserSessionProps {
   profile: HostProfile;
@@ -333,14 +332,10 @@ export function SftpBrowserSession({
         formData.append("files", f);
       }
 
-      const headers: Record<string, string> = {};
-      const sessionToken = getStoredSessionToken();
-      if (sessionToken) {
-        headers["X-Sushi-Session"] = sessionToken;
-      }
-      if (gatewaySettings.gatewayToken) {
-        headers["X-Sushi-Token"] = gatewaySettings.gatewayToken;
-      }
+      // Same auth headers as every other API call, minus Content-Type so the
+      // browser sets the multipart boundary itself.
+      const headers = getAuthHeaders(gatewaySettings);
+      delete headers["Content-Type"];
 
       const res = await fetch("/api/sftp/upload", {
         method: "POST",

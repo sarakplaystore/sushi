@@ -1116,8 +1116,16 @@ export async function verifyIncomingAuth(
     return { ok: true, username: "gateway" };
   }
 
+  const wrongGatewayToken =
+    "Gateway token rejected: it doesn't match this gateway's SUSHI_GATEWAY_TOKEN. Copy the exact value from the gateway's .env into Sushi → Gateway settings.";
+
   if (process.env.GATEWAY_ONLY === "true" && gatewayTokenEnv) {
-    return { ok: false, error: "Valid SUSHI_GATEWAY_TOKEN required." };
+    return {
+      ok: false,
+      error: providedGatewayToken
+        ? wrongGatewayToken
+        : "This Sushi gateway requires its access token: enter the gateway's SUSHI_GATEWAY_TOKEN in Sushi → Gateway settings.",
+    };
   }
 
   const cfg = await getEffectiveAuthConfig(headers);
@@ -1128,20 +1136,36 @@ export async function verifyIncomingAuth(
     providedGatewayToken,
   ].filter(Boolean) as string[];
 
-  // On persistent-disk VPS or env-configured instances, require initialized account first
-  if (isPersistentDiskAvailable() && !cfg.initialized) {
+  // On persistent-disk VPS or env-configured instances, sessions are only valid once
+  // the admin account exists (never trust tokens signed with a fallback secret).
+  const awaitingSetup = isPersistentDiskAvailable() && !cfg.initialized;
+
+  if (!awaitingSetup) {
+    const expectedUsername = cfg.initialized ? cfg.username : undefined;
+    for (const tok of candidateTokens) {
+      const claims = verifySessionToken(tok, cfg.authSecret, expectedUsername);
+      if (claims) {
+        return { ok: true, username: claims.sub };
+      }
+    }
+  }
+
+  // A gateway token was sent (typically a Vercel-hosted Sushi using this server as
+  // its VPS gateway) but it could not be accepted — explain how to fix it.
+  if (providedGatewayToken) {
+    return {
+      ok: false,
+      error: gatewayTokenEnv
+        ? wrongGatewayToken
+        : "This server has no SUSHI_GATEWAY_TOKEN configured, so it can't accept connections from another Sushi frontend. Set SUSHI_GATEWAY_TOKEN in its .env (the same value as in Sushi → Gateway settings) and restart it.",
+    };
+  }
+
+  if (awaitingSetup) {
     return {
       ok: false,
       error: "Authentication required: complete initial admin setup first.",
     };
-  }
-
-  const expectedUsername = cfg.initialized ? cfg.username : undefined;
-  for (const tok of candidateTokens) {
-    const claims = verifySessionToken(tok, cfg.authSecret, expectedUsername);
-    if (claims) {
-      return { ok: true, username: claims.sub };
-    }
   }
 
   return {

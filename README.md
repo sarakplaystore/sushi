@@ -83,6 +83,14 @@ bash scripts/install-vps.sh
 - `sushi` on port `3000` (Web UI + API + `/ws/ssh` + `/ws/rdp`)
 - `guacd` (`guacamole/guacd:1.5.5`) on an internal bridge network for live RDP rendering
 
+> **Plain `http://<vps-ip>:3000` works**, including SSH, SFTP, RDP, the encrypted vault and Termix import.
+> Browsers disable WebCrypto (`crypto.subtle`, `crypto.randomUUID`) on non-HTTPS pages, so Sushi
+> falls back to audited pure-JS AES-GCM / PBKDF2 / HKDF (`@noble/ciphers`, `@noble/hashes`) with
+> byte-identical output. Vaults move freely between HTTP and HTTPS. For anything beyond a quick
+> test, put Sushi behind HTTPS (Caddy / Nginx + a domain): over plain HTTP your Sushi login and the
+> server passwords/keys you send travel unencrypted, and **passkeys only work on HTTPS** (or
+> `http://localhost`). Sushi shows a dismissible notice when it is opened over plain HTTP.
+
 ### 3. Deploy to Vercel (+ Optional Companion VPS Gateway)
 
 1. Import `sarakplaystore/sushi` into **Vercel** (Framework Preset: **Next.js**, Node.js `22.x`) and deploy.
@@ -96,6 +104,29 @@ bash scripts/install-vps.sh
    SUSHI_GATEWAY_TOKEN="your-secret" ALLOWED_ORIGIN="https://your-app.vercel.app" npm run gateway
    ```
    Put Caddy/Nginx HTTPS in front of the VPS and enter `https://gw.yourdomain.com` + your token in **Gateway** inside the Sushi UI.
+   The token you enter must equal the gateway's `SUSHI_GATEWAY_TOKEN`. If it is missing or wrong, the
+   terminal says so and falls back to serverless SSH. A full Sushi install (`docker compose`) can act
+   as the gateway too, as long as `SUSHI_GATEWAY_TOKEN` is set in its `.env`.
+
+---
+
+## SSH Troubleshooting
+
+| What you see | What it means / fix |
+|---|---|
+| `Could not reach host:22 (connection timed out)` | Wrong IP/port or a firewall. **Vercel cannot reach private / LAN / Tailscale addresses** (`192.168.x.x`, `10.x`, `100.64.x.x`): self-host Sushi on that network or attach a VPS gateway. |
+| `Connection refused by host:port` | Nothing listens for SSH on that port. Check the port and that `sshd` is running. |
+| `The connection … was reset before SSH finished connecting` | Firewall / network blocking outbound SSH, a fail2ban IP ban, or a non-SSH service on that port. |
+| `Authentication failed … wrong username or password` | Or the server has `PasswordAuthentication no`. Use SSH key authentication. |
+| `Authentication failed … the server rejected this private key` | Add the key's public half to `~/.ssh/authorized_keys` for that user. |
+| `This private key is passphrase-protected` / `Incorrect passphrase` | Enter (or fix) the key passphrase in the host settings. |
+| `vim`/`top`/`less`/`sudo` password prompts don't work on Vercel | Serverless SSH runs each command on its own and can't forward keystrokes. Use a live PTY: self-hosted Sushi or **Attach VPS Gateway**. Pagers (`systemctl`, `journalctl`, `git log`, `man`) are disabled automatically. |
+
+Supported private keys: OpenSSH (`BEGIN OPENSSH PRIVATE KEY`, incl. passphrase-protected), PEM
+(`BEGIN RSA/EC PRIVATE KEY`, incl. encrypted), **PKCS#8** (`BEGIN PRIVATE KEY` /
+`BEGIN ENCRYPTED PRIVATE KEY`, converted automatically for RSA, ECDSA and Ed25519) and PuTTY `.ppk` v2 RSA keys
+(for other `.ppk` keys use PuTTYgen → *Conversions → Export OpenSSH key*).
+Keys mangled by copy & paste (CRLF, indentation, one-line keys, literal `\n`) are repaired automatically.
 
 ---
 

@@ -6,6 +6,13 @@ import type {
   WhitelistedSshKey,
 } from "@/types/connection";
 import type { Database, InitSqlJsStatic, SqlJsStatic, SqlValue } from "sql.js";
+import {
+  aesGcmDecrypt as webAesGcmDecrypt,
+  hkdfSha256 as webHkdfSha256,
+  pbkdf2Sha256 as webPbkdf2Sha256,
+  randomUUID,
+  sha256 as webSha256,
+} from "./web-crypto";
 
 /**
  * Termix SQLite database importer (`Termix-SSH/Termix`).
@@ -106,30 +113,6 @@ export interface TermixSqliteImportResult {
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
 
-function getSubtle(): SubtleCrypto {
-  const subtle = globalThis.crypto?.subtle;
-  if (!subtle) {
-    throw new Error(
-      "WebCrypto is unavailable in this browser context. Open Sushi over HTTPS (or http://localhost) to decrypt Termix databases."
-    );
-  }
-  return subtle;
-}
-
-function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
-  if (
-    bytes.byteOffset === 0 &&
-    bytes.byteLength === bytes.buffer.byteLength &&
-    bytes.buffer instanceof ArrayBuffer
-  ) {
-    return bytes.buffer;
-  }
-  return bytes.buffer.slice(
-    bytes.byteOffset,
-    bytes.byteOffset + bytes.byteLength
-  ) as ArrayBuffer;
-}
-
 function hexToBytes(hex: string): Uint8Array {
   const clean = hex.trim();
   if (clean.length % 2 !== 0 || !/^[0-9a-f]*$/i.test(clean)) {
@@ -177,25 +160,7 @@ async function hkdfSha256(
   info: string,
   length = 32
 ): Promise<Uint8Array> {
-  const subtle = getSubtle();
-  const key = await subtle.importKey(
-    "raw",
-    toArrayBuffer(ikm),
-    "HKDF",
-    false,
-    ["deriveBits"]
-  );
-  const bits = await subtle.deriveBits(
-    {
-      name: "HKDF",
-      hash: "SHA-256",
-      salt: toArrayBuffer(salt),
-      info: toArrayBuffer(textEncoder.encode(info)),
-    },
-    key,
-    length * 8
-  );
-  return new Uint8Array(bits);
+  return webHkdfSha256(ikm, salt, info, length);
 }
 
 async function pbkdf2Sha256(
@@ -204,25 +169,7 @@ async function pbkdf2Sha256(
   iterations: number,
   length = 32
 ): Promise<Uint8Array> {
-  const subtle = getSubtle();
-  const key = await subtle.importKey(
-    "raw",
-    toArrayBuffer(textEncoder.encode(secret)),
-    "PBKDF2",
-    false,
-    ["deriveBits"]
-  );
-  const bits = await subtle.deriveBits(
-    {
-      name: "PBKDF2",
-      hash: "SHA-256",
-      salt: toArrayBuffer(salt),
-      iterations,
-    },
-    key,
-    length * 8
-  );
-  return new Uint8Array(bits);
+  return webPbkdf2Sha256(secret, salt, iterations, length);
 }
 
 async function aesGcmDecrypt(
@@ -232,30 +179,11 @@ async function aesGcmDecrypt(
   tag: Uint8Array,
   aad?: Uint8Array
 ): Promise<Uint8Array> {
-  const subtle = getSubtle();
-  const cryptoKey = await subtle.importKey(
-    "raw",
-    toArrayBuffer(key),
-    "AES-GCM",
-    false,
-    ["decrypt"]
-  );
-  const params: AesGcmParams = {
-    name: "AES-GCM",
-    iv: toArrayBuffer(iv),
-    tagLength: tag.length * 8,
-  };
-  if (aad) params.additionalData = toArrayBuffer(aad);
-  const plain = await subtle.decrypt(
-    params,
-    cryptoKey,
-    toArrayBuffer(concatBytes(ciphertext, tag))
-  );
-  return new Uint8Array(plain);
+  return webAesGcmDecrypt(key, iv, concatBytes(ciphertext, tag), aad, tag.length);
 }
 
 function randomId(): string {
-  return globalThis.crypto.randomUUID();
+  return randomUUID();
 }
 
 /* ------------------------------------------------------------------ */
@@ -923,9 +851,7 @@ export async function deriveOpenSshPublicInfo(
       0;
     if (4 + typeLen > publicBlob.length) return null;
     const keyType = textDecoder.decode(publicBlob.subarray(4, 4 + typeLen));
-    const digest = new Uint8Array(
-      await getSubtle().digest("SHA-256", toArrayBuffer(publicBlob))
-    );
+    const digest = await webSha256(publicBlob);
     const fingerprint = `SHA256:${bytesToBase64(digest).replace(/=+$/, "")}`;
     const cleanComment = (comment || "").trim().replace(/\s+/g, "-");
     const base = `${keyType} ${bytesToBase64(publicBlob)}`;

@@ -22,6 +22,7 @@ import {
   parseGuacDaemonStream,
 } from "../src/lib/server/guacd-bridge";
 import { createGatewayWebSockets } from "../src/lib/server/ws-gateway";
+import { META_REGEX, splitEmittable } from "../src/lib/server/exec-stream";
 import {
   bootstrapAdminAccount,
   createChallengeToken,
@@ -34,6 +35,7 @@ import {
 } from "../src/lib/server/auth";
 import {
   generateEd25519KeyPair,
+  normalizePrivateKeyForSsh,
   verifyPrivateKeyAgainstWhitelist,
 } from "../src/lib/server/ssh-key-utils";
 import {
@@ -45,7 +47,21 @@ import {
   looksLikeTermixDatabaseFile,
   parseTermixEnvSecrets,
 } from "../src/lib/client/termix-sqlite";
-import { resolveProfileWithKeychain } from "../src/lib/client/crypto-vault";
+import {
+  decryptVaultEnvelope,
+  encryptVaultData,
+  resolveProfileWithKeychain,
+  type VaultPlaintext,
+} from "../src/lib/client/crypto-vault";
+import {
+  __setForcePureJsCrypto,
+  aesGcmDecrypt,
+  aesGcmEncrypt,
+  hkdfSha256,
+  pbkdf2Sha256,
+  randomUUID,
+  sha256,
+} from "../src/lib/client/web-crypto";
 import {
   buildTermixFixture,
   termixEncryptDatabaseTwoFile,
@@ -97,6 +113,20 @@ async function runTests() {
       if (ctx.method === "password" && ctx.username === "tester" && ctx.password === "sushipass") {
         ctx.accept();
       } else if (ctx.method === "publickey" && ctx.username === "tester") {
+        // Verify the client really holds the private key for the offered public key
+        if (ctx.signature && ctx.blob) {
+          const typeLen = ctx.key.data.readUInt32BE(0);
+          const keyType = ctx.key.data.subarray(4, 4 + typeLen).toString("latin1");
+          const offered = sshUtils.parseKey(`${keyType} ${ctx.key.data.toString("base64")}`);
+          const offeredKey = Array.isArray(offered) ? offered[0] : offered;
+          if (
+            offeredKey instanceof Error ||
+            offeredKey.verify(ctx.blob, ctx.signature, ctx.hashAlgo) !== true
+          ) {
+            ctx.reject(["password", "publickey"]);
+            return;
+          }
+        }
         ctx.accept();
       } else {
         ctx.reject(["password", "publickey"]);
@@ -302,6 +332,101 @@ async function runTests() {
     privateKey: clientKeys.private,
   });
   assert.equal(keyTest.ok, true);
+
+  // Private key formats ssh2 can't parse natively (PKCS#8 RSA / ECDSA / Ed25519, plain
+  // and encrypted) and keys damaged by copy & paste are normalized before login.
+  const rsaPair = crypto.generateKeyPairSync("rsa", { modulusLength: 2048 });
+  const ecPair = crypto.generateKeyPairSync("ec", { namedCurve: "prime256v1" });
+  const edPair = crypto.generateKeyPairSync("ed25519");
+  const encryptedPkcs8 = rsaPair.privateKey
+    .export({ type: "pkcs8", format: "pem", cipher: "aes-256-cbc", passphrase: "pk8pass" })
+    .toString();
+  const keyFormatCases: Array<[string, string, string?]> = [
+    ["RSA PKCS#8", rsaPair.privateKey.export({ type: "pkcs8", format: "pem" }).toString()],
+    ["ECDSA PKCS#8", ecPair.privateKey.export({ type: "pkcs8", format: "pem" }).toString()],
+    ["Ed25519 PKCS#8", edPair.privateKey.export({ type: "pkcs8", format: "pem" }).toString()],
+    ["encrypted RSA PKCS#8", encryptedPkcs8, "pk8pass"],
+    ["OpenSSH key flattened onto one line", clientKeys.private.trim().replace(/\n/g, " ")],
+    ["OpenSSH key with literal \\n escapes", clientKeys.private.trim().replace(/\n/g, "\\n")],
+    [
+      "indented OpenSSH key with CRLF",
+      clientKeys.private.split("\n").map((l) => `   ${l}`).join("\r\n"),
+    ],
+  ];
+  for (const [label, privateKey, passphrase] of keyFormatCases) {
+    const normalized = normalizePrivateKeyForSsh(privateKey, passphrase);
+    assert.equal(sshUtils.parseKey(normalized.privateKey, normalized.passphrase) instanceof Error, false, label);
+    const formatTest = await testSshConnection({
+      host: "127.0.0.1",
+      port: sshPort,
+      username: "tester",
+      authMethod: "privateKey",
+      privateKey,
+      passphrase,
+    });
+    assert.equal(formatTest.ok, true, `${label}: ${formatTest.error}`);
+  }
+
+  // Actionable errors instead of raw ssh2 / socket messages
+  const sshErr = async (overrides: Record<string, unknown>) =>
+    (
+      await testSshConnection({
+        host: "127.0.0.1",
+        port: sshPort,
+        username: "tester",
+        authMethod: "privateKey",
+        ...overrides,
+      } as Parameters<typeof testSshConnection>[0])
+    ).error ?? "";
+  assert.match(await sshErr({ privateKey: encryptedPkcs8 }), /passphrase-protected/);
+  assert.match(await sshErr({ privateKey: encryptedPkcs8, passphrase: "nope" }), /Incorrect passphrase/);
+  assert.match(await sshErr({ privateKey: clientKeys.public }), /public key/);
+  assert.match(
+    await sshErr({ authMethod: "password", password: "wrong-password" }),
+    /Authentication failed for tester@127\.0\.0\.1: wrong username or password/
+  );
+  assert.match(
+    await sshErr({ host: "root@127.0.0.1", authMethod: "password", password: "x" }),
+    /put the username \("root"\) in the Username field/
+  );
+  const closedPortServer = net.createServer();
+  await new Promise<void>((resolve) => closedPortServer.listen(0, "127.0.0.1", () => resolve()));
+  const closedPort = (closedPortServer.address() as net.AddressInfo).port;
+  await new Promise<void>((resolve) => closedPortServer.close(() => resolve()));
+  assert.match(
+    await sshErr({ port: closedPort, authMethod: "password", password: "x" }),
+    new RegExp(`Connection refused by 127\\.0\\.0\\.1:${closedPort}`)
+  );
+
+  // Serverless exec stream: prompts are emitted immediately (not held in a buffer),
+  // while a META marker split across SSH packets is still reassembled and stripped.
+  assert.deepEqual(splitEmittable("[sudo] password for tester: "), ["[sudo] password for tester: ", ""]);
+  assert.deepEqual(splitEmittable("Do you want to continue? [Y/n] "), ["Do you want to continue? [Y/n] ", ""]);
+  assert.deepEqual(splitEmittable("colored \x1b[32mok\x1b[0m"), ["colored \x1b[32mok\x1b[0m", ""]);
+  {
+    const fullOutput = "line one\r\nline two\r\n\x1b]777;SUSHI_META;0;/srv/app\x07";
+    for (let cut = 1; cut < fullOutput.length; cut++) {
+      let carry = "";
+      let shown = "";
+      let meta: RegExpExecArray | null = null;
+      for (const packet of [fullOutput.slice(0, cut), fullOutput.slice(cut)]) {
+        carry += packet;
+        const m = META_REGEX.exec(carry);
+        if (m) {
+          shown += carry.slice(0, m.index);
+          meta = m;
+          carry = carry.slice(m.index + m[0].length);
+        } else {
+          const [emit, hold] = splitEmittable(carry);
+          shown += emit;
+          carry = hold;
+        }
+      }
+      assert.ok(meta, `marker found when split at ${cut}`);
+      assert.equal(meta![2], "/srv/app");
+      assert.equal(shown, "line one\r\nline two", `clean output when split at ${cut}`);
+    }
+  }
 
   const creds = {
     host: "127.0.0.1",
@@ -601,7 +726,92 @@ async function runTests() {
   assert.equal(importedV2.hosts[0].authMethod, "privateKey");
   assert.deepEqual(importedV2.hosts[0].tags, ["prod", "k8s"]);
 
-  console.log("==> [6/8] Testing Termix SQLite database import (db.sqlite & db.sqlite.encrypted)...");
+  console.log("==> [6/8] Testing vault crypto on plain HTTP (pure-JS fallback) + Termix SQLite import...");
+  // Browsers only expose crypto.subtle / crypto.randomUUID on HTTPS or localhost. On a
+  // plain-HTTP self-hosted instance Sushi falls back to @noble — it must be byte-compatible.
+  {
+    const key = crypto.randomBytes(32);
+    const message = new TextEncoder().encode(`sushi vault ✓ ${"x".repeat(2048)}`);
+    for (const iv of [crypto.randomBytes(12), crypto.randomBytes(16)]) {
+      const nativeCt = await aesGcmEncrypt(key, iv, message);
+      __setForcePureJsCrypto(true);
+      const pureCt = await aesGcmEncrypt(key, iv, message);
+      const pureOpened = await aesGcmDecrypt(key, iv, nativeCt);
+      const tampered = Buffer.from(nativeCt);
+      tampered[0] ^= 1;
+      await assert.rejects(aesGcmDecrypt(key, iv, tampered));
+      __setForcePureJsCrypto(false);
+      assert.deepEqual(Buffer.from(pureCt), Buffer.from(nativeCt));
+      assert.deepEqual(Buffer.from(pureOpened), Buffer.from(message));
+      assert.deepEqual(Buffer.from(await aesGcmDecrypt(key, iv, pureCt)), Buffer.from(message));
+    }
+    const salt = crypto.randomBytes(16);
+    const nativeKdf = [
+      await pbkdf2Sha256("master passphrase", salt, 2000),
+      await hkdfSha256(key, new Uint8Array(0), "termix:dek-wrap:v3:1"),
+      await hkdfSha256(key, salt, "ctx"),
+      await sha256("abc"),
+    ];
+    __setForcePureJsCrypto(true);
+    const pureKdf = [
+      await pbkdf2Sha256("master passphrase", salt, 2000),
+      await hkdfSha256(key, new Uint8Array(0), "termix:dek-wrap:v3:1"),
+      await hkdfSha256(key, salt, "ctx"),
+      await sha256("abc"),
+    ];
+    const pureUuid = randomUUID();
+    __setForcePureJsCrypto(false);
+    nativeKdf.forEach((v, i) => assert.deepEqual(Buffer.from(pureKdf[i]), Buffer.from(v)));
+    assert.match(pureUuid, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+
+    // Vault envelopes move freely between HTTPS (native) and plain-HTTP (pure-JS) sessions
+    const memoryStorage = new Map<string, string>();
+    (globalThis as Record<string, unknown>).localStorage = {
+      getItem: (k: string) => memoryStorage.get(k) ?? null,
+      setItem: (k: string, v: string) => void memoryStorage.set(k, String(v)),
+      removeItem: (k: string) => void memoryStorage.delete(k),
+    };
+    const vaultPlain: VaultPlaintext = {
+      version: 1,
+      hosts: [
+        {
+          id: "h1",
+          name: "prod",
+          protocol: "ssh",
+          host: "203.0.113.10",
+          port: 22,
+          username: "root",
+          authMethod: "password",
+          password: "p@ss ✓",
+          createdAt: 1,
+          updatedAt: 1,
+        },
+      ],
+      snippets: [{ id: "s1", title: "Uptime", command: "uptime", category: "Diagnostics" }],
+      sshKeys: [],
+    };
+    for (const passphrase of ["correct horse", null]) {
+      const nativeEnvelope = await encryptVaultData(vaultPlain, passphrase);
+      __setForcePureJsCrypto(true);
+      const pureT0 = Date.now();
+      const openedOverHttp = await decryptVaultEnvelope(nativeEnvelope, passphrase);
+      const pureMs = Date.now() - pureT0;
+      const httpEnvelope = await encryptVaultData(vaultPlain, passphrase);
+      if (passphrase) {
+        await assert.rejects(decryptVaultEnvelope(httpEnvelope, "wrong"), /Incorrect master passphrase/);
+      }
+      __setForcePureJsCrypto(false);
+      const openedOverHttps = await decryptVaultEnvelope(httpEnvelope, passphrase);
+      assert.equal(openedOverHttp.hosts[0].password, "p@ss ✓");
+      assert.equal(openedOverHttps.hosts[0].password, "p@ss ✓");
+      assert.equal(openedOverHttps.snippets[0].command, "uptime");
+      console.log(
+        `    vault ${passphrase ? "passphrase (PBKDF2 210k)" : "device-key"} mode: native ⇄ pure-JS OK (pure-JS unlock ${pureMs} ms)`
+      );
+    }
+    delete (globalThis as Record<string, unknown>).localStorage;
+  }
+
   const termixFx = await buildTermixFixture({ sshTestPort: sshPort });
   assert.equal(looksLikeTermixDatabaseFile(termixFx.encryptedFile, "db.sqlite.encrypted"), true);
   assert.equal(looksLikeTermixDatabaseFile(termixFx.sqlite, "backup.bin"), true);
@@ -684,6 +894,30 @@ async function runTests() {
     termixFx.buildKey.fingerprint
   );
   assert.deepEqual(termixDb.snippets.map((s) => s.command).sort(), ["df -h", "vcgencmd measure_temp"]);
+  // Plain-HTTP self-hosting (http://<vps-ip>:3000): browsers expose no crypto.subtle
+  // there, so the same import must work through the pure-JS fallback, identically.
+  const hostDigest = (hs: typeof termixDb.hosts) =>
+    hs
+      .map((h) => [h.name, h.protocol, h.password ?? "", h.privateKey ?? "", h.passphrase ?? ""].join("|"))
+      .sort();
+  __setForcePureJsCrypto(true);
+  try {
+    const pureJsDb = await importTermixSqliteDatabase(termixFx.encryptedFile, {
+      termixEnv: termixFx.envFile,
+      termixPassword: termixFx.bobPassword,
+    });
+    assert.equal(pureJsDb.status, "ok");
+    assert.equal(pureJsDb.secrets.locked, 0);
+    assert.equal(pureJsDb.secrets.decrypted, termixDb.secrets.decrypted);
+    assert.deepEqual(hostDigest(pureJsDb.hosts), hostDigest(termixDb.hosts));
+    assert.deepEqual(
+      pureJsDb.sshKeys.map((k) => k.fingerprint).sort(),
+      termixDb.sshKeys.map((k) => k.fingerprint).sort()
+    );
+  } finally {
+    __setForcePureJsCrypto(false);
+  }
+
   const termixAdmin = termixDb.users.find((u) => u.username === "admin");
   const termixBob = termixDb.users.find((u) => u.username === "bob");
   assert.equal(termixAdmin?.unlockMethod, "encryption_key");
@@ -836,6 +1070,82 @@ async function runTests() {
       }
     });
   });
+
+  // Hybrid mode: a Vercel-hosted Sushi sends ITS OWN session token (signed with a
+  // different secret) plus the VPS gateway token — the gateway token must be honored.
+  const wsSshAuth = (fields: Record<string, unknown>) =>
+    new Promise<{ type: string; message?: string }>((resolve, reject) => {
+      const ws = new WebSocket(`ws://127.0.0.1:${gwPort}/ws/ssh`);
+      const timer = setTimeout(() => {
+        ws.terminate();
+        reject(new Error("WebSocket auth timed out"));
+      }, 10000);
+      ws.on("error", (err) => {
+        clearTimeout(timer);
+        reject(err);
+      });
+      ws.on("open", () => {
+        ws.send(JSON.stringify({ type: "auth", cols: 80, rows: 24, credentials: creds, ...fields }));
+      });
+      ws.on("message", (raw) => {
+        const msg = JSON.parse(raw.toString("utf8"));
+        if (msg.type === "ready" || msg.type === "error") {
+          clearTimeout(timer);
+          ws.close();
+          resolve(msg);
+        }
+      });
+    });
+  const foreignSession = createSessionToken("vercel-admin", "f".repeat(64));
+  process.env.SUSHI_GATEWAY_TOKEN = "vps-gateway-token-0123456789";
+  try {
+    const viaGatewayToken = await wsSshAuth({
+      sessionToken: foreignSession,
+      gatewayToken: "vps-gateway-token-0123456789",
+    });
+    assert.equal(viaGatewayToken.type, "ready", viaGatewayToken.message);
+    const wrongGatewayToken = await wsSshAuth({
+      sessionToken: foreignSession,
+      gatewayToken: "not-the-token",
+    });
+    assert.equal(wrongGatewayToken.type, "error");
+    assert.match(wrongGatewayToken.message ?? "", /Gateway token rejected/);
+
+    // RDP passes tokens in the query string: session + token are checked separately
+    await new Promise<void>((resolve, reject) => {
+      const payload = Buffer.from(
+        JSON.stringify({ host: "127.0.0.1", port: rdpPort, username: "a", password: "b" }),
+        "utf8"
+      ).toString("base64url");
+      const ws = new WebSocket(
+        `ws://127.0.0.1:${gwPort}/ws/rdp?payload=${encodeURIComponent(payload)}&session=${encodeURIComponent(
+          foreignSession
+        )}&token=vps-gateway-token-0123456789`,
+        "guacamole"
+      );
+      const timer = setTimeout(() => reject(new Error("RDP gateway-token handshake timed out")), 10000);
+      ws.on("error", reject);
+      ws.on("close", (code) => {
+        if (code === 1008) {
+          clearTimeout(timer);
+          reject(new Error("RDP gateway token was rejected"));
+        }
+      });
+      ws.on("message", (raw) => {
+        const instrs = parseGuacBrowserMessage(raw.toString("utf8"));
+        if (instrs.some((i) => i[0] === "" && i.length === 2 && i[1].length === 36)) {
+          clearTimeout(timer);
+          ws.close();
+          resolve();
+        }
+      });
+    });
+  } finally {
+    delete process.env.SUSHI_GATEWAY_TOKEN;
+  }
+  const unconfiguredGateway = await wsSshAuth({ gatewayToken: "vps-gateway-token-0123456789" });
+  assert.equal(unconfiguredGateway.type, "error");
+  assert.match(unconfiguredGateway.message ?? "", /no SUSHI_GATEWAY_TOKEN configured/);
 
   // Test /ws/rdp Guacamole subprotocol handshake + ping echo + size frame
   await new Promise<void>((resolve, reject) => {

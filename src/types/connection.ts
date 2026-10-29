@@ -4,6 +4,17 @@ export type AuthMethod = "password" | "privateKey";
 
 export type RdpSecurityMode = "any" | "nla" | "tls" | "rdp";
 
+export interface WhitelistedSshKey {
+  id: string;
+  name: string;
+  privateKey: string;
+  passphrase?: string;
+  publicKey?: string;
+  keyType?: string;
+  fingerprint?: string;
+  createdAt: number;
+}
+
 export interface HostProfile {
   id: string;
   name: string;
@@ -15,6 +26,7 @@ export interface HostProfile {
   password?: string;
   privateKey?: string;
   passphrase?: string;
+  sshKeyId?: string;
   // RDP specific options
   domain?: string;
   rdpSecurity?: RdpSecurityMode;

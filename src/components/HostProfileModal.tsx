@@ -22,7 +22,9 @@ import type {
   RdpProbeResult,
   RdpSecurityMode,
   SshTestResult,
+  WhitelistedSshKey,
 } from "@/types/connection";
+import { resolveProfileWithKeychain } from "@/lib/client/crypto-vault";
 import {
   type GatewaySettings,
   getAuthHeaders,
@@ -33,6 +35,9 @@ interface HostProfileModalProps {
   isOpen: boolean;
   initialProfile?: Partial<HostProfile> | null;
   gatewaySettings: GatewaySettings;
+  sshKeys?: WhitelistedSshKey[];
+  enforceKeyWhitelist?: boolean;
+  onAddWhitelistedKey?: (key: WhitelistedSshKey) => Promise<void>;
   onClose: () => void;
   onSave: (profile: HostProfile, connectAfterSave?: boolean) => void;
   onQuickConnectOnly?: (profile: HostProfile) => void;
@@ -51,6 +56,9 @@ export function HostProfileModal({
   isOpen,
   initialProfile,
   gatewaySettings,
+  sshKeys = [],
+  enforceKeyWhitelist = false,
+  onAddWhitelistedKey,
   onClose,
   onSave,
   onQuickConnectOnly,
@@ -64,6 +72,8 @@ export function HostProfileModal({
   const [password, setPassword] = useState("");
   const [privateKey, setPrivateKey] = useState("");
   const [passphrase, setPassphrase] = useState("");
+  const [sshKeyId, setSshKeyId] = useState<string>("");
+  const [whitelistingInline, setWhitelistingInline] = useState(false);
   const [domain, setDomain] = useState("");
   const [rdpSecurity, setRdpSecurity] = useState<RdpSecurityMode>("any");
   const [ignoreCert, setIgnoreCert] = useState(true);
@@ -93,6 +103,7 @@ export function HostProfileModal({
     setPassword(initialProfile?.password || "");
     setPrivateKey(initialProfile?.privateKey || "");
     setPassphrase(initialProfile?.passphrase || "");
+    setSshKeyId(initialProfile?.sshKeyId || "");
     setDomain(initialProfile?.domain || "");
     setRdpSecurity(initialProfile?.rdpSecurity || "any");
     setIgnoreCert(initialProfile?.ignoreCert !== false);
@@ -164,6 +175,23 @@ export function HostProfileModal({
     }
 
     const now = Date.now();
+    const selectedWhitelisted =
+      authMethod === "privateKey" && sshKeyId
+        ? sshKeys.find((k) => k.id === sshKeyId)
+        : undefined;
+
+    if (
+      protocol !== "rdp" &&
+      authMethod === "privateKey" &&
+      enforceKeyWhitelist &&
+      !selectedWhitelisted
+    ) {
+      setFormError(
+        "Private Key Whitelist is enforced: select an approved Vault SSH key or click 'Add to Whitelist' first."
+      );
+      return null;
+    }
+
     return {
       id: initialProfile?.id || crypto.randomUUID(),
       name: name.trim() || `${username.trim()}@${host.trim()}`,
@@ -173,8 +201,18 @@ export function HostProfileModal({
       username: username.trim(),
       authMethod,
       password,
-      privateKey: authMethod === "privateKey" ? privateKey : undefined,
-      passphrase: authMethod === "privateKey" ? passphrase : undefined,
+      sshKeyId:
+        authMethod === "privateKey" && selectedWhitelisted
+          ? selectedWhitelisted.id
+          : undefined,
+      privateKey:
+        authMethod === "privateKey"
+          ? selectedWhitelisted?.privateKey ?? privateKey
+          : undefined,
+      passphrase:
+        authMethod === "privateKey"
+          ? selectedWhitelisted?.passphrase ?? passphrase
+          : undefined,
       domain: protocol === "rdp" ? domain.trim() : undefined,
       rdpSecurity: protocol === "rdp" ? rdpSecurity : undefined,
       ignoreCert: protocol === "rdp" ? ignoreCert : undefined,
@@ -216,56 +254,51 @@ export function HostProfileModal({
         setRdpProbeResult(data);
       } else {
         // Test SSH/SFTP via local serverless/node endpoint (fallback to gateway if needed)
+        const draftProfile = buildProfile();
+        if (!draftProfile) {
+          setTesting(false);
+          return;
+        }
+        const resolved = resolveProfileWithKeychain(
+          draftProfile,
+          sshKeys,
+          enforceKeyWhitelist
+        );
+        if (!resolved.ok) {
+          setFormError(resolved.error);
+          setTesting(false);
+          return;
+        }
+        const testCreds = {
+          host: resolved.profile.host,
+          port: resolved.profile.port,
+          username: resolved.profile.username,
+          authMethod: resolved.profile.authMethod,
+          password: resolved.profile.password,
+          privateKey: resolved.profile.privateKey,
+          passphrase: resolved.profile.passphrase,
+        };
+
         const endpoint = apiBase ? `${apiBase}/api/ssh/test` : "/api/ssh/test";
         let res: Response;
         try {
           res = await fetch(endpoint, {
             method: "POST",
             headers: getAuthHeaders(gatewaySettings),
-            body: JSON.stringify({
-              credentials: {
-                host: host.trim(),
-                port: Number(port || 22),
-                username: username.trim() || "root",
-                authMethod,
-                password,
-                privateKey,
-                passphrase,
-              },
-            }),
+            body: JSON.stringify({ credentials: testCreds }),
           });
           if (res.status === 404 && apiBase) {
             res = await fetch("/api/ssh/test", {
               method: "POST",
               headers: getAuthHeaders(gatewaySettings),
-              body: JSON.stringify({
-                credentials: {
-                  host: host.trim(),
-                  port: Number(port || 22),
-                  username: username.trim() || "root",
-                  authMethod,
-                  password,
-                  privateKey,
-                  passphrase,
-                },
-              }),
+              body: JSON.stringify({ credentials: testCreds }),
             });
           }
         } catch {
           res = await fetch("/api/ssh/test", {
             method: "POST",
             headers: getAuthHeaders(gatewaySettings),
-            body: JSON.stringify({
-              credentials: {
-                host: host.trim(),
-                port: Number(port || 22),
-                username: username.trim() || "root",
-                authMethod,
-                password,
-                privateKey,
-                passphrase,
-              },
-            }),
+            body: JSON.stringify({ credentials: testCreds }),
           });
         }
 
@@ -476,39 +509,123 @@ export function HostProfileModal({
                 </div>
               ) : (
                 <div className="space-y-3">
-                  <div className="flex items-center justify-between">
-                    <label className="text-xs text-slate-400">
-                      PEM / OpenSSH Private Key (Ed25519, RSA, ECDSA)
-                    </label>
-                    <label className="flex cursor-pointer items-center gap-1.5 rounded-lg border border-white/10 bg-white/5 px-2.5 py-1 text-xs text-slate-200 transition hover:bg-white/10">
-                      <Upload className="h-3.5 w-3.5" />
-                      Import Key File
-                      <input
-                        type="file"
-                        onChange={handleKeyFileUpload}
-                        className="hidden"
-                      />
-                    </label>
-                  </div>
-                  <textarea
-                    rows={4}
-                    value={privateKey}
-                    onChange={(e) => setPrivateKey(e.target.value)}
-                    placeholder="-----BEGIN OPENSSH PRIVATE KEY-----&#10;..."
-                    className="font-mono-code w-full rounded-xl border border-white/10 bg-[#0b0e14] p-3 text-xs text-slate-200 placeholder-slate-600 outline-none focus:border-white/25"
-                  />
                   <div>
                     <label className="mb-1 block text-xs text-slate-400">
-                      Key Passphrase (optional)
+                      Whitelisted SSH Keychain
                     </label>
-                    <input
-                      type="password"
-                      value={passphrase}
-                      onChange={(e) => setPassphrase(e.target.value)}
-                      placeholder="Leave empty if unencrypted"
-                      className="w-full rounded-xl border border-white/10 bg-[#0b0e14] px-3.5 py-2 text-sm text-white placeholder-slate-500 outline-none focus:border-white/25"
-                    />
+                    <select
+                      value={sshKeyId}
+                      onChange={(e) => setSshKeyId(e.target.value)}
+                      className="w-full rounded-xl border border-white/10 bg-[#0b0e14] px-3.5 py-2 text-xs text-white outline-none focus:border-white/25"
+                    >
+                      <option value="">
+                        {enforceKeyWhitelist
+                          ? "— Select an approved Whitelisted SSH Key —"
+                          : "— Custom inline private key —"}
+                      </option>
+                      {sshKeys.map((k) => (
+                        <option key={k.id} value={k.id}>
+                          {k.name}
+                          {k.fingerprint ? ` (${k.fingerprint.slice(0, 22)}…)` : ""}
+                        </option>
+                      ))}
+                    </select>
                   </div>
+
+                  {!sshKeyId && (
+                    <>
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <label className="text-xs text-slate-400">
+                          PEM / OpenSSH Private Key (Ed25519, RSA, ECDSA)
+                        </label>
+                        <div className="flex items-center gap-1.5">
+                          {privateKey.trim() && onAddWhitelistedKey && (
+                            <button
+                              type="button"
+                              disabled={whitelistingInline}
+                              onClick={async () => {
+                                setFormError(null);
+                                setWhitelistingInline(true);
+                                try {
+                                  const keyLabel =
+                                    name.trim() ||
+                                    `${username.trim() || "ssh"}@${host.trim() || "server"}`;
+                                  const res = await fetch("/api/ssh/key-inspect", {
+                                    method: "POST",
+                                    headers: getAuthHeaders(gatewaySettings),
+                                    body: JSON.stringify({
+                                      action: "inspect",
+                                      privateKey: privateKey.trim(),
+                                      passphrase: passphrase || undefined,
+                                      label: keyLabel,
+                                    }),
+                                  });
+                                  const data = await res.json();
+                                  if (!res.ok || !data.ok) {
+                                    throw new Error(
+                                      data.error || "Invalid private key."
+                                    );
+                                  }
+                                  const newKey: WhitelistedSshKey = {
+                                    id: crypto.randomUUID(),
+                                    name: keyLabel,
+                                    privateKey: privateKey.trim(),
+                                    passphrase: passphrase || undefined,
+                                    publicKey: data.publicKeyOpenSSH,
+                                    keyType: data.keyType,
+                                    fingerprint: data.fingerprint,
+                                    createdAt: Date.now(),
+                                  };
+                                  await onAddWhitelistedKey(newKey);
+                                  setSshKeyId(newKey.id);
+                                } catch (err) {
+                                  setFormError(
+                                    err instanceof Error
+                                      ? err.message
+                                      : "Could not whitelist key."
+                                  );
+                                } finally {
+                                  setWhitelistingInline(false);
+                                }
+                              }}
+                              className="inline-flex items-center gap-1 rounded-lg border border-emerald-500/30 bg-emerald-500/15 px-2.5 py-1 text-xs font-medium text-emerald-300 transition hover:bg-emerald-500/25 disabled:opacity-50"
+                            >
+                              <ShieldCheck className="h-3.5 w-3.5" />
+                              Add to Whitelist
+                            </button>
+                          )}
+                          <label className="flex cursor-pointer items-center gap-1.5 rounded-lg border border-white/10 bg-white/5 px-2.5 py-1 text-xs text-slate-200 transition hover:bg-white/10">
+                            <Upload className="h-3.5 w-3.5" />
+                            Import Key File
+                            <input
+                              type="file"
+                              onChange={handleKeyFileUpload}
+                              className="hidden"
+                            />
+                          </label>
+                        </div>
+                      </div>
+                      <textarea
+                        rows={4}
+                        value={privateKey}
+                        onChange={(e) => setPrivateKey(e.target.value)}
+                        placeholder="-----BEGIN OPENSSH PRIVATE KEY-----&#10;..."
+                        className="font-mono-code w-full rounded-xl border border-white/10 bg-[#0b0e14] p-3 text-xs text-slate-200 placeholder-slate-600 outline-none focus:border-white/25"
+                      />
+                      <div>
+                        <label className="mb-1 block text-xs text-slate-400">
+                          Key Passphrase (optional)
+                        </label>
+                        <input
+                          type="password"
+                          value={passphrase}
+                          onChange={(e) => setPassphrase(e.target.value)}
+                          placeholder="Leave empty if unencrypted"
+                          className="w-full rounded-xl border border-white/10 bg-[#0b0e14] px-3.5 py-2 text-sm text-white placeholder-slate-500 outline-none focus:border-white/25"
+                        />
+                      </div>
+                    </>
+                  )}
                 </div>
               )}
 

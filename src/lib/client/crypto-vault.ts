@@ -1,9 +1,15 @@
-import type { CommandSnippet, HostProfile } from "@/types/connection";
+import type {
+  CommandSnippet,
+  HostProfile,
+  WhitelistedSshKey,
+} from "@/types/connection";
 
 export interface VaultPlaintext {
   version: 1;
   hosts: HostProfile[];
   snippets: CommandSnippet[];
+  sshKeys?: WhitelistedSshKey[];
+  enforceKeyWhitelist?: boolean;
 }
 
 export interface EncryptedVaultEnvelope {
@@ -204,6 +210,8 @@ export async function decryptVaultEnvelope(
         Array.isArray(parsed.snippets) && parsed.snippets.length > 0
           ? parsed.snippets
           : DEFAULT_SNIPPETS,
+      sshKeys: Array.isArray(parsed.sshKeys) ? parsed.sshKeys : [],
+      enforceKeyWhitelist: Boolean(parsed.enforceKeyWhitelist),
     };
   } catch {
     throw new Error(
@@ -233,4 +241,62 @@ export function saveLocalEnvelope(envelope: EncryptedVaultEnvelope): void {
 export function clearDeviceKey(): void {
   if (typeof window === "undefined") return;
   localStorage.removeItem(DEVICE_KEY_STORAGE_KEY);
+}
+
+/**
+ * Resolves a HostProfile's SSH private key from the Vault Whitelisted Keychain
+ * (`sshKeyId`) and enforces `enforceKeyWhitelist` if enabled.
+ */
+export function resolveProfileWithKeychain(
+  profile: HostProfile,
+  sshKeys: WhitelistedSshKey[],
+  enforceKeyWhitelist = false
+): { ok: true; profile: HostProfile } | { ok: false; error: string } {
+  if (profile.protocol === "rdp" || profile.authMethod !== "privateKey") {
+    return { ok: true, profile };
+  }
+
+  if (profile.sshKeyId) {
+    const matched = sshKeys.find((k) => k.id === profile.sshKeyId);
+    if (!matched) {
+      return {
+        ok: false,
+        error:
+          "The whitelisted SSH key linked to this host was removed from Vault. Edit the host to select an active whitelisted key.",
+      };
+    }
+    return {
+      ok: true,
+      profile: {
+        ...profile,
+        privateKey: matched.privateKey,
+        passphrase: matched.passphrase ?? profile.passphrase,
+      },
+    };
+  }
+
+  if (enforceKeyWhitelist) {
+    const cleanInline = (profile.privateKey || "").trim();
+    const matchedByContent = sshKeys.find(
+      (k) => k.privateKey.trim() === cleanInline && cleanInline.length > 0
+    );
+    if (!matchedByContent) {
+      return {
+        ok: false,
+        error:
+          "Private Key Whitelist Enforcement is enabled: add this private key to your Vault SSH Key Whitelist before connecting.",
+      };
+    }
+    return {
+      ok: true,
+      profile: {
+        ...profile,
+        sshKeyId: matchedByContent.id,
+        privateKey: matchedByContent.privateKey,
+        passphrase: matchedByContent.passphrase ?? profile.passphrase,
+      },
+    };
+  }
+
+  return { ok: true, profile };
 }

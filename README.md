@@ -10,10 +10,12 @@ It is designed around a **Hybrid VPS + Serverless Architecture**:
 
 ## Features
 
-- **Username, Password & WebAuthn Passkey Protection**
-  - Full login gate guarding the Sushi UI, SSH/SFTP/RDP API routes, Vault sync, and `/ws/ssh` & `/ws/rdp` WebSockets
-  - First-run interactive admin setup on VPS (`scrypt`-hashed in `/data/auth.json`) + environment variable setup (`SUSHI_AUTH_USERNAME` / `SUSHI_AUTH_PASSWORD` / `SUSHI_AUTH_SECRET`) on Vercel
-  - **FIDO2 / WebAuthn Passkeys** (`@simplewebauthn/server` & `@simplewebauthn/browser`) for Touch ID, Face ID, Windows Hello, and YubiKey — stored on disk on VPS and backed by HMAC-signed passkey certificates (`+ optional SUSHI_PASSKEYS_JSON`) on stateless Vercel
+- **Username, Password, WebAuthn Passkey & Whitelisted Private Key Protection**
+  - Interactive first-run Admin Setup directly in the browser on **both VPS and Vercel** (no manual env copy-paste required!), plus optional `SUSHI_AUTH_USERNAME` / `SUSHI_AUTH_PASSWORD` / `SUSHI_AUTHORIZED_KEYS` environment overrides
+  - **Whitelisted Private Key Login & SSH Keychain**: Sign in to Sushi using an `ed25519` / `rsa` / `ecdsa` private key verified via cryptographic challenge signature against whitelisted public keys, and optionally enforce a strict **Vault SSH Key Whitelist** across all SSH/SFTP server connections
+  - **FIDO2 / WebAuthn Passkeys** (`@simplewebauthn/server` & `@simplewebauthn/browser`) for Touch ID, Face ID, Windows Hello, and YubiKey
+- **Termix File Import & Export (`Termix-SSH/Termix`)**
+  - Seamless import from Termix Host Export (`.json`), Termix Share Export, Termix v2.0 User Data Export, and OpenSSH `~/.ssh/config` — plus 1-click export to Termix JSON (with or without secrets)
 - **SSH Terminal (`@xterm/xterm` + `ssh2`)**
   - Live bidirectional **WebSocket PTY** (`/ws/ssh`) on VPS/Gateway (`vim`, `htop`, `tmux`, resize, 256-color ANSI)
   - Automatic **Serverless HTTP Streaming Shell** (`/api/ssh/exec`) fallback on Vercel with persistent working directory (`cd`), command history, and Ctrl+C cancellation

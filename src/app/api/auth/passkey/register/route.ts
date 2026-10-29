@@ -38,7 +38,7 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  const cfg = await getEffectiveAuthConfig();
+  const cfg = await getEffectiveAuthConfig(req.headers);
   if (!cfg.initialized) {
     return NextResponse.json(
       { ok: false, error: "Admin account is not initialized." },

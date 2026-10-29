@@ -29,22 +29,23 @@ export async function OPTIONS(req: NextRequest) {
 
 export async function POST(req: NextRequest) {
   const cors = getCorsHeaders(req.headers.get("origin"));
-  const cfg = await getEffectiveAuthConfig();
-
-  if (!cfg.initialized) {
-    return NextResponse.json(
-      { ok: false, error: "Admin account is not initialized yet." },
-      { status: 400, headers: cors }
-    );
-  }
 
   try {
     const body = (await req.json()) as {
       step?: "options" | "verify";
       signedCertificates?: string[];
+      adminProfileCert?: string;
       challengeToken?: string;
       assertion?: AuthenticationResponseJSON;
     };
+
+    const cfg = await getEffectiveAuthConfig(req.headers, body.adminProfileCert);
+    if (!cfg.initialized) {
+      return NextResponse.json(
+        { ok: false, error: "Admin account is not initialized yet." },
+        { status: 400, headers: cors }
+      );
+    }
 
     const { rpID, origin } = resolveWebAuthnRpFromRequest(req);
     const certKeys = verifySignedPasskeyCertificates(

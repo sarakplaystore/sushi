@@ -22,6 +22,7 @@ import {
   parseGuacDaemonStream,
 } from "../src/lib/server/guacd-bridge";
 import { createGatewayWebSockets } from "../src/lib/server/ws-gateway";
+import { META_REGEX, splitEmittable } from "../src/lib/server/exec-stream";
 import {
   bootstrapAdminAccount,
   createChallengeToken,
@@ -34,13 +35,37 @@ import {
 } from "../src/lib/server/auth";
 import {
   generateEd25519KeyPair,
+  normalizePrivateKeyForSsh,
   verifyPrivateKeyAgainstWhitelist,
 } from "../src/lib/server/ssh-key-utils";
 import {
   exportToTermixFile,
   importFromTermixContent,
 } from "../src/lib/client/termix-porter";
-import { resolveProfileWithKeychain } from "../src/lib/client/crypto-vault";
+import {
+  importTermixSqliteDatabase,
+  looksLikeTermixDatabaseFile,
+  parseTermixEnvSecrets,
+} from "../src/lib/client/termix-sqlite";
+import {
+  decryptVaultEnvelope,
+  encryptVaultData,
+  resolveProfileWithKeychain,
+  type VaultPlaintext,
+} from "../src/lib/client/crypto-vault";
+import {
+  __setForcePureJsCrypto,
+  aesGcmDecrypt,
+  aesGcmEncrypt,
+  hkdfSha256,
+  pbkdf2Sha256,
+  randomUUID,
+  sha256,
+} from "../src/lib/client/web-crypto";
+import {
+  buildTermixFixture,
+  termixEncryptDatabaseTwoFile,
+} from "./fixtures/termix-sqlite-fixture";
 
 const OPEN_MODE = {
   READ: 0x00000001,
@@ -63,7 +88,7 @@ interface MemNode {
 }
 
 async function runTests() {
-  console.log("==> [1/5] Starting ephemeral SSH2 + SFTP test server...");
+  console.log("==> [1/8] Starting ephemeral SSH2 + SFTP test server...");
   const { privateKey } = crypto.generateKeyPairSync("rsa", {
     modulusLength: 2048,
     privateKeyEncoding: { type: "pkcs1", format: "pem" },
@@ -88,6 +113,20 @@ async function runTests() {
       if (ctx.method === "password" && ctx.username === "tester" && ctx.password === "sushipass") {
         ctx.accept();
       } else if (ctx.method === "publickey" && ctx.username === "tester") {
+        // Verify the client really holds the private key for the offered public key
+        if (ctx.signature && ctx.blob) {
+          const typeLen = ctx.key.data.readUInt32BE(0);
+          const keyType = ctx.key.data.subarray(4, 4 + typeLen).toString("latin1");
+          const offered = sshUtils.parseKey(`${keyType} ${ctx.key.data.toString("base64")}`);
+          const offeredKey = Array.isArray(offered) ? offered[0] : offered;
+          if (
+            offeredKey instanceof Error ||
+            offeredKey.verify(ctx.blob, ctx.signature, ctx.hashAlgo) !== true
+          ) {
+            ctx.reject(["password", "publickey"]);
+            return;
+          }
+        }
         ctx.accept();
       } else {
         ctx.reject(["password", "publickey"]);
@@ -273,7 +312,7 @@ async function runTests() {
   await new Promise<void>((resolve) => sshServer.listen(0, "127.0.0.1", () => resolve()));
   const sshPort = (sshServer.address() as net.AddressInfo).port;
 
-  console.log("==> [2/5] Testing SSH password + Ed25519 private key authentication & SFTP operations...");
+  console.log("==> [2/8] Testing SSH password + Ed25519 private key authentication & SFTP operations...");
   const passTest = await testSshConnection({
     host: "127.0.0.1",
     port: sshPort,
@@ -293,6 +332,101 @@ async function runTests() {
     privateKey: clientKeys.private,
   });
   assert.equal(keyTest.ok, true);
+
+  // Private key formats ssh2 can't parse natively (PKCS#8 RSA / ECDSA / Ed25519, plain
+  // and encrypted) and keys damaged by copy & paste are normalized before login.
+  const rsaPair = crypto.generateKeyPairSync("rsa", { modulusLength: 2048 });
+  const ecPair = crypto.generateKeyPairSync("ec", { namedCurve: "prime256v1" });
+  const edPair = crypto.generateKeyPairSync("ed25519");
+  const encryptedPkcs8 = rsaPair.privateKey
+    .export({ type: "pkcs8", format: "pem", cipher: "aes-256-cbc", passphrase: "pk8pass" })
+    .toString();
+  const keyFormatCases: Array<[string, string, string?]> = [
+    ["RSA PKCS#8", rsaPair.privateKey.export({ type: "pkcs8", format: "pem" }).toString()],
+    ["ECDSA PKCS#8", ecPair.privateKey.export({ type: "pkcs8", format: "pem" }).toString()],
+    ["Ed25519 PKCS#8", edPair.privateKey.export({ type: "pkcs8", format: "pem" }).toString()],
+    ["encrypted RSA PKCS#8", encryptedPkcs8, "pk8pass"],
+    ["OpenSSH key flattened onto one line", clientKeys.private.trim().replace(/\n/g, " ")],
+    ["OpenSSH key with literal \\n escapes", clientKeys.private.trim().replace(/\n/g, "\\n")],
+    [
+      "indented OpenSSH key with CRLF",
+      clientKeys.private.split("\n").map((l) => `   ${l}`).join("\r\n"),
+    ],
+  ];
+  for (const [label, privateKey, passphrase] of keyFormatCases) {
+    const normalized = normalizePrivateKeyForSsh(privateKey, passphrase);
+    assert.equal(sshUtils.parseKey(normalized.privateKey, normalized.passphrase) instanceof Error, false, label);
+    const formatTest = await testSshConnection({
+      host: "127.0.0.1",
+      port: sshPort,
+      username: "tester",
+      authMethod: "privateKey",
+      privateKey,
+      passphrase,
+    });
+    assert.equal(formatTest.ok, true, `${label}: ${formatTest.error}`);
+  }
+
+  // Actionable errors instead of raw ssh2 / socket messages
+  const sshErr = async (overrides: Record<string, unknown>) =>
+    (
+      await testSshConnection({
+        host: "127.0.0.1",
+        port: sshPort,
+        username: "tester",
+        authMethod: "privateKey",
+        ...overrides,
+      } as Parameters<typeof testSshConnection>[0])
+    ).error ?? "";
+  assert.match(await sshErr({ privateKey: encryptedPkcs8 }), /passphrase-protected/);
+  assert.match(await sshErr({ privateKey: encryptedPkcs8, passphrase: "nope" }), /Incorrect passphrase/);
+  assert.match(await sshErr({ privateKey: clientKeys.public }), /public key/);
+  assert.match(
+    await sshErr({ authMethod: "password", password: "wrong-password" }),
+    /Authentication failed for tester@127\.0\.0\.1: wrong username or password/
+  );
+  assert.match(
+    await sshErr({ host: "root@127.0.0.1", authMethod: "password", password: "x" }),
+    /put the username \("root"\) in the Username field/
+  );
+  const closedPortServer = net.createServer();
+  await new Promise<void>((resolve) => closedPortServer.listen(0, "127.0.0.1", () => resolve()));
+  const closedPort = (closedPortServer.address() as net.AddressInfo).port;
+  await new Promise<void>((resolve) => closedPortServer.close(() => resolve()));
+  assert.match(
+    await sshErr({ port: closedPort, authMethod: "password", password: "x" }),
+    new RegExp(`Connection refused by 127\\.0\\.0\\.1:${closedPort}`)
+  );
+
+  // Serverless exec stream: prompts are emitted immediately (not held in a buffer),
+  // while a META marker split across SSH packets is still reassembled and stripped.
+  assert.deepEqual(splitEmittable("[sudo] password for tester: "), ["[sudo] password for tester: ", ""]);
+  assert.deepEqual(splitEmittable("Do you want to continue? [Y/n] "), ["Do you want to continue? [Y/n] ", ""]);
+  assert.deepEqual(splitEmittable("colored \x1b[32mok\x1b[0m"), ["colored \x1b[32mok\x1b[0m", ""]);
+  {
+    const fullOutput = "line one\r\nline two\r\n\x1b]777;SUSHI_META;0;/srv/app\x07";
+    for (let cut = 1; cut < fullOutput.length; cut++) {
+      let carry = "";
+      let shown = "";
+      let meta: RegExpExecArray | null = null;
+      for (const packet of [fullOutput.slice(0, cut), fullOutput.slice(cut)]) {
+        carry += packet;
+        const m = META_REGEX.exec(carry);
+        if (m) {
+          shown += carry.slice(0, m.index);
+          meta = m;
+          carry = carry.slice(m.index + m[0].length);
+        } else {
+          const [emit, hold] = splitEmittable(carry);
+          shown += emit;
+          carry = hold;
+        }
+      }
+      assert.ok(meta, `marker found when split at ${cut}`);
+      assert.equal(meta![2], "/srv/app");
+      assert.equal(shown, "line one\r\nline two", `clean output when split at ${cut}`);
+    }
+  }
 
   const creds = {
     host: "127.0.0.1",
@@ -321,7 +455,7 @@ async function runTests() {
   const listAfterDel = await sftpListDirectory(creds, "/");
   assert.equal(listAfterDel.entries.some((e) => e.name === "configs"), false);
 
-  console.log("==> [3/5] Testing MS-RDPBCGR X.224 RDP Server Probe...");
+  console.log("==> [3/8] Testing MS-RDPBCGR X.224 RDP Server Probe...");
   const rdpMock = net.createServer((sock) => {
     sock.once("data", (data) => {
       // Verify TPKT v3 & X.224 CR (0xE0)
@@ -348,7 +482,7 @@ async function runTests() {
   assert.equal(rdpRes.reachable, true);
   assert.ok(rdpRes.supportedProtocols.includes("Standard RDP"));
 
-  console.log("==> [4/6] Testing Username/Password + Passkey Certificate & Session Protection...");
+  console.log("==> [4/8] Testing Username/Password + Passkey Certificate & Session Protection...");
   process.env.SUSHI_AUTH_USERNAME = "sushiadmin";
   process.env.SUSHI_AUTH_PASSWORD = "correct-horse-battery";
   process.env.SUSHI_AUTH_SECRET = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -463,7 +597,7 @@ async function runTests() {
   process.env.SUSHI_AUTH_PASSWORD = "correct-horse-battery";
 
   // Verify Vault SSH Key Whitelist Enforcement & Termix Export/Import Round-Trip
-  console.log("==> [5/7] Testing Vault Key Whitelist Enforcement & Termix File Export/Import...");
+  console.log("==> [5/8] Testing Vault Key Whitelist Enforcement & Termix File Export/Import...");
   const whitelistedVaultKey = {
     id: "vault-key-1",
     name: "Prod Ed25519",
@@ -592,7 +726,257 @@ async function runTests() {
   assert.equal(importedV2.hosts[0].authMethod, "privateKey");
   assert.deepEqual(importedV2.hosts[0].tags, ["prod", "k8s"]);
 
-  console.log("==> [6/7] Testing Protected WebSocket SSH PTY & Guacamole RDP Bridge (/ws/ssh & /ws/rdp)...");
+  console.log("==> [6/8] Testing vault crypto on plain HTTP (pure-JS fallback) + Termix SQLite import...");
+  // Browsers only expose crypto.subtle / crypto.randomUUID on HTTPS or localhost. On a
+  // plain-HTTP self-hosted instance Sushi falls back to @noble — it must be byte-compatible.
+  {
+    const key = crypto.randomBytes(32);
+    const message = new TextEncoder().encode(`sushi vault ✓ ${"x".repeat(2048)}`);
+    for (const iv of [crypto.randomBytes(12), crypto.randomBytes(16)]) {
+      const nativeCt = await aesGcmEncrypt(key, iv, message);
+      __setForcePureJsCrypto(true);
+      const pureCt = await aesGcmEncrypt(key, iv, message);
+      const pureOpened = await aesGcmDecrypt(key, iv, nativeCt);
+      const tampered = Buffer.from(nativeCt);
+      tampered[0] ^= 1;
+      await assert.rejects(aesGcmDecrypt(key, iv, tampered));
+      __setForcePureJsCrypto(false);
+      assert.deepEqual(Buffer.from(pureCt), Buffer.from(nativeCt));
+      assert.deepEqual(Buffer.from(pureOpened), Buffer.from(message));
+      assert.deepEqual(Buffer.from(await aesGcmDecrypt(key, iv, pureCt)), Buffer.from(message));
+    }
+    const salt = crypto.randomBytes(16);
+    const nativeKdf = [
+      await pbkdf2Sha256("master passphrase", salt, 2000),
+      await hkdfSha256(key, new Uint8Array(0), "termix:dek-wrap:v3:1"),
+      await hkdfSha256(key, salt, "ctx"),
+      await sha256("abc"),
+    ];
+    __setForcePureJsCrypto(true);
+    const pureKdf = [
+      await pbkdf2Sha256("master passphrase", salt, 2000),
+      await hkdfSha256(key, new Uint8Array(0), "termix:dek-wrap:v3:1"),
+      await hkdfSha256(key, salt, "ctx"),
+      await sha256("abc"),
+    ];
+    const pureUuid = randomUUID();
+    __setForcePureJsCrypto(false);
+    nativeKdf.forEach((v, i) => assert.deepEqual(Buffer.from(pureKdf[i]), Buffer.from(v)));
+    assert.match(pureUuid, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+
+    // Vault envelopes move freely between HTTPS (native) and plain-HTTP (pure-JS) sessions
+    const memoryStorage = new Map<string, string>();
+    (globalThis as Record<string, unknown>).localStorage = {
+      getItem: (k: string) => memoryStorage.get(k) ?? null,
+      setItem: (k: string, v: string) => void memoryStorage.set(k, String(v)),
+      removeItem: (k: string) => void memoryStorage.delete(k),
+    };
+    const vaultPlain: VaultPlaintext = {
+      version: 1,
+      hosts: [
+        {
+          id: "h1",
+          name: "prod",
+          protocol: "ssh",
+          host: "203.0.113.10",
+          port: 22,
+          username: "root",
+          authMethod: "password",
+          password: "p@ss ✓",
+          createdAt: 1,
+          updatedAt: 1,
+        },
+      ],
+      snippets: [{ id: "s1", title: "Uptime", command: "uptime", category: "Diagnostics" }],
+      sshKeys: [],
+    };
+    for (const passphrase of ["correct horse", null]) {
+      const nativeEnvelope = await encryptVaultData(vaultPlain, passphrase);
+      __setForcePureJsCrypto(true);
+      const pureT0 = Date.now();
+      const openedOverHttp = await decryptVaultEnvelope(nativeEnvelope, passphrase);
+      const pureMs = Date.now() - pureT0;
+      const httpEnvelope = await encryptVaultData(vaultPlain, passphrase);
+      if (passphrase) {
+        await assert.rejects(decryptVaultEnvelope(httpEnvelope, "wrong"), /Incorrect master passphrase/);
+      }
+      __setForcePureJsCrypto(false);
+      const openedOverHttps = await decryptVaultEnvelope(httpEnvelope, passphrase);
+      assert.equal(openedOverHttp.hosts[0].password, "p@ss ✓");
+      assert.equal(openedOverHttps.hosts[0].password, "p@ss ✓");
+      assert.equal(openedOverHttps.snippets[0].command, "uptime");
+      console.log(
+        `    vault ${passphrase ? "passphrase (PBKDF2 210k)" : "device-key"} mode: native ⇄ pure-JS OK (pure-JS unlock ${pureMs} ms)`
+      );
+    }
+    delete (globalThis as Record<string, unknown>).localStorage;
+  }
+
+  const termixFx = await buildTermixFixture({ sshTestPort: sshPort });
+  assert.equal(looksLikeTermixDatabaseFile(termixFx.encryptedFile, "db.sqlite.encrypted"), true);
+  assert.equal(looksLikeTermixDatabaseFile(termixFx.sqlite, "backup.bin"), true);
+  assert.equal(looksLikeTermixDatabaseFile(new TextEncoder().encode(termixV2), "export.json"), false);
+
+  // .env parsing: Termix .env file, docker-compose style, and a bare hex key
+  const parsedEnv = parseTermixEnvSecrets(termixFx.envFile);
+  assert.equal(Buffer.from(parsedEnv.databaseKey!).toString("hex"), termixFx.databaseKeyHex);
+  assert.equal(Buffer.from(parsedEnv.encryptionKey!).toString("hex"), termixFx.encryptionKeyHex);
+  const composeEnv = parseTermixEnvSecrets(`  - DATABASE_KEY: "${termixFx.databaseKeyHex}"`);
+  assert.equal(Buffer.from(composeEnv.databaseKey!).toString("hex"), termixFx.databaseKeyHex);
+  assert.equal(parseTermixEnvSecrets(termixFx.databaseKeyHex).bareKey, true);
+
+  // Encrypted at rest: needs DATABASE_KEY and rejects a wrong one
+  const lockedDb = await importTermixSqliteDatabase(termixFx.encryptedFile);
+  assert.equal(lockedDb.status, "needs_database_key");
+  assert.equal(lockedDb.fileKind, "termix-encrypted-v2");
+  const wrongKeyDb = await importTermixSqliteDatabase(termixFx.encryptedFile, {
+    termixEnv: `DATABASE_KEY=${"ab".repeat(32)}`,
+  });
+  assert.equal(wrongKeyDb.status, "needs_database_key");
+  assert.match(wrongKeyDb.message ?? "", /could not decrypt/);
+
+  // DATABASE_KEY alone opens the file, but per-user secrets stay sealed
+  const dbKeyOnly = await importTermixSqliteDatabase(termixFx.encryptedFile, {
+    termixEnv: termixFx.databaseKeyHex,
+  });
+  assert.equal(dbKeyOnly.status, "ok");
+  assert.equal(dbKeyOnly.secrets.decrypted, 0);
+  assert.ok(dbKeyOnly.secrets.locked > 0);
+  assert.ok(dbKeyOnly.warnings.some((w) => w.includes("ENCRYPTION_KEY")));
+  assert.ok(dbKeyOnly.warnings.some((w) => w.includes("bob") && w.includes("password")));
+
+  // Full Termix .env (v3 ENCRYPTION_KEY data keys) + Termix 2.x account password
+  const termixDb = await importTermixSqliteDatabase(termixFx.encryptedFile, {
+    termixEnv: termixFx.envFile,
+    termixPassword: termixFx.bobPassword,
+  });
+  assert.equal(termixDb.status, "ok");
+  assert.equal(termixDb.fileKind, "termix-encrypted-v2");
+  assert.equal(termixDb.secrets.locked, 0);
+  assert.equal(termixDb.skippedHosts, 1); // VNC-only host
+  assert.equal(termixDb.hosts.length, 8);
+  const tHost = (name: string) => termixDb.hosts.find((h) => h.name === name);
+  assert.equal(tHost("web-01")?.password, "Sup3rSecret!");
+  assert.equal(tHost("web-01")?.group, "Production/Web");
+  assert.deepEqual(tHost("web-01")?.tags, ["web", "prod", "pinned"]);
+  assert.equal(tHost("web-01")?.notes, "Primary nginx node");
+  assert.equal(tHost("db-01")?.username, "deploy");
+  assert.equal(tHost("db-01")?.authMethod, "privateKey");
+  assert.match(tHost("db-01")?.notes ?? "", /jump hosts: web-01/);
+  assert.equal(tHost("build-box")?.port, 2222);
+  assert.equal(tHost("build-box")?.passphrase, "kp-123");
+  assert.equal(tHost("win-bastion")?.protocol, "rdp");
+  assert.equal(tHost("win-bastion")?.username, "Administrator");
+  assert.equal(tHost("win-bastion")?.password, "WinCred!42");
+  assert.equal(tHost("win-bastion")?.domain, "CORP");
+  assert.equal(tHost("win-bastion")?.rdpSecurity, "nla");
+  assert.equal(tHost("win-bastion")?.ignoreCert, true);
+  assert.equal(tHost("dual-stack")?.protocol, "ssh");
+  assert.equal(tHost("dual-stack")?.password, "ssh-dual-pass");
+  assert.equal(tHost("dual-stack (RDP)")?.port, 3390);
+  assert.equal(tHost("dual-stack (RDP)")?.username, "rdpuser");
+  assert.equal(tHost("dual-stack (RDP)")?.password, "rdp-dual-pass");
+  assert.equal(tHost("dual-stack (RDP)")?.domain, "LAB");
+  assert.equal(tHost("dual-stack (RDP)")?.rdpSecurity, "tls");
+  assert.match(tHost("dual-stack")?.notes ?? "", /SOCKS5 proxy: proxy\.lan:1080/);
+  assert.equal(tHost("bob-pi")?.password, "raspberry");
+  assert.equal(termixDb.sshKeys.length, 2);
+  const importedClusterKey = termixDb.sshKeys.find((k) => k.name === "Prod Cluster Key");
+  assert.equal(importedClusterKey?.fingerprint, termixFx.clusterKey.fingerprint);
+  assert.equal(importedClusterKey?.keyType, "ssh-ed25519");
+  assert.equal(
+    importedClusterKey?.publicKey?.split(" ").slice(0, 2).join(" "),
+    termixFx.clusterKey.publicKey.split(" ").slice(0, 2).join(" ")
+  );
+  assert.equal(tHost("db-01")?.sshKeyId, importedClusterKey?.id);
+  assert.equal(
+    termixDb.sshKeys.find((k) => k.id === tHost("build-box")?.sshKeyId)?.fingerprint,
+    termixFx.buildKey.fingerprint
+  );
+  assert.deepEqual(termixDb.snippets.map((s) => s.command).sort(), ["df -h", "vcgencmd measure_temp"]);
+  // Plain-HTTP self-hosting (http://<vps-ip>:3000): browsers expose no crypto.subtle
+  // there, so the same import must work through the pure-JS fallback, identically.
+  const hostDigest = (hs: typeof termixDb.hosts) =>
+    hs
+      .map((h) => [h.name, h.protocol, h.password ?? "", h.privateKey ?? "", h.passphrase ?? ""].join("|"))
+      .sort();
+  __setForcePureJsCrypto(true);
+  try {
+    const pureJsDb = await importTermixSqliteDatabase(termixFx.encryptedFile, {
+      termixEnv: termixFx.envFile,
+      termixPassword: termixFx.bobPassword,
+    });
+    assert.equal(pureJsDb.status, "ok");
+    assert.equal(pureJsDb.secrets.locked, 0);
+    assert.equal(pureJsDb.secrets.decrypted, termixDb.secrets.decrypted);
+    assert.deepEqual(hostDigest(pureJsDb.hosts), hostDigest(termixDb.hosts));
+    assert.deepEqual(
+      pureJsDb.sshKeys.map((k) => k.fingerprint).sort(),
+      termixDb.sshKeys.map((k) => k.fingerprint).sort()
+    );
+  } finally {
+    __setForcePureJsCrypto(false);
+  }
+
+  const termixAdmin = termixDb.users.find((u) => u.username === "admin");
+  const termixBob = termixDb.users.find((u) => u.username === "bob");
+  assert.equal(termixAdmin?.unlockMethod, "encryption_key");
+  assert.equal(termixBob?.unlockMethod, "password");
+
+  // An imported Termix host connects through the enforced Vault key whitelist
+  const termixE2eHost = tHost("sushi-e2e");
+  assert.ok(termixE2eHost);
+  assert.equal(termixE2eHost.username, "tester"); // override_credential_username
+  const resolvedTermixHost = resolveProfileWithKeychain(termixE2eHost, termixDb.sshKeys, true);
+  assert.equal(resolvedTermixHost.ok, true);
+  if (resolvedTermixHost.ok) {
+    const termixSshTest = await testSshConnection({
+      host: resolvedTermixHost.profile.host,
+      port: resolvedTermixHost.profile.port,
+      username: resolvedTermixHost.profile.username,
+      authMethod: "privateKey",
+      privateKey: resolvedTermixHost.profile.privateKey,
+    });
+    assert.equal(termixSshTest.ok, true);
+  }
+
+  // Per-user scope on a plain db.sqlite, keychain de-duplication & legacy two-file layout
+  const bobOnly = await importTermixSqliteDatabase(termixFx.sqlite, {
+    termixEnv: termixFx.envFile,
+    termixPassword: termixFx.bobPassword,
+    onlyUserId: termixBob!.id,
+  });
+  assert.equal(bobOnly.fileKind, "sqlite");
+  assert.deepEqual(bobOnly.hosts.map((h) => h.name), ["bob-pi"]);
+  assert.deepEqual(bobOnly.snippets.map((s) => s.title), ["Pi temp"]);
+  assert.equal(bobOnly.sshKeys.length, 0);
+
+  const existingClusterKey = {
+    id: "existing-cluster",
+    name: "Cluster (already whitelisted)",
+    privateKey: termixFx.clusterKey.privateKey,
+    fingerprint: termixFx.clusterKey.fingerprint,
+    createdAt: Date.now(),
+  };
+  const dedupedDb = await importTermixSqliteDatabase(termixFx.sqlite, {
+    termixEnv: termixFx.envFile,
+    existingSshKeys: [existingClusterKey],
+  });
+  assert.equal(dedupedDb.sshKeys.length, 1);
+  assert.equal(dedupedDb.hosts.find((h) => h.name === "db-01")?.sshKeyId, "existing-cluster");
+
+  const twoFileDb = termixEncryptDatabaseTwoFile(
+    termixFx.sqlite,
+    Buffer.from(termixFx.databaseKeyHex, "hex")
+  );
+  const twoFileImport = await importTermixSqliteDatabase(twoFileDb.encrypted, {
+    termixEnv: termixFx.envFile,
+    metaJson: twoFileDb.metaJson,
+  });
+  assert.equal(twoFileImport.status, "ok");
+  assert.equal(twoFileImport.hosts.length, termixDb.hosts.length);
+
+  console.log("==> [7/8] Testing Protected WebSocket SSH PTY & Guacamole RDP Bridge (/ws/ssh & /ws/rdp)...");
   // Start mock guacd daemon
   const guacdMock = net.createServer({ allowHalfOpen: true }, (sock) => {
     sock.setEncoding("utf8");
@@ -687,6 +1071,82 @@ async function runTests() {
     });
   });
 
+  // Hybrid mode: a Vercel-hosted Sushi sends ITS OWN session token (signed with a
+  // different secret) plus the VPS gateway token — the gateway token must be honored.
+  const wsSshAuth = (fields: Record<string, unknown>) =>
+    new Promise<{ type: string; message?: string }>((resolve, reject) => {
+      const ws = new WebSocket(`ws://127.0.0.1:${gwPort}/ws/ssh`);
+      const timer = setTimeout(() => {
+        ws.terminate();
+        reject(new Error("WebSocket auth timed out"));
+      }, 10000);
+      ws.on("error", (err) => {
+        clearTimeout(timer);
+        reject(err);
+      });
+      ws.on("open", () => {
+        ws.send(JSON.stringify({ type: "auth", cols: 80, rows: 24, credentials: creds, ...fields }));
+      });
+      ws.on("message", (raw) => {
+        const msg = JSON.parse(raw.toString("utf8"));
+        if (msg.type === "ready" || msg.type === "error") {
+          clearTimeout(timer);
+          ws.close();
+          resolve(msg);
+        }
+      });
+    });
+  const foreignSession = createSessionToken("vercel-admin", "f".repeat(64));
+  process.env.SUSHI_GATEWAY_TOKEN = "vps-gateway-token-0123456789";
+  try {
+    const viaGatewayToken = await wsSshAuth({
+      sessionToken: foreignSession,
+      gatewayToken: "vps-gateway-token-0123456789",
+    });
+    assert.equal(viaGatewayToken.type, "ready", viaGatewayToken.message);
+    const wrongGatewayToken = await wsSshAuth({
+      sessionToken: foreignSession,
+      gatewayToken: "not-the-token",
+    });
+    assert.equal(wrongGatewayToken.type, "error");
+    assert.match(wrongGatewayToken.message ?? "", /Gateway token rejected/);
+
+    // RDP passes tokens in the query string: session + token are checked separately
+    await new Promise<void>((resolve, reject) => {
+      const payload = Buffer.from(
+        JSON.stringify({ host: "127.0.0.1", port: rdpPort, username: "a", password: "b" }),
+        "utf8"
+      ).toString("base64url");
+      const ws = new WebSocket(
+        `ws://127.0.0.1:${gwPort}/ws/rdp?payload=${encodeURIComponent(payload)}&session=${encodeURIComponent(
+          foreignSession
+        )}&token=vps-gateway-token-0123456789`,
+        "guacamole"
+      );
+      const timer = setTimeout(() => reject(new Error("RDP gateway-token handshake timed out")), 10000);
+      ws.on("error", reject);
+      ws.on("close", (code) => {
+        if (code === 1008) {
+          clearTimeout(timer);
+          reject(new Error("RDP gateway token was rejected"));
+        }
+      });
+      ws.on("message", (raw) => {
+        const instrs = parseGuacBrowserMessage(raw.toString("utf8"));
+        if (instrs.some((i) => i[0] === "" && i.length === 2 && i[1].length === 36)) {
+          clearTimeout(timer);
+          ws.close();
+          resolve();
+        }
+      });
+    });
+  } finally {
+    delete process.env.SUSHI_GATEWAY_TOKEN;
+  }
+  const unconfiguredGateway = await wsSshAuth({ gatewayToken: "vps-gateway-token-0123456789" });
+  assert.equal(unconfiguredGateway.type, "error");
+  assert.match(unconfiguredGateway.message ?? "", /no SUSHI_GATEWAY_TOKEN configured/);
+
   // Test /ws/rdp Guacamole subprotocol handshake + ping echo + size frame
   await new Promise<void>((resolve, reject) => {
     const payload = Buffer.from(
@@ -729,7 +1189,7 @@ async function runTests() {
     });
   });
 
-  console.log("==> [7/7] Cleaning up test servers...");
+  console.log("==> [8/8] Cleaning up test servers...");
   httpServer.close();
   guacdMock.close();
   rdpMock.close();

@@ -48,16 +48,26 @@ async function bootstrap() {
         return;
       }
 
-      res.writeHead(200, {
+      // Unknown API routes must 404 (not 200) so frontends fall back to their own
+      // serverless endpoints, e.g. "Test SSH Auth" -> local /api/ssh/test.
+      const isUnknownApi = url.pathname.startsWith("/api/");
+      res.writeHead(isUnknownApi ? 404 : 200, {
         ...cors,
         "Content-Type": "application/json; charset=utf-8",
       });
       res.end(
-        JSON.stringify({
-          service: "sushi-gateway",
-          status: "online",
-          endpoints: ["/ws/ssh", "/ws/rdp", "/api/system/capabilities"],
-        })
+        JSON.stringify(
+          isUnknownApi
+            ? {
+                ok: false,
+                error: `${url.pathname} is not served by a GATEWAY_ONLY Sushi gateway (WebSocket SSH/RDP only).`,
+              }
+            : {
+                service: "sushi-gateway",
+                status: "online",
+                endpoints: ["/ws/ssh", "/ws/rdp", "/api/system/capabilities"],
+              }
+        )
       );
     });
 

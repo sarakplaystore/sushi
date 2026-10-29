@@ -18,6 +18,7 @@ import {
   getAuthHeaders,
   resolveGatewayHttpBase,
 } from "@/lib/client/gateway";
+import { copyTextToClipboard } from "@/lib/client/clipboard";
 
 interface GatewaySetupModalProps {
   isOpen: boolean;
@@ -67,7 +68,7 @@ export function GatewaySetupModal({
   if (!isOpen) return null;
 
   const copyText = (id: string, value: string) => {
-    navigator.clipboard.writeText(value);
+    void copyTextToClipboard(value);
     setCopiedId(id);
     setTimeout(() => setCopiedId(null), 1800);
   };

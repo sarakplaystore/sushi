@@ -1,9 +1,11 @@
 import type {
+  CommandSnippet,
   HostProfile,
   ProtocolType,
   RdpSecurityMode,
   WhitelistedSshKey,
 } from "@/types/connection";
+import { randomUUID } from "./web-crypto";
 
 /**
  * Termix Host Export & Share Export format (`Termix-SSH/Termix`)
@@ -69,9 +71,12 @@ export interface TermixExportFile {
 export interface TermixImportSummary {
   hosts: HostProfile[];
   sshKeys: WhitelistedSshKey[];
+  /** Command snippets (Termix SQLite databases include the `snippets` table). */
+  snippets?: CommandSnippet[];
   detectedFormat:
     | "termix-host-export"
     | "termix-user-data-v2"
+    | "termix-sqlite"
     | "ssh-config"
     | "sushi-hosts";
   warnings: string[];
@@ -136,7 +141,7 @@ function parseOpenSshConfigText(content: string): HostProfile[] {
     if (current && current.hostname) {
       const now = Date.now();
       results.push({
-        id: crypto.randomUUID(),
+        id: randomUUID(),
         name: current.name,
         protocol: "ssh",
         host: current.hostname,
@@ -302,7 +307,7 @@ export function importFromTermixContent(
     );
     if (existing) return existing.id;
 
-    const id = crypto.randomUUID();
+    const id = randomUUID();
     newSshKeys.push({
       id,
       name: keyName,
@@ -479,7 +484,7 @@ export function importFromTermixContent(
       : "any";
 
     importedHosts.push({
-      id: crypto.randomUUID(),
+      id: randomUUID(),
       name: displayName,
       protocol,
       host: hostname,

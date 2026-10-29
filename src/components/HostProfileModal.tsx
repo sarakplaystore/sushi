@@ -30,6 +30,7 @@ import {
   getAuthHeaders,
   resolveGatewayHttpBase,
 } from "@/lib/client/gateway";
+import { randomUUID } from "@/lib/client/web-crypto";
 
 interface HostProfileModalProps {
   isOpen: boolean;
@@ -193,7 +194,7 @@ export function HostProfileModal({
     }
 
     return {
-      id: initialProfile?.id || crypto.randomUUID(),
+      id: initialProfile?.id || randomUUID(),
       name: name.trim() || `${username.trim()}@${host.trim()}`,
       protocol,
       host: host.trim(),
@@ -567,7 +568,7 @@ export function HostProfileModal({
                                     );
                                   }
                                   const newKey: WhitelistedSshKey = {
-                                    id: crypto.randomUUID(),
+                                    id: randomUUID(),
                                     name: keyLabel,
                                     privateKey: privateKey.trim(),
                                     passphrase: passphrase || undefined,

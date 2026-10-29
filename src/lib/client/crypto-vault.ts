@@ -3,6 +3,12 @@ import type {
   HostProfile,
   WhitelistedSshKey,
 } from "@/types/connection";
+import {
+  aesGcmDecrypt,
+  aesGcmEncrypt,
+  pbkdf2Sha256,
+  randomBytes,
+} from "./web-crypto";
 
 export interface VaultPlaintext {
   version: 1;
@@ -86,92 +92,56 @@ function base64ToBytes(b64: string): Uint8Array {
   return bytes;
 }
 
-async function getOrCreateDeviceKey(): Promise<CryptoKey> {
+/**
+ * Device-mode vault key: 256-bit AES key stored (base64, raw bytes) in localStorage.
+ * Raw bytes are used directly so the vault also works outside secure contexts
+ * (plain-HTTP self-hosting), where `crypto.subtle` is unavailable.
+ */
+async function getOrCreateDeviceKey(): Promise<Uint8Array> {
   const existing = localStorage.getItem(DEVICE_KEY_STORAGE_KEY);
   if (existing) {
-    const raw = base64ToBytes(existing);
-    return crypto.subtle.importKey(
-      "raw",
-      raw.buffer as ArrayBuffer,
-      { name: "AES-GCM" },
-      true,
-      ["encrypt", "decrypt"]
-    );
+    return base64ToBytes(existing);
   }
-
-  const key = await crypto.subtle.generateKey(
-    { name: "AES-GCM", length: 256 },
-    true,
-    ["encrypt", "decrypt"]
-  );
-  const exported = await crypto.subtle.exportKey("raw", key);
-  localStorage.setItem(DEVICE_KEY_STORAGE_KEY, bytesToBase64(new Uint8Array(exported)));
+  const key = randomBytes(32);
+  localStorage.setItem(DEVICE_KEY_STORAGE_KEY, bytesToBase64(key));
   return key;
 }
 
 export async function derivePassphraseKey(
   passphrase: string,
   saltBytes: Uint8Array
-): Promise<CryptoKey> {
-  const encoder = new TextEncoder();
-  const baseKey = await crypto.subtle.importKey(
-    "raw",
-    encoder.encode(passphrase),
-    "PBKDF2",
-    false,
-    ["deriveKey"]
-  );
-
-  return crypto.subtle.deriveKey(
-    {
-      name: "PBKDF2",
-      salt: saltBytes.buffer as ArrayBuffer,
-      iterations: 210000,
-      hash: "SHA-256",
-    },
-    baseKey,
-    { name: "AES-GCM", length: 256 },
-    false,
-    ["encrypt", "decrypt"]
-  );
+): Promise<Uint8Array> {
+  return pbkdf2Sha256(passphrase, saltBytes, 210000, 32);
 }
 
 export async function encryptVaultData(
   data: VaultPlaintext,
   passphrase?: string | null
 ): Promise<EncryptedVaultEnvelope> {
-  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const iv = randomBytes(12);
   const encoded = new TextEncoder().encode(JSON.stringify(data));
 
   if (passphrase && passphrase.length > 0) {
-    const salt = crypto.getRandomValues(new Uint8Array(16));
+    const salt = randomBytes(16);
     const key = await derivePassphraseKey(passphrase, salt);
-    const encrypted = await crypto.subtle.encrypt(
-      { name: "AES-GCM", iv },
-      key,
-      encoded
-    );
+    const encrypted = await aesGcmEncrypt(key, iv, encoded);
     return {
       version: 1,
       mode: "passphrase",
       salt: bytesToBase64(salt),
       iv: bytesToBase64(iv),
-      ciphertext: bytesToBase64(new Uint8Array(encrypted)),
+      ciphertext: bytesToBase64(encrypted),
       updatedAt: Date.now(),
     };
   }
 
   const deviceKey = await getOrCreateDeviceKey();
-  const encrypted = await crypto.subtle.encrypt(
-    { name: "AES-GCM", iv },
-    deviceKey,
-    encoded
-  );
+  const encrypted = await aesGcmEncrypt(deviceKey, iv, encoded);
   return {
     version: 1,
     mode: "device",
     iv: bytesToBase64(iv),
-    ciphertext: bytesToBase64(new Uint8Array(encrypted)),
+    ciphertext: bytesToBase64(encrypted),
     updatedAt: Date.now(),
   };
 }
@@ -183,7 +153,7 @@ export async function decryptVaultEnvelope(
   const iv = base64ToBytes(envelope.iv);
   const ciphertext = base64ToBytes(envelope.ciphertext);
 
-  let key: CryptoKey;
+  let key: Uint8Array;
   if (envelope.mode === "passphrase") {
     if (!passphrase) {
       throw new Error("Master passphrase required to unlock vault.");
@@ -197,11 +167,7 @@ export async function decryptVaultEnvelope(
   }
 
   try {
-    const decrypted = await crypto.subtle.decrypt(
-      { name: "AES-GCM", iv: iv.buffer as ArrayBuffer },
-      key,
-      ciphertext.buffer as ArrayBuffer
-    );
+    const decrypted = await aesGcmDecrypt(key, iv, ciphertext);
     const parsed = JSON.parse(new TextDecoder().decode(decrypted)) as VaultPlaintext;
     return {
       version: 1,

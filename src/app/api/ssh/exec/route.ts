@@ -1,7 +1,9 @@
+import { StringDecoder } from "node:string_decoder";
 import { NextRequest, NextResponse } from "next/server";
 import type { ConnectionCredentials } from "@/types/connection";
 import { connectSsh, shellQuote } from "@/lib/server/ssh-client";
 import { getCorsHeaders, verifyRequestAccess } from "@/lib/server/security";
+import { META_REGEX, splitEmittable } from "@/lib/server/exec-stream";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -13,8 +15,6 @@ export async function OPTIONS(req: NextRequest) {
     headers: getCorsHeaders(req.headers.get("origin")),
   });
 }
-
-const META_REGEX = /\r?\n?\x1b\]777;SUSHI_META;(-?\d+);([^\x07]*)\x07/;
 
 export async function POST(req: NextRequest) {
   const cors = getCorsHeaders(req.headers.get("origin"));
@@ -86,8 +86,14 @@ export async function POST(req: NextRequest) {
         const cdPrefix =
           cwd && cwd !== "~" ? `cd -- ${shellQuote(cwd)} 2>/dev/null || true\n` : "";
 
+        // Each serverless command runs on its own (no keystrokes can be forwarded),
+        // so disable pagers that would otherwise wait for "q" (systemctl, journalctl,
+        // git log, man, psql ...).
+        const pagerEnv =
+          "export PAGER=cat GIT_PAGER=cat MANPAGER=cat SYSTEMD_PAGER=cat LESS=-FRX 2>/dev/null\n";
+
         const wrappedScript = [
-          cdPrefix + (command.trim() ? command : ":"),
+          pagerEnv + cdPrefix + (command.trim() ? command : ":"),
           "__sushi_ec=$?",
           'printf "\\n\\033]777;SUSHI_META;%s;%s\\007" "$__sushi_ec" "$(pwd)"',
           "exit $__sushi_ec",
@@ -106,6 +112,8 @@ export async function POST(req: NextRequest) {
 
               let carry = "";
               let parsedMeta = false;
+              // Keeps multi-byte UTF-8 characters intact across SSH packets
+              const utf8 = new StringDecoder("utf8");
 
               const flushText = (text: string) => {
                 if (!text) return;
@@ -116,7 +124,7 @@ export async function POST(req: NextRequest) {
               };
 
               ch.on("data", (chunk: Buffer) => {
-                carry += chunk.toString("utf8");
+                carry += utf8.write(chunk);
                 const match = META_REGEX.exec(carry);
                 if (match) {
                   const before = carry.slice(0, match.index);
@@ -130,12 +138,10 @@ export async function POST(req: NextRequest) {
                   });
                   carry = after;
                 } else {
-                  // Hold last 96 chars in case OSC marker splits across packets
-                  if (carry.length > 96) {
-                    const emitPart = carry.slice(0, carry.length - 96);
-                    carry = carry.slice(carry.length - 96);
-                    flushText(emitPart);
-                  }
+                  // Emit everything except a tail that may be a split META marker
+                  const [emitPart, held] = splitEmittable(carry);
+                  carry = held;
+                  flushText(emitPart);
                 }
               });
 
@@ -147,6 +153,7 @@ export async function POST(req: NextRequest) {
               });
 
               ch.on("close", (code: number | null) => {
+                carry += utf8.end();
                 if (carry) {
                   const match = META_REGEX.exec(carry);
                   if (match) {

@@ -25,6 +25,7 @@ import {
   ArrowLeftRight,
   KeyRound,
   AlertCircle,
+  ShieldAlert,
 } from "lucide-react";
 import type { AuthStatusResponse } from "@/types/auth";
 import type {
@@ -66,6 +67,7 @@ import {
   getStoredAuthorizedKeyCertificates,
   getStoredPasskeyCertificates,
 } from "@/lib/client/auth-storage";
+import { isInsecureBrowserContext, randomUUID } from "@/lib/client/web-crypto";
 
 export function SushiWorkspace() {
   // Authentication & Passkey Gate state
@@ -96,6 +98,19 @@ export function SushiWorkspace() {
   const [snippets, setSnippets] = useState<CommandSnippet[]>(DEFAULT_SNIPPETS);
   const [sshKeys, setSshKeys] = useState<WhitelistedSshKey[]>([]);
   const [enforceKeyWhitelist, setEnforceKeyWhitelist] = useState(false);
+  const [insecureHttp, setInsecureHttp] = useState(false);
+  const [insecureNoticeDismissed, setInsecureNoticeDismissed] = useState(false);
+  useEffect(() => {
+    if (!isInsecureBrowserContext()) return;
+    setInsecureHttp(true);
+    try {
+      setInsecureNoticeDismissed(
+        sessionStorage.getItem("sushi_http_notice_dismissed") === "1"
+      );
+    } catch {
+      // ignore storage errors
+    }
+  }, []);
   const [whitelistBannerError, setWhitelistBannerError] = useState<string | null>(
     null
   );
@@ -321,7 +336,7 @@ export function SushiWorkspace() {
       }
       setWhitelistBannerError(null);
 
-      const tabId = `tab-${crypto.randomUUID()}`;
+      const tabId = `tab-${randomUUID()}`;
       const newTab: SessionTab = {
         id: tabId,
         title: `${profile.name}`,
@@ -783,7 +798,7 @@ export function SushiWorkspace() {
                   setVaultModalOpen(true);
                 }}
                 className="flex items-center justify-center gap-1 rounded-xl border border-white/8 bg-[#131823] px-2 py-2 text-[11px] font-medium text-slate-200 transition hover:border-white/18 hover:bg-white/8"
-                title="Import or Export Termix JSON"
+                title="Import a Termix SQLite database or JSON export, or export to Termix"
               >
                 <ArrowLeftRight className="h-3.5 w-3.5 text-[#ff6b57]" />
                 Termix
@@ -909,6 +924,37 @@ export function SushiWorkspace() {
             }
           >
             <div className="mx-auto max-w-5xl space-y-8">
+              {insecureHttp && !insecureNoticeDismissed && (
+                <div className="flex items-start justify-between gap-3 rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-xs text-amber-100">
+                  <span className="flex items-start gap-2">
+                    <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0 text-amber-400" />
+                    <span>
+                      <span className="font-semibold text-amber-200">
+                        You&apos;re using Sushi over plain HTTP.
+                      </span>{" "}
+                      SSH, SFTP, RDP and the vault work, but your Sushi login and the
+                      server passwords/keys you send travel unencrypted between this
+                      browser and Sushi, and passkeys are disabled. Put Sushi behind
+                      HTTPS (e.g. Caddy or Nginx with a domain) for production use.
+                    </span>
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setInsecureNoticeDismissed(true);
+                      try {
+                        sessionStorage.setItem("sushi_http_notice_dismissed", "1");
+                      } catch {
+                        // ignore storage errors
+                      }
+                    }}
+                    className="shrink-0 rounded-lg bg-amber-500/20 px-3 py-1 font-semibold text-amber-100 hover:bg-amber-500/30"
+                  >
+                    Dismiss
+                  </button>
+                </div>
+              )}
+
               {whitelistBannerError && (
                 <div className="flex items-center justify-between gap-3 rounded-xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-xs text-rose-200">
                   <span className="flex items-center gap-2">
@@ -1359,27 +1405,87 @@ export function SushiWorkspace() {
         onApplyTermixImport={async (
           importedHosts,
           importedKeys,
-          replaceExisting
+          replaceExisting,
+          importedSnippets = []
         ) => {
-          const mergedHosts = replaceExisting
-            ? importedHosts
-            : [...importedHosts, ...hosts];
+          // 1. Merge SSH keys, re-pointing hosts at an existing keychain entry
+          //    when the same key (text or fingerprint) is already whitelisted.
           const mergedKeys = [...sshKeys];
+          const keyIdRemap = new Map<string, string>();
+          let addedKeys = 0;
           for (const k of importedKeys) {
-            if (!mergedKeys.some((ek) => ek.privateKey.trim() === k.privateKey.trim())) {
+            const existing = mergedKeys.find(
+              (ek) =>
+                ek.privateKey.trim() === k.privateKey.trim() ||
+                Boolean(k.fingerprint && ek.fingerprint === k.fingerprint)
+            );
+            if (existing) {
+              if (existing.id !== k.id) keyIdRemap.set(k.id, existing.id);
+            } else {
               mergedKeys.push(k);
+              addedKeys++;
             }
           }
+
+          // 2. Merge hosts, skipping exact duplicates of hosts already in Sushi
+          const hostSignature = (h: HostProfile) =>
+            [
+              h.protocol,
+              h.host.trim().toLowerCase(),
+              h.port,
+              h.username.trim().toLowerCase(),
+              h.name.trim().toLowerCase(),
+            ].join("|");
+          const baseHosts = replaceExisting ? [] : hosts;
+          const seen = new Set(baseHosts.map(hostSignature));
+          const newHosts: HostProfile[] = [];
+          let skippedHosts = 0;
+          for (const h of importedHosts) {
+            const sig = hostSignature(h);
+            if (seen.has(sig)) {
+              skippedHosts++;
+              continue;
+            }
+            seen.add(sig);
+            newHosts.push(
+              h.sshKeyId && keyIdRemap.has(h.sshKeyId)
+                ? { ...h, sshKeyId: keyIdRemap.get(h.sshKeyId) }
+                : h
+            );
+          }
+          const mergedHosts = [...newHosts, ...baseHosts];
+
+          // 3. Merge command snippets (Termix SQLite `snippets` table)
+          const mergedSnippets = [...snippets];
+          let addedSnippets = 0;
+          for (const s of importedSnippets) {
+            if (
+              !mergedSnippets.some(
+                (es) => es.title === s.title && es.command === s.command
+              )
+            ) {
+              mergedSnippets.push(s);
+              addedSnippets++;
+            }
+          }
+
           setHosts(mergedHosts);
           setSshKeys(mergedKeys);
+          setSnippets(mergedSnippets);
           await persistVault(
             mergedHosts,
-            snippets,
+            mergedSnippets,
             undefined,
             undefined,
             mergedKeys,
             enforceKeyWhitelist
           );
+          return {
+            addedHosts: newHosts.length,
+            skippedHosts,
+            addedKeys,
+            addedSnippets,
+          };
         }}
       />
 

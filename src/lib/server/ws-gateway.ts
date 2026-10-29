@@ -7,6 +7,26 @@ import { verifyRequestAccess } from "./security";
 import { connectSsh, type ConnectedSshSession } from "./ssh-client";
 import { bridgeRdpToGuacd } from "./guacd-bridge";
 
+/**
+ * Browsers cannot set custom headers on a WebSocket handshake, so the SSH / RDP
+ * clients send their Sushi session token and VPS gateway token in the first message
+ * or the query string. Map both onto the headers the HTTP API uses, so the session
+ * token is verified as a session AND the gateway token is checked against
+ * SUSHI_GATEWAY_TOKEN. (Forwarding only one of them — always as a session token —
+ * meant a Vercel-hosted Sushi could never authenticate to a VPS gateway.)
+ */
+function withBrowserTokens(
+  headers: IncomingMessage["headers"],
+  tokens: { session?: string | null; gateway?: string | null }
+): IncomingMessage["headers"] {
+  const merged: IncomingMessage["headers"] = { ...headers };
+  const session = tokens.session?.trim();
+  const gateway = tokens.gateway?.trim();
+  if (session) merged["x-sushi-session"] = session;
+  if (gateway) merged["x-sushi-token"] = gateway;
+  return merged;
+}
+
 export interface GatewayUpgradeDispatcher {
   canHandle: (pathname: string) => boolean;
   handleUpgrade: (req: IncomingMessage, socket: Duplex, head: Buffer) => void;
@@ -82,13 +102,16 @@ export function createGatewayWebSockets(): GatewayUpgradeDispatcher {
       }
 
       if (msg.type === "auth" && !authenticated) {
-        const querySession = reqUrl.searchParams.get("session");
-        const explicitToken =
-          (typeof msg.sessionToken === "string" ? msg.sessionToken : null) ||
-          (typeof msg.gatewayToken === "string" ? msg.gatewayToken : null) ||
-          querySession ||
-          queryToken;
-        const tokenCheck = await verifyRequestAccess(req.headers, explicitToken);
+        const sessionToken =
+          typeof msg.sessionToken === "string" ? msg.sessionToken.trim() : "";
+        const gatewayToken =
+          typeof msg.gatewayToken === "string" ? msg.gatewayToken.trim() : "";
+        const tokenCheck = await verifyRequestAccess(
+          withBrowserTokens(req.headers, {
+            session: sessionToken || reqUrl.searchParams.get("session"),
+            gateway: gatewayToken || queryToken,
+          })
+        );
         if (!tokenCheck.ok) {
           sendJson({ type: "error", message: tokenCheck.error });
           ws.close(1008, "Unauthorized");
@@ -195,9 +218,12 @@ export function createGatewayWebSockets(): GatewayUpgradeDispatcher {
 
   rdpWss.on("connection", async (ws: WebSocket, req: IncomingMessage) => {
     const reqUrl = new URL(req.url || "/ws/rdp", "http://localhost");
-    const queryToken =
-      reqUrl.searchParams.get("session") || reqUrl.searchParams.get("token");
-    const auth = await verifyRequestAccess(req.headers, queryToken);
+    const auth = await verifyRequestAccess(
+      withBrowserTokens(req.headers, {
+        session: reqUrl.searchParams.get("session"),
+        gateway: reqUrl.searchParams.get("token"),
+      })
+    );
 
     if (!auth.ok) {
       ws.close(1008, "769");

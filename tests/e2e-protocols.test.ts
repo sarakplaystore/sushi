@@ -54,6 +54,12 @@ import {
   openArchiveSink,
 } from "../src/lib/client/zip-sink";
 import {
+  DEFAULT_RDP_PORT,
+  buildRdpCompanionDraft,
+  buildRdpCompanionProfile,
+  rdpCompanionTitle,
+} from "../src/lib/client/rdp-companion";
+import {
   buildExecScript,
   createSudoAnswerer,
 } from "../src/lib/server/exec-script";
@@ -1742,6 +1748,96 @@ async function runTests() {
   assert.equal(PROMPT_HINT_RE.test("Are you sure (yes/no)? "), true);
   assert.equal(PROMPT_HINT_RE.test("root@host:~# "), false);
 
+  // --- "Open via RDP": the same host, reached as a desktop ------------------
+  console.log("==> [8b] Testing Open via RDP companion profiles...");
+  const sshHost = {
+    id: "host-ssh-1",
+    name: "prod-api-tokyo",
+    protocol: "ssh" as const,
+    host: "203.0.113.42",
+    port: 2222,
+    username: "ubuntu",
+    authMethod: "privateKey" as const,
+    password: "ssh-pass",
+    privateKey: "-----BEGIN OPENSSH PRIVATE KEY-----",
+    passphrase: "key-pass",
+    sshKeyId: "key-1",
+    domain: "",
+    rdpSecurity: "any" as const,
+    ignoreCert: true,
+    rdpWidth: 1600,
+    rdpHeight: 900,
+    initialPath: "/var/www",
+    group: "Production",
+    accentColor: "#34d399",
+    createdAt: 1,
+    updatedAt: 1,
+  };
+
+  const companion = buildRdpCompanionProfile(sshHost);
+  assert.equal(companion.protocol, "rdp");
+  assert.equal(companion.port, DEFAULT_RDP_PORT, "SSH port 2222 is not reused for RDP");
+  assert.equal(companion.port, 3389);
+  assert.equal(companion.host, sshHost.host);
+  assert.equal(companion.username, "ubuntu");
+  assert.equal(companion.password, "ssh-pass", "same password is offered to the desktop");
+  assert.equal(companion.authMethod, "password");
+  assert.equal(companion.privateKey, undefined, "private key never reaches the RDP bridge");
+  assert.equal(companion.passphrase, undefined);
+  assert.equal(companion.sshKeyId, undefined);
+  assert.equal(companion.initialPath, undefined, "SFTP start path is meaningless for RDP");
+  assert.equal(companion.rdpWidth, 1600, "RDP options the host already has are kept");
+  assert.equal(companion.rdpHeight, 900);
+  assert.equal(companion.ignoreCert, true);
+  assert.equal(companion.accentColor, "#ff6b57");
+  assert.equal(companion.id, sshHost.id, "the derived profile points at the same host");
+  assert.equal(companion.name, sshHost.name);
+  // the source profile is untouched (the Vault copy must not gain RDP fields)
+  assert.equal(sshHost.protocol, "ssh");
+  assert.equal(sshHost.port, 2222);
+  assert.equal(sshHost.authMethod, "privateKey");
+  assert.equal(sshHost.privateKey, "-----BEGIN OPENSSH PRIVATE KEY-----");
+
+  // an explicit port is honoured (non-standard xrdp setups)
+  assert.equal(buildRdpCompanionProfile(sshHost, { port: 3390 }).port, 3390);
+
+  // a host that already is an RDP host keeps its own port and colour
+  const rdpHost = {
+    ...sshHost,
+    id: "host-rdp-1",
+    name: "win-dc-01",
+    protocol: "rdp" as const,
+    port: 3390,
+    username: "Administrator",
+    authMethod: "password" as const,
+    domain: "CORP",
+    accentColor: "#fbbf24",
+  };
+  const rdpCompanion = buildRdpCompanionProfile(rdpHost);
+  assert.equal(rdpCompanion.protocol, "rdp");
+  assert.equal(rdpCompanion.port, 3390);
+  assert.equal(rdpCompanion.domain, "CORP");
+  assert.equal(rdpCompanion.accentColor, "#fbbf24");
+  // SFTP hosts behave like SSH hosts
+  assert.equal(
+    buildRdpCompanionProfile({ ...sshHost, protocol: "sftp" as const }).port,
+    3389
+  );
+
+  // the dialog draft saves as a *separate* RDP host
+  const draft = buildRdpCompanionDraft(sshHost);
+  assert.equal(draft.id, undefined, "no id → saving creates a new host");
+  assert.equal(draft.protocol, "rdp");
+  assert.equal(draft.port, 3389);
+  assert.equal(draft.name, "prod-api-tokyo (RDP)");
+  // a companion profile (already RDP) does not get a doubled suffix
+  assert.equal(buildRdpCompanionDraft(companion).name, "prod-api-tokyo (RDP)");
+  assert.equal(buildRdpCompanionDraft(companion).id, undefined);
+
+  // tab titles tell the SSH tab and its desktop twin apart
+  assert.equal(rdpCompanionTitle(sshHost), "prod-api-tokyo (RDP)");
+  assert.equal(rdpCompanionTitle(rdpHost), "win-dc-01");
+
   // --- folder download sink (File System Access API vs. blob fallback) ------
   // The client module reads `window`, so a tiny stub stands in for a browser here.
   const fakeWindow = { isSecureContext: true } as {
@@ -1822,7 +1918,7 @@ async function runTests() {
   rdpMock.close();
   sshServer.close();
   console.log(
-    "ALL AUTH, PASSKEY, KEY WHITELIST, TERMIX, SSH, SFTP, RDP, EXEC STDIN, FOLDER-DOWNLOAD, AND SELECTION-DOWNLOAD E2E TESTS PASSED!"
+    "ALL AUTH, PASSKEY, KEY WHITELIST, TERMIX, SSH, SFTP, RDP, EXEC STDIN, FOLDER-DOWNLOAD, SELECTION-DOWNLOAD, AND RDP-COMPANION E2E TESTS PASSED!"
   );
 }
 

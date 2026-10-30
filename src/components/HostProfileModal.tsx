@@ -35,6 +35,9 @@ import { randomUUID } from "@/lib/client/web-crypto";
 interface HostProfileModalProps {
   isOpen: boolean;
   initialProfile?: Partial<HostProfile> | null;
+  /** Overrides the header (e.g. "Open via RDP" when launched from a session). */
+  title?: string;
+  subtitle?: string;
   gatewaySettings: GatewaySettings;
   sshKeys?: WhitelistedSshKey[];
   enforceKeyWhitelist?: boolean;
@@ -56,6 +59,8 @@ const ACCENT_COLORS = [
 export function HostProfileModal({
   isOpen,
   initialProfile,
+  title,
+  subtitle,
   gatewaySettings,
   sshKeys = [],
   enforceKeyWhitelist = false,
@@ -323,9 +328,19 @@ export function HostProfileModal({
               className="h-3 w-3 rounded-full"
               style={{ backgroundColor: accentColor }}
             />
-            <h2 className="text-base font-semibold text-white">
-              {initialProfile?.id ? "Edit Host Profile" : "New Remote Connection"}
-            </h2>
+            <div className="min-w-0">
+              <h2 className="text-base font-semibold text-white">
+                {title ||
+                  (initialProfile?.id
+                    ? "Edit Host Profile"
+                    : "New Remote Connection")}
+              </h2>
+              {subtitle && (
+                <p className="mt-0.5 max-w-xl text-[11px] leading-relaxed text-slate-400">
+                  {subtitle}
+                </p>
+              )}
+            </div>
           </div>
           <button
             onClick={onClose}

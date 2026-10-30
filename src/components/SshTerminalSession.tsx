@@ -4,6 +4,7 @@ import React, { useEffect, useRef, useState, useCallback } from "react";
 import {
   RotateCw,
   FolderKanban,
+  Monitor,
   Search,
   Sparkles,
   Trash2,
@@ -49,6 +50,7 @@ interface SshTerminalSessionProps {
   gatewaySettings: GatewaySettings;
   snippets: CommandSnippet[];
   onOpenCompanionSftp: (cwd?: string) => void;
+  onOpenRdp: () => void;
   onOpenGatewayModal: () => void;
 }
 
@@ -117,6 +119,7 @@ export function SshTerminalSession({
   gatewaySettings,
   snippets,
   onOpenCompanionSftp,
+  onOpenRdp,
   onOpenGatewayModal,
 }: SshTerminalSessionProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -1337,6 +1340,17 @@ export function SshTerminalSession({
           >
             <FolderKanban className="h-3.5 w-3.5" />
             <span className="hidden sm:inline">Open SFTP</span>
+          </button>
+
+          {/* Open the same host as an RDP desktop */}
+          <button
+            type="button"
+            onClick={onOpenRdp}
+            className="flex items-center gap-1.5 rounded-lg border border-[#ff6b57]/35 bg-[#ff6b57]/10 px-2.5 py-1 text-xs font-medium text-[#ff9587] transition hover:bg-[#ff6b57]/20"
+            title="Open this host as an RDP desktop (port 3389)"
+          >
+            <Monitor className="h-3.5 w-3.5" />
+            <span className="hidden sm:inline">Open RDP</span>
           </button>
 
           {/* Snippets Popover */}

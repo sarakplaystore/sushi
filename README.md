@@ -32,6 +32,7 @@ It is designed around a **Hybrid VPS + Serverless Architecture**:
   - Live in-browser Windows & Linux `xrdp` desktop streaming via `/ws/rdp` -> `guacd` (`NLA / CredSSP`, `TLS`, `Standard RDP`)
   - Dynamic display scaling, fullscreen mode, clipboard sync, special key combos (`Ctrl+Alt+Del`, `Win`, `Ctrl+Shift+Esc`), and PNG screenshot capture
   - Native serverless **MS-RDPBCGR X.224 + TLS certificate inspector** (`/api/rdp/probe`) and one-click `.rdp` profile generator
+  - **Open via RDP from anywhere**: a desktop button on every SSH/SFTP host row and host card, plus **Open RDP** in the terminal header and **RDP** in the file manager toolbar — the same host, reached as a desktop on port 3389, no duplicate host needed (see *Open a host's desktop over RDP*).
 - **AES-256-GCM Encrypted Credential Vault**
   - Client-side WebCrypto `AES-256-GCM` encryption (automatic device key or `PBKDF2-SHA256` Master Passphrase lock)
   - Portable encrypted JSON backup import/export + automatic `/data/vault.enc.json` sync when self-hosted on a VPS
@@ -109,6 +110,31 @@ bash scripts/install-vps.sh
    The token you enter must equal the gateway's `SUSHI_GATEWAY_TOKEN`. If it is missing or wrong, the
    terminal says so and falls back to serverless SSH. A full Sushi install (`docker compose`) can act
    as the gateway too, as long as `SUSHI_GATEWAY_TOKEN` is set in its `.env`.
+
+### Open a host's desktop over RDP
+
+Any host saved for SSH or SFTP can be opened as an RDP desktop with one click — the Vault keeps a
+single profile per machine:
+
+- **host row** in the sidebar → the coral monitor icon (always visible);
+- **host card** on the dashboard → the **RDP** button next to *SFTP* / *SSH*;
+- **inside a session** → **Open RDP** in the SSH terminal header, **RDP** in the file manager toolbar.
+
+What gets connected:
+
+- the same address, username and password, on **port 3389** (`rdp://user@host:3389`) — an SSH host on
+  a custom port is not asked to speak RDP on that port;
+- RDP options the profile already has (domain, security mode, resolution, ignore-certificate) are
+  kept, and SSH key material is **never** sent to the RDP bridge;
+- clicking the button again focuses the desktop tab that is already open for that host.
+
+Desktop logins are often a different account than the SSH login (`Administrator`, a domain user, or
+the Linux user signed in to `xrdp`). **Credentials** in the RDP session header opens the connection
+dialog prefilled for this server: fix the username / domain / port / password there and connect
+ephemeral, or save it — saving creates a separate RDP host and leaves the SSH entry untouched.
+
+Live pixels need `guacd` (self-hosted `docker compose`) or an attached VPS gateway; without one the
+tab still gives you the X.224/TLS/NLA probe and a native `.rdp` launcher.
 
 ### Downloading files and folders (SFTP → ZIP)
 

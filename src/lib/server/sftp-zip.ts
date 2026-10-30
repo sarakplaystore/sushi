@@ -139,6 +139,346 @@ function sftpReadDir(
   });
 }
 
+/** A single thing the user selected: a file or a folder. */
+interface RemoteTarget {
+  /** Absolute path on the remote host. */
+  absPath: string;
+  /** Name this item gets inside the archive. */
+  name: string;
+  kind: "file" | "directory";
+  size: number;
+  mode: number;
+  mtime: number;
+}
+
+interface WalkState {
+  entries: RemoteTreeEntry[];
+  fileCount: number;
+  directoryCount: number;
+  totalBytes: number;
+  skippedSymlinks: number;
+  skippedUnreadable: number;
+  usedNames: Set<string>;
+}
+
+/**
+ * Keeps archive entry names unique when the selection holds two items with the
+ * same basename (possible when paths are posted by hand): `a.txt`, `a (2).txt`.
+ */
+function uniqueEntryName(name: string, used: Set<string>): string {
+  if (!used.has(name)) {
+    used.add(name);
+    return name;
+  }
+  const dot = name.lastIndexOf(".");
+  const base = dot > 0 ? name.slice(0, dot) : name;
+  const ext = dot > 0 ? name.slice(dot) : "";
+  for (let i = 2; ; i += 1) {
+    const candidate = `${base} (${i})${ext}`;
+    if (!used.has(candidate)) {
+      used.add(candidate);
+      return candidate;
+    }
+  }
+}
+
+/** Deepest folder shared by every selected path (used as the archive root). */
+function commonParentDirectory(paths: string[]): string {
+  if (paths.length === 1) return path.posix.dirname(paths[0]);
+  const parents = paths.map((p) => path.posix.dirname(p).split("/").filter(Boolean));
+  const first = parents[0];
+  let shared = 0;
+  while (
+    shared < first.length &&
+    parents.every((parts) => parts[shared] === first[shared])
+  ) {
+    shared += 1;
+  }
+  return `/${first.slice(0, shared).join("/")}`;
+}
+
+/**
+ * Walks one folder into `state`, prefixing every entry with `relBase`.
+ * `relBase` is empty for a plain "download this folder" (contents at the archive
+ * root) and the folder name when the folder is part of a multi-item selection.
+ */
+async function walkIntoArchive(
+  sftp: SFTPWrapper,
+  state: WalkState,
+  rootPath: string,
+  relBase: string,
+  limits: SftpZipLimits
+): Promise<void> {
+  const stack: Array<{ remotePath: string; relPath: string; depth: number }> = [
+    { remotePath: rootPath, relPath: relBase, depth: 0 },
+  ];
+
+  while (stack.length > 0) {
+    const dir = stack.pop()!;
+    let items: Array<{ filename: string; attrs: Attributes }>;
+    try {
+      items = await sftpReadDir(sftp, dir.remotePath);
+    } catch {
+      // Unreadable sub-directory: keep the rest of the selection downloadable.
+      state.skippedUnreadable += 1;
+      continue;
+    }
+
+    for (const item of items) {
+      if (item.filename === "." || item.filename === ".." || !item.filename) {
+        continue;
+      }
+      const remotePath = path.posix.join(dir.remotePath, item.filename);
+      const relPath = dir.relPath
+        ? `${dir.relPath}/${item.filename}`
+        : item.filename;
+      let attrs = item.attrs;
+      let type = formatPermissions(attrs.mode).type;
+
+      if (type === "symlink") {
+        // Follow links to regular files, but never into linked directories:
+        // `ln -s / target` or cycles would otherwise walk forever.
+        const targetStats = await sftpStat(sftp, remotePath).catch(() => null);
+        if (!targetStats) {
+          state.skippedUnreadable += 1;
+          continue;
+        }
+        const targetType = formatPermissions(targetStats.mode).type;
+        if (targetType === "directory") {
+          state.skippedSymlinks += 1;
+          continue;
+        }
+        attrs = targetStats;
+        type = targetType;
+      }
+
+      if (type === "directory") {
+        if (dir.depth + 1 > limits.maxDepth) {
+          throw new SftpZipLimitError(
+            "too-deep",
+            `This folder is nested deeper than ${limits.maxDepth} levels at ${remotePath}. Download that sub-folder on its own.`,
+            limits.maxDepth,
+            { path: remotePath }
+          );
+        }
+        state.directoryCount += 1;
+        state.entries.push({
+          relPath,
+          remotePath,
+          kind: "directory",
+          size: 0,
+          mtime: toMillis(attrs.mtime),
+          mode: attrs.mode,
+        });
+        stack.push({
+          remotePath,
+          relPath,
+          depth: dir.depth + 1,
+        });
+        continue;
+      }
+
+      if (state.fileCount + 1 > limits.maxFiles) {
+        throw new SftpZipLimitError(
+          "too-many-files",
+          `This selection contains more than ${limits.maxFiles} files. Download fewer items or a sub-folder instead.`,
+          limits.maxFiles,
+          { path: dir.remotePath }
+        );
+      }
+      const size = Number(attrs.size) || 0;
+      if (state.totalBytes + size > limits.maxTotalBytes) {
+        throw new SftpZipLimitError(
+          "too-large",
+          `This selection is larger than ${formatMebibytes(limits.maxTotalBytes)}. Download fewer items (large archives should be pulled over SSH/tar on the server).`,
+          limits.maxTotalBytes,
+          { path: remotePath }
+        );
+      }
+      state.fileCount += 1;
+      state.totalBytes += size;
+      state.entries.push({
+        relPath,
+        remotePath,
+        kind: "file",
+        size,
+        mtime: toMillis(attrs.mtime),
+        mode: attrs.mode,
+      });
+    }
+  }
+}
+
+/** Upper bound on how many paths one archive request may contain. */
+export const MAX_ARCHIVE_TARGETS = 500;
+
+/**
+ * Walks one or more selected remote paths over one SFTP connection and returns
+ * the metadata for a single archive.
+ *
+ * - One folder → its *contents* go to the archive root (the classic
+ *   "download this folder" archive).
+ * - One file → the file itself sits at the archive root.
+ * - Several files / folders → every item keeps its own name at the archive root,
+ *   so `app/` and `single.txt` stay side by side inside one .zip.
+ *
+ * Throws SftpZipLimitError as soon as a limit would be exceeded.
+ */
+export async function collectRemoteArchive(
+  creds: ConnectionCredentials,
+  requestedTargets: string[],
+  limits: SftpZipLimits = DEFAULT_SFTP_ZIP_LIMITS,
+  options: { requireDirectory?: boolean } = {}
+): Promise<RemoteTree> {
+  return withSftp(creds, async (sftp) => {
+    const targets: RemoteTarget[] = [];
+    const seen = new Set<string>();
+
+    for (const raw of requestedTargets) {
+      const requested = (raw || "").trim();
+      if (!requested) continue;
+      if (targets.length >= MAX_ARCHIVE_TARGETS) {
+        throw new Error(
+          `Too many items selected at once (limit ${MAX_ARCHIVE_TARGETS}).`
+        );
+      }
+
+      let absPath: string;
+      try {
+        absPath = await sftpRealpath(sftp, requested);
+      } catch {
+        absPath = path.posix.resolve("/", requested);
+      }
+      // `./app` and `/home/me/app` are the same selection — walk it once.
+      if (seen.has(absPath)) continue;
+      seen.add(absPath);
+
+      let stats = await sftpStat(sftp, absPath).catch(async () =>
+        sftpLstat(sftp, absPath)
+      );
+      let type = formatPermissions(stats.mode).type;
+      if (type === "symlink") {
+        // A selected symlink is resolved once so a linked file can be archived.
+        // Linked folders are still skipped by the walk, so cycles stay impossible.
+        const followed = await sftpStat(sftp, absPath).catch(() => null);
+        if (followed) {
+          stats = followed;
+          type = formatPermissions(followed.mode).type;
+        }
+      }
+
+      if (options.requireDirectory && type !== "directory") {
+        throw new Error(
+          `${absPath} is a ${type === "symlink" ? "symlink" : "file"}, not a folder — download it directly instead of archiving it.`
+        );
+      }
+
+      targets.push({
+        absPath,
+        name: path.posix.basename(absPath) || "download",
+        kind: type === "directory" ? "directory" : "file",
+        size: Number(stats.size) || 0,
+        mode: stats.mode,
+        mtime: toMillis(stats.mtime),
+      });
+    }
+
+    if (targets.length === 0) {
+      throw new Error("Nothing was selected to download.");
+    }
+
+    const state: WalkState = {
+      entries: [],
+      fileCount: 0,
+      directoryCount: 0,
+      totalBytes: 0,
+      skippedSymlinks: 0,
+      skippedUnreadable: 0,
+      usedNames: new Set<string>(),
+    };
+    const single = targets.length === 1;
+
+    for (const target of targets) {
+      const entryName = uniqueEntryName(target.name, state.usedNames);
+
+      if (target.kind === "directory") {
+        if (single) {
+          await walkIntoArchive(sftp, state, target.absPath, "", limits);
+          continue;
+        }
+        // A folder inside a multi-item selection keeps its own name, and the
+        // entry exists even when the folder is empty.
+        state.directoryCount += 1;
+        state.entries.push({
+          relPath: entryName,
+          remotePath: target.absPath,
+          kind: "directory",
+          size: 0,
+          mtime: target.mtime,
+          mode: target.mode,
+        });
+        await walkIntoArchive(sftp, state, target.absPath, entryName, limits);
+        continue;
+      }
+
+      if (state.fileCount + 1 > limits.maxFiles) {
+        throw new SftpZipLimitError(
+          "too-many-files",
+          `This selection contains more than ${limits.maxFiles} files. Download fewer items instead.`,
+          limits.maxFiles,
+          { path: target.absPath }
+        );
+      }
+      if (state.totalBytes + target.size > limits.maxTotalBytes) {
+        throw new SftpZipLimitError(
+          "too-large",
+          `This selection is larger than ${formatMebibytes(limits.maxTotalBytes)}. Download fewer items (large archives should be pulled over SSH/tar on the server).`,
+          limits.maxTotalBytes,
+          { path: target.absPath }
+        );
+      }
+      state.fileCount += 1;
+      state.totalBytes += target.size;
+      state.entries.push({
+        relPath: entryName,
+        remotePath: target.absPath,
+        kind: "file",
+        size: target.size,
+        mtime: target.mtime,
+        mode: target.mode,
+      });
+    }
+
+    // Directories before their contents reads nicer when unzipping.
+    state.entries.sort((a, b) => {
+      const depthDiff =
+        a.relPath.split("/").length - b.relPath.split("/").length;
+      if (depthDiff !== 0) return depthDiff;
+      if (a.kind !== b.kind) return a.kind === "directory" ? -1 : 1;
+      return a.relPath.localeCompare(b.relPath);
+    });
+
+    const rootPath =
+      single && targets[0].kind === "directory"
+        ? targets[0].absPath
+        : commonParentDirectory(targets.map((t) => t.absPath));
+    const rootName = single
+      ? targets[0].name
+      : `${path.posix.basename(rootPath) || "download"}-selection`;
+
+    return {
+      rootPath,
+      rootName: sanitizeRootName(rootName),
+      entries: state.entries,
+      fileCount: state.fileCount,
+      directoryCount: state.directoryCount,
+      totalBytes: state.totalBytes,
+      skippedSymlinks: state.skippedSymlinks,
+      skippedUnreadable: state.skippedUnreadable,
+    };
+  });
+}
+
 /**
  * Walks a remote folder over one SFTP connection and returns its metadata.
  * Throws SftpZipLimitError as soon as a limit would be exceeded.
@@ -148,150 +488,8 @@ export async function collectRemoteTree(
   requestedPath: string,
   limits: SftpZipLimits = DEFAULT_SFTP_ZIP_LIMITS
 ): Promise<RemoteTree> {
-  return withSftp(creds, async (sftp) => {
-    const requested = (requestedPath || "").trim() || ".";
-    let rootPath: string;
-    try {
-      rootPath = await sftpRealpath(sftp, requested);
-    } catch {
-      rootPath = path.posix.resolve("/", requested);
-    }
-
-    const rootStats = await sftpStat(sftp, rootPath).catch(async () =>
-      sftpLstat(sftp, rootPath)
-    );
-    const rootType = formatPermissions(rootStats.mode).type;
-    if (rootType !== "directory") {
-      throw new Error(
-        `${rootPath} is a ${rootType === "symlink" ? "symlink" : "file"}, not a folder — download it directly instead of archiving it.`
-      );
-    }
-
-    const entries: RemoteTreeEntry[] = [];
-    let fileCount = 0;
-    let directoryCount = 0;
-    let totalBytes = 0;
-    let skippedSymlinks = 0;
-    let skippedUnreadable = 0;
-
-    const stack: Array<{ remotePath: string; relPath: string; depth: number }> = [
-      { remotePath: rootPath, relPath: "", depth: 0 },
-    ];
-
-    while (stack.length > 0) {
-      const dir = stack.pop()!;
-      let items: Array<{ filename: string; attrs: Attributes }>;
-      try {
-        items = await sftpReadDir(sftp, dir.remotePath);
-      } catch {
-        // Unreadable sub-directory: keep the rest of the folder downloadable.
-        skippedUnreadable += 1;
-        continue;
-      }
-
-      for (const item of items) {
-        if (item.filename === "." || item.filename === ".." || !item.filename) {
-          continue;
-        }
-        const remotePath = path.posix.join(dir.remotePath, item.filename);
-        const relPath = dir.relPath
-          ? `${dir.relPath}/${item.filename}`
-          : item.filename;
-        let attrs = item.attrs;
-        let type = formatPermissions(attrs.mode).type;
-
-        if (type === "symlink") {
-          // Follow links to regular files, but never into linked directories:
-          // `ln -s / target` or cycles would otherwise walk forever.
-          const targetStats = await sftpStat(sftp, remotePath).catch(() => null);
-          if (!targetStats) {
-            skippedUnreadable += 1;
-            continue;
-          }
-          const targetType = formatPermissions(targetStats.mode).type;
-          if (targetType === "directory") {
-            skippedSymlinks += 1;
-            continue;
-          }
-          attrs = targetStats;
-          type = targetType;
-        }
-
-        if (type === "directory") {
-          if (dir.depth + 1 > limits.maxDepth) {
-            throw new SftpZipLimitError(
-              "too-deep",
-              `This folder is nested deeper than ${limits.maxDepth} levels at ${remotePath}. Download that sub-folder on its own.`,
-              limits.maxDepth,
-              { path: remotePath }
-            );
-          }
-          directoryCount += 1;
-          entries.push({
-            relPath,
-            remotePath,
-            kind: "directory",
-            size: 0,
-            mtime: toMillis(attrs.mtime),
-            mode: attrs.mode,
-          });
-          stack.push({
-            remotePath,
-            relPath,
-            depth: dir.depth + 1,
-          });
-          continue;
-        }
-
-        if (fileCount + 1 > limits.maxFiles) {
-          throw new SftpZipLimitError(
-            "too-many-files",
-            `This folder contains more than ${limits.maxFiles} files. Download a sub-folder instead.`,
-            limits.maxFiles,
-            { path: dir.remotePath }
-          );
-        }
-        const size = Number(attrs.size) || 0;
-        if (totalBytes + size > limits.maxTotalBytes) {
-          throw new SftpZipLimitError(
-            "too-large",
-            `This folder is larger than ${formatMebibytes(limits.maxTotalBytes)}. Download a sub-folder instead (large archives should be pulled over SSH/tar on the server).`,
-            limits.maxTotalBytes,
-            { path: remotePath }
-          );
-        }
-        fileCount += 1;
-        totalBytes += size;
-        entries.push({
-          relPath,
-          remotePath,
-          kind: "file",
-          size,
-          mtime: toMillis(attrs.mtime),
-          mode: attrs.mode,
-        });
-      }
-    }
-
-    // Directories before their contents reads nicer when unzipping.
-    entries.sort((a, b) => {
-      const depthDiff =
-        a.relPath.split("/").length - b.relPath.split("/").length;
-      if (depthDiff !== 0) return depthDiff;
-      if (a.kind !== b.kind) return a.kind === "directory" ? -1 : 1;
-      return a.relPath.localeCompare(b.relPath);
-    });
-
-    return {
-      rootPath,
-      rootName: sanitizeRootName(rootPath),
-      entries,
-      fileCount,
-      directoryCount,
-      totalBytes,
-      skippedSymlinks,
-      skippedUnreadable,
-    };
+  return collectRemoteArchive(creds, [requestedPath], limits, {
+    requireDirectory: true,
   });
 }
 

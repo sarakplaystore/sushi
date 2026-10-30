@@ -4,8 +4,9 @@ import type { ConnectionCredentials } from "@/types/connection";
 import { getCorsHeaders, verifyRequestAccess } from "@/lib/server/security";
 import {
   DEFAULT_SFTP_ZIP_LIMITS,
+  MAX_ARCHIVE_TARGETS,
   SftpZipLimitError,
-  collectRemoteTree,
+  collectRemoteArchive,
   writeZipFromTree,
 } from "@/lib/server/sftp-zip";
 
@@ -39,10 +40,14 @@ function contentDisposition(filename: string): string {
 
 /**
  * POST /api/sftp/download-zip
- * Streams a remote folder as a .zip archive.
+ * Streams one remote folder, or any selection of files and folders, as a .zip.
  *
- * The tree is collected first (metadata only) so oversized folders fail with a
- * readable JSON error before the response starts; the archive itself is then
+ * Body: `{ credentials, path }` for a single folder (contents at the archive
+ * root) or `{ credentials, paths: string[] }` for a selection (every file and
+ * folder keeps its own name inside one archive).
+ *
+ * The tree is collected first (metadata only) so oversized selections fail with
+ * a readable JSON error before the response starts; the archive itself is then
  * streamed file by file over SFTP, never buffered in memory.
  */
 export async function POST(req: NextRequest) {
@@ -52,11 +57,16 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ ok: false, error: auth.error }, { status: 401, headers: cors });
   }
 
-  let body: { credentials?: ConnectionCredentials; path?: string };
+  let body: {
+    credentials?: ConnectionCredentials;
+    path?: string;
+    paths?: string[];
+  };
   try {
     body = (await req.json()) as {
       credentials?: ConnectionCredentials;
       path?: string;
+      paths?: string[];
     };
   } catch {
     return NextResponse.json(
@@ -65,16 +75,33 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  if (!body?.credentials || !body?.path) {
+  // A single folder keeps the original `path` shape; a multi-selection posts
+  // `paths`. Both end up in the same archive walker.
+  const targets = Array.isArray(body?.paths)
+    ? body.paths.filter((p): p is string => typeof p === "string" && p.trim() !== "")
+    : [];
+  if (targets.length === 0 && body?.path) targets.push(body.path);
+
+  if (!body?.credentials || targets.length === 0) {
     return NextResponse.json(
-      { ok: false, error: "Missing credentials or remote folder path." },
+      { ok: false, error: "Missing credentials, or no files/folders to archive." },
       { status: 400, headers: cors }
+    );
+  }
+
+  if (targets.length > MAX_ARCHIVE_TARGETS) {
+    return NextResponse.json(
+      {
+        ok: false,
+        error: `Too many items selected at once (limit ${MAX_ARCHIVE_TARGETS}).`,
+      },
+      { status: 413, headers: cors }
     );
   }
 
   let tree;
   try {
-    tree = await collectRemoteTree(body.credentials, body.path, ARCHIVE_LIMITS);
+    tree = await collectRemoteArchive(body.credentials, targets, ARCHIVE_LIMITS);
   } catch (err) {
     if (err instanceof SftpZipLimitError) {
       return NextResponse.json(

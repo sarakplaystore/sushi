@@ -6,6 +6,7 @@ import { PassThrough } from "node:stream";
 import zlib from "node:zlib";
 import http from "node:http";
 import net from "node:net";
+import path from "node:path";
 import { Server as SshServer, utils as sshUtils } from "ssh2";
 import { WebSocket } from "ws";
 import {
@@ -22,6 +23,7 @@ import { probeRdpServer } from "../src/lib/server/rdp-probe";
 import type { ConnectionCredentials } from "../src/types/connection";
 import {
   SftpZipLimitError,
+  collectRemoteArchive,
   collectRemoteTree,
   dosDateTime,
   writeZipFromTree,
@@ -295,7 +297,9 @@ async function runTests() {
           });
 
           sftp.on("REALPATH", (reqId, reqPath) => {
-            const norm = reqPath === "." || !reqPath ? "/" : reqPath;
+            // A real sshd canonicalises `.` / `..` segments here, so mirror that.
+            const norm =
+              reqPath === "." || !reqPath ? "/" : path.posix.resolve("/", reqPath);
             sftp.name(reqId, [{ filename: norm, longname: norm, attrs: {} as never }]);
           });
 
@@ -765,6 +769,118 @@ async function runTests() {
   await assert.rejects(
     () => collectRemoteTree(creds, "/hello.txt"),
     /not a folder/
+  );
+
+  // Selection download: any mix of files and folders becomes one archive.
+  console.log("==> [2c] Testing multi-selection → one ZIP (files + folders)...");
+  const selection = await collectRemoteArchive(creds, [
+    "/projects/src",
+    "/projects/README.md",
+    "/projects/empty",
+  ]);
+  assert.equal(selection.rootPath, "/projects");
+  assert.equal(selection.rootName, "projects-selection");
+  assert.equal(selection.fileCount, 3);
+  assert.equal(selection.directoryCount, 2);
+  assert.equal(
+    selection.totalBytes,
+    readme.length + indexTs.length + bigFile.length
+  );
+
+  const selectionArchive = await zipTreeToBuffer(creds, selection);
+  const selectionEntries = parseZipEntries(selectionArchive);
+  assert.deepEqual(
+    selectionEntries.map((e) => e.name).sort(),
+    ["README.md", "empty/", "src/", "src/big.txt", "src/index.ts"]
+  );
+  const selectionByName = new Map(selectionEntries.map((e) => [e.name, e]));
+  assert.equal(
+    selectionByName.get("README.md")?.data.toString("utf8"),
+    "# Sushi projects\n"
+  );
+  assert.equal(selectionByName.get("src/big.txt")?.data.equals(bigFile), true);
+  // The selected folders keep their own entry, so empty ones survive unzipping.
+  assert.equal(
+    ((selectionByName.get("empty/")?.externalAttributes ?? 0) >>> 28) & 0xf,
+    0o4
+  );
+
+  // A single selected file goes to the archive root under its own name…
+  const singleFile = await collectRemoteArchive(creds, ["/projects/README.md"]);
+  assert.equal(singleFile.rootName, "README.md");
+  assert.equal(singleFile.rootPath, "/projects");
+  assert.deepEqual(
+    singleFile.entries.map((e) => e.relPath),
+    ["README.md"]
+  );
+  assert.equal(singleFile.fileCount, 1);
+  // …and a single folder still archives its contents at the root.
+  const singleFolder = await collectRemoteArchive(creds, ["/projects"]);
+  assert.deepEqual(
+    singleFolder.entries.map((e) => e.relPath).sort(),
+    tree.entries.map((e) => e.relPath).sort()
+  );
+
+  // Duplicate paths (same folder spelled twice) are walked once.
+  const deduped = await collectRemoteArchive(creds, [
+    "/projects/src",
+    "/projects/./src",
+    "./projects/src",
+  ]);
+  assert.equal(deduped.fileCount, 2);
+  assert.equal(deduped.directoryCount, 0);
+  assert.deepEqual(
+    deduped.entries.map((e) => e.relPath).sort(),
+    ["big.txt", "index.ts"]
+  );
+
+  // Two selected items with the same basename keep distinct archive names.
+  await sftpWriteBuffer(
+    creds,
+    "/projects/src/README.md",
+    Buffer.from("# inner readme\n")
+  );
+  const sameName = await collectRemoteArchive(creds, [
+    "/projects/README.md",
+    "/projects/src/README.md",
+  ]);
+  assert.deepEqual(
+    sameName.entries.map((e) => e.relPath).sort(),
+    ["README (2).md", "README.md"]
+  );
+  assert.equal(
+    sameName.entries.find((e) => e.relPath === "README (2).md")?.remotePath,
+    "/projects/src/README.md"
+  );
+
+  // Selection archives are accepted by a real unzip too.
+  if (spawnSync("unzip", ["-v"], { stdio: "ignore" }).status === 0) {
+    const tmpSelection = `/tmp/sushi-selection-${Date.now()}.zip`;
+    fs.writeFileSync(tmpSelection, selectionArchive);
+    const check = spawnSync("unzip", ["-t", tmpSelection], { encoding: "utf8" });
+    assert.equal(
+      check.status,
+      0,
+      `unzip -t accepts a selection archive: ${check.stdout}${check.stderr}`
+    );
+    fs.rmSync(tmpSelection, { force: true });
+  }
+
+  // Limits still apply to a selection.
+  await assert.rejects(
+    () =>
+      collectRemoteArchive(creds, ["/projects"], {
+        maxFiles: 2,
+        maxDepth: 24,
+        maxTotalBytes: 1 << 30,
+      }),
+    (err: unknown) =>
+      err instanceof SftpZipLimitError && err.code === "too-many-files"
+  );
+  // An empty selection is a clear error rather than an empty archive.
+  await assert.rejects(
+    () => collectRemoteArchive(creds, ["   "]),
+    /Nothing was selected/
   );
 
   await sftpDeleteItem(creds, "/projects");
@@ -1706,7 +1822,7 @@ async function runTests() {
   rdpMock.close();
   sshServer.close();
   console.log(
-    "ALL AUTH, PASSKEY, KEY WHITELIST, TERMIX, SSH, SFTP, RDP, EXEC STDIN, AND FOLDER-DOWNLOAD E2E TESTS PASSED!"
+    "ALL AUTH, PASSKEY, KEY WHITELIST, TERMIX, SSH, SFTP, RDP, EXEC STDIN, FOLDER-DOWNLOAD, AND SELECTION-DOWNLOAD E2E TESTS PASSED!"
   );
 }
 

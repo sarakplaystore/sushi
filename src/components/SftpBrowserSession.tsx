@@ -29,6 +29,7 @@ import {
   Ban,
   Copy,
   ShieldCheck,
+  ListChecks,
 } from "lucide-react";
 import type { HostProfile, SftpEntry } from "@/types/connection";
 import { type GatewaySettings, getAuthHeaders } from "@/lib/client/gateway";
@@ -183,6 +184,12 @@ export function SftpBrowserSession({
     y: number;
   } | null>(null);
 
+  // Multi-selection: a checkbox per row plus click / ⌘ / Ctrl / Shift on the
+  // row, so any mix of files and folders can be downloaded as one archive.
+  const [selectedPaths, setSelectedPaths] = useState<string[]>([]);
+  const selectionAnchorRef = useRef<string | null>(null);
+  const selectedSet = new Set(selectedPaths);
+
   const credentialsPayload = {
     host: profile.host,
     port: profile.port,
@@ -215,9 +222,17 @@ export function SftpBrowserSession({
         if (!res.ok || !data.ok) {
           throw new Error(data.error || `Failed to list ${targetPath}`);
         }
+        const nextEntries: SftpEntry[] = data.entries || [];
         setCwd(data.cwd);
         setPathInput(data.cwd);
-        setEntries(data.entries || []);
+        setEntries(nextEntries);
+        // Keep the selection across refreshes/renames, but never keep a path
+        // that no longer exists (and drop everything after navigating away).
+        const stillThere = new Set(nextEntries.map((e) => e.path));
+        setSelectedPaths((prev) => {
+          const kept = prev.filter((p) => stillThere.has(p));
+          return kept.length === prev.length ? prev : kept;
+        });
       } catch (err) {
         setError(err instanceof Error ? err.message : "Failed to load directory.");
       } finally {
@@ -343,21 +358,24 @@ export function SftpBrowserSession({
   };
 
   /**
-   * Downloads a folder as a .zip archive. The server walks the tree over SFTP and
-   * streams the archive, so this works on Vercel (no remote shell) as well as on a
-   * VPS. Progress is shown as the bytes arrive.
+   * Downloads a folder, or an arbitrary selection of files and folders, as a
+   * single .zip archive. The server walks every path over SFTP and streams the
+   * archive, so this works on Vercel (no remote shell) as well as on a VPS.
+   * Progress is shown as the bytes arrive; in Chromium the archive is written
+   * straight to disk instead of being buffered in this tab.
    */
-  const handleDownloadFolder = async (entry?: SftpEntry | null) => {
-    if (zipJob) return;
-    const targetPath = entry ? entry.path : cwd;
-    const label =
-      entry?.name || cwd.split("/").filter(Boolean).pop() || "folder";
+  const handleDownloadArchive = async (
+    paths: string[],
+    label: string,
+    preferredName: string
+  ) => {
+    if (zipJob || paths.length === 0) return;
     const controller = new AbortController();
     zipAbortRef.current = controller;
 
     // Pick the destination first (Chromium): a big folder can then be written
     // straight to disk instead of being held in this tab's memory.
-    const sink = await openArchiveSink(`${label}.zip`);
+    const sink = await openArchiveSink(preferredName);
     if (sink.kind === "cancelled") return;
 
     setZipJob({ label, received: 0, total: 0, files: 0 });
@@ -369,15 +387,17 @@ export function SftpBrowserSession({
         signal: controller.signal,
         body: JSON.stringify({
           credentials: credentialsPayload,
-          path: targetPath,
+          // One path = that folder's contents at the archive root (or the file
+          // itself); several paths = one archive holding every selected item
+          // under its own name.
+          paths,
         }),
       });
 
       if (!res.ok || !res.body) {
         const errData = await res.json().catch(() => ({}));
         throw new Error(
-          errData.error ||
-            `Could not archive ${targetPath} (HTTP ${res.status}).`
+          errData.error || `Could not build the archive (HTTP ${res.status}).`
         );
       }
 
@@ -387,7 +407,7 @@ export function SftpBrowserSession({
       const headerName = res.headers.get("X-Sushi-Archive-Name");
       let archiveName = headerName
         ? decodeURIComponent(headerName)
-        : `${label}.zip`;
+        : preferredName;
       if (!/\.zip$/i.test(archiveName)) archiveName += ".zip";
 
       const reader = res.body.getReader();
@@ -434,15 +454,50 @@ export function SftpBrowserSession({
       }
       const aborted = (err as Error)?.name === "AbortError";
       const message = aborted
-        ? "Folder download cancelled."
+        ? "Download cancelled."
         : err instanceof Error
           ? `${err.message}`
-          : "Folder download failed.";
+          : "Download failed.";
       showNotice(false, message);
     } finally {
       zipAbortRef.current = null;
       setZipJob(null);
     }
+  };
+
+  /** Downloads one folder (or the folder currently open) as a .zip archive. */
+  const handleDownloadFolder = async (entry?: SftpEntry | null) => {
+    const targetPath = entry ? entry.path : cwd;
+    const label =
+      entry?.name || cwd.split("/").filter(Boolean).pop() || "folder";
+    await handleDownloadArchive([targetPath], label, `${label}.zip`);
+  };
+
+  /** Archive name for the current selection: the item itself, or "<dir>-selection". */
+  const selectionArchiveName = (selection: SftpEntry[]): string => {
+    if (selection.length === 1) return `${selection[0].name}.zip`;
+    const base = cwd.split("/").filter(Boolean).pop() || "download";
+    return `${base}-selection.zip`;
+  };
+
+  /**
+   * Downloads whatever is selected. A lone file is fetched directly; a folder,
+   * or any mix of files and folders, becomes one .zip with each item kept under
+   * its own name.
+   */
+  const handleDownloadSelection = async () => {
+    const selection = entries.filter((e) => selectedSet.has(e.path));
+    if (selection.length === 0) return;
+    if (selection.length === 1 && selection[0].type === "file") {
+      await handleDownloadFile(selection[0]);
+      return;
+    }
+    const name = selectionArchiveName(selection);
+    await handleDownloadArchive(
+      selection.map((e) => e.path),
+      name.replace(/\.zip$/i, ""),
+      name
+    );
   };
 
   useEffect(() => {
@@ -529,6 +584,72 @@ export function SftpBrowserSession({
   });
 
   const breadcrumbParts = cwd.split("/").filter(Boolean);
+
+  // ---- Selection helpers -------------------------------------------------
+  const selectedEntries = entries.filter((e) => selectedSet.has(e.path));
+  const selectedFolderCount = selectedEntries.filter(
+    (e) => e.type === "directory"
+  ).length;
+  const selectedBytes = selectedEntries.reduce(
+    (sum, e) => sum + (e.type === "directory" ? 0 : e.size),
+    0
+  );
+  const allVisibleSelected =
+    visibleEntries.length > 0 &&
+    visibleEntries.every((e) => selectedSet.has(e.path));
+  const someVisibleSelected = visibleEntries.some((e) =>
+    selectedSet.has(e.path)
+  );
+
+  const toggleSelected = (entry: SftpEntry) => {
+    setSelectedPaths((prev) =>
+      prev.includes(entry.path)
+        ? prev.filter((p) => p !== entry.path)
+        : [...prev, entry.path]
+    );
+    selectionAnchorRef.current = entry.path;
+  };
+
+  const selectRange = (entry: SftpEntry) => {
+    const paths = visibleEntries.map((e) => e.path);
+    const to = paths.indexOf(entry.path);
+    const anchor = selectionAnchorRef.current;
+    const from = anchor === null ? -1 : paths.indexOf(anchor);
+    if (from === -1 || to === -1) {
+      setSelectedPaths([entry.path]);
+      selectionAnchorRef.current = entry.path;
+      return;
+    }
+    const [lo, hi] = from <= to ? [from, to] : [to, from];
+    setSelectedPaths(paths.slice(lo, hi + 1));
+  };
+
+  /** Row click: plain = select only this one, ⌘/Ctrl = toggle, Shift = range. */
+  const handleRowSelect = (entry: SftpEntry, event: React.MouseEvent) => {
+    if (event.shiftKey) {
+      selectRange(entry);
+      return;
+    }
+    if (event.metaKey || event.ctrlKey) {
+      toggleSelected(entry);
+      return;
+    }
+    setSelectedPaths([entry.path]);
+    selectionAnchorRef.current = entry.path;
+  };
+
+  const toggleSelectAllVisible = () => {
+    if (allVisibleSelected) {
+      const visible = new Set(visibleEntries.map((e) => e.path));
+      setSelectedPaths((prev) => prev.filter((p) => !visible.has(p)));
+      return;
+    }
+    setSelectedPaths((prev) => {
+      const next = new Set(prev);
+      for (const e of visibleEntries) next.add(e.path);
+      return [...next];
+    });
+  };
 
   return (
     <div
@@ -754,17 +875,23 @@ export function SftpBrowserSession({
                   type="button"
                   onClick={() => {
                     const entry = rowMenu.entry;
+                    const multi =
+                      selectedSet.has(entry.path) && selectedEntries.length > 1;
                     setRowMenu(null);
-                    if (entry.type === "directory") void handleDownloadFolder(entry);
+                    if (multi) void handleDownloadSelection();
+                    else if (entry.type === "directory") void handleDownloadFolder(entry);
                     else void handleDownloadFile(entry);
                   }}
                   disabled={Boolean(zipJob)}
                   className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs font-medium text-sky-200 hover:bg-sky-500/15 disabled:opacity-50"
                 >
                   <FolderDown className="h-3.5 w-3.5" />
-                  {rowMenu.entry.type === "directory"
-                    ? "Download folder (.zip)"
-                    : "Download file"}
+                  {selectedSet.has(rowMenu.entry.path) &&
+                  selectedEntries.length > 1
+                    ? `Download ${selectedEntries.length} selected items (.zip)`
+                    : rowMenu.entry.type === "directory"
+                      ? "Download folder (.zip)"
+                      : "Download file"}
                 </button>
                 <div className="my-1 h-px bg-white/8" />
                 <button
@@ -854,6 +981,48 @@ export function SftpBrowserSession({
           </div>
         </div>
       </div>
+
+      {/* Selection bar: appears as soon as anything is checked */}
+      {selectedEntries.length > 0 && (
+        <div className="flex flex-wrap items-center gap-2 border-b border-sky-500/25 bg-sky-500/10 px-4 py-2 text-[11px] text-sky-100">
+          <ListChecks className="h-3.5 w-3.5 shrink-0 text-sky-300" />
+          <span className="min-w-0 flex-1 truncate">
+            <span className="font-semibold text-white">
+              {selectedEntries.length} selected
+            </span>
+            {selectedFolderCount > 0 &&
+              ` — ${selectedFolderCount} folder${selectedFolderCount === 1 ? "" : "s"}`}
+            {selectedFolderCount > 0 && selectedBytes > 0 && ","}
+            {selectedBytes > 0 && ` ${formatBytes(selectedBytes)} in files`}
+            <span className="hidden text-sky-300/70 sm:inline">
+              {" "}
+              • folders are zipped
+            </span>
+          </span>
+          <button
+            type="button"
+            onClick={() => void handleDownloadSelection()}
+            disabled={Boolean(zipJob)}
+            className="flex shrink-0 items-center gap-1 rounded-md border border-sky-400/40 bg-sky-500/20 px-2 py-0.5 font-semibold text-sky-100 transition hover:bg-sky-500/35 disabled:opacity-50"
+            title="Download the selected files and folders (folders are zipped)"
+          >
+            <Download className="h-3 w-3" />
+            Download{selectedEntries.length > 1 ? ` ${selectedEntries.length}` : ""}
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setSelectedPaths([]);
+              selectionAnchorRef.current = null;
+            }}
+            className="flex shrink-0 items-center gap-1 rounded-md border border-white/15 px-2 py-0.5 text-slate-200 transition hover:bg-white/10"
+            title="Clear selection"
+          >
+            <X className="h-3 w-3" />
+            Clear
+          </button>
+        </div>
+      )}
 
       {/* Folder → ZIP progress */}
       {zipJob && (
@@ -993,7 +1162,21 @@ export function SftpBrowserSession({
         <table className="w-full border-collapse text-left text-xs">
           <thead className="sticky top-0 z-10 border-b border-white/8 bg-[#0e121a] text-[11px] font-medium uppercase tracking-wider text-slate-400">
             <tr>
-              <th className="py-2.5 pl-4 pr-3">Name</th>
+              <th className="w-8 py-2.5 pl-4 pr-1">
+                <input
+                  type="checkbox"
+                  aria-label="Select all files and folders"
+                  title="Select all items in this folder"
+                  checked={allVisibleSelected}
+                  ref={(el) => {
+                    if (el) el.indeterminate = someVisibleSelected && !allVisibleSelected;
+                  }}
+                  onChange={toggleSelectAllVisible}
+                  disabled={visibleEntries.length === 0}
+                  className="h-3.5 w-3.5 cursor-pointer accent-sky-500 disabled:opacity-40"
+                />
+              </th>
+              <th className="py-2.5 pr-3">Name</th>
               <th className="hidden px-3 py-2.5 text-right sm:table-cell">Size</th>
               <th className="hidden px-3 py-2.5 md:table-cell">Permissions</th>
               <th className="hidden px-3 py-2.5 lg:table-cell">Modified</th>
@@ -1006,7 +1189,8 @@ export function SftpBrowserSession({
                 onClick={navigateParent}
                 className="cursor-pointer transition hover:bg-white/[0.03]"
               >
-                <td className="py-2 pl-4 pr-3 font-medium text-slate-300" colSpan={5}>
+                <td className="py-2 pl-4 pr-1" />
+                <td className="py-2 pr-3 font-medium text-slate-300" colSpan={5}>
                   <div className="flex items-center gap-2.5">
                     <Folder className="h-4 w-4 text-sky-400/75" />
                     <span className="font-mono-code">..</span>
@@ -1017,14 +1201,14 @@ export function SftpBrowserSession({
 
             {loading && entries.length === 0 ? (
               <tr>
-                <td colSpan={5} className="py-16 text-center text-slate-400">
+                <td colSpan={6} className="py-16 text-center text-slate-400">
                   <Loader2 className="mx-auto mb-2 h-6 w-6 animate-spin text-sky-400" />
                   Connecting to {profile.host}:{profile.port} via SFTP...
                 </td>
               </tr>
             ) : visibleEntries.length === 0 ? (
               <tr>
-                <td colSpan={5} className="py-16 text-center text-slate-500">
+                <td colSpan={6} className="py-16 text-center text-slate-500">
                   Directory is empty. Drag &amp; drop files here to upload.
                 </td>
               </tr>
@@ -1038,6 +1222,14 @@ export function SftpBrowserSession({
                 return (
                   <tr
                     key={entry.path}
+                    aria-selected={selectedSet.has(entry.path)}
+                    onClick={(e) => {
+                      // Clicks on the row's own buttons/checkbox keep their meaning.
+                      if ((e.target as HTMLElement).closest("button,input,a,label")) {
+                        return;
+                      }
+                      handleRowSelect(entry, e);
+                    }}
                     onDoubleClick={() => {
                       if (isDir) {
                         void loadDirectory(entry.path);
@@ -1047,11 +1239,31 @@ export function SftpBrowserSession({
                     }}
                     onContextMenu={(e) => {
                       e.preventDefault();
+                      // Right-clicking outside the current selection selects the
+                      // row being acted on (like every file manager).
+                      if (!selectedSet.has(entry.path)) {
+                        setSelectedPaths([entry.path]);
+                        selectionAnchorRef.current = entry.path;
+                      }
                       setRowMenu({ entry, x: e.clientX, y: e.clientY });
                     }}
-                    className="group transition hover:bg-white/[0.035]"
+                    className={`group cursor-default transition ${
+                      selectedSet.has(entry.path)
+                        ? "bg-sky-500/10 hover:bg-sky-500/15"
+                        : "hover:bg-white/[0.035]"
+                    }`}
                   >
-                    <td className="py-2 pl-4 pr-3">
+                    <td className="py-2 pl-4 pr-1">
+                      <input
+                        type="checkbox"
+                        aria-label={`Select ${entry.name}`}
+                        checked={selectedSet.has(entry.path)}
+                        onClick={(e) => e.stopPropagation()}
+                        onChange={() => toggleSelected(entry)}
+                        className="h-3.5 w-3.5 cursor-pointer accent-sky-500"
+                      />
+                    </td>
+                    <td className="py-2 pr-3">
                       <button
                         type="button"
                         onClick={() => {

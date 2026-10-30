@@ -120,7 +120,23 @@ bash scripts/install-vps.sh
 | `Authentication failed … wrong username or password` | Or the server has `PasswordAuthentication no`. Use SSH key authentication. |
 | `Authentication failed … the server rejected this private key` | Add the key's public half to `~/.ssh/authorized_keys` for that user. |
 | `This private key is passphrase-protected` / `Incorrect passphrase` | Enter (or fix) the key passphrase in the host settings. |
-| `vim`/`top`/`less`/`sudo` password prompts don't work on Vercel | Serverless SSH runs each command on its own and can't forward keystrokes. Use a live PTY: self-hosted Sushi or **Attach VPS Gateway**. Pagers (`systemctl`, `journalctl`, `git log`, `man`) are disabled automatically. |
+| `vim`/`top`/`less`/`tmux` don't run on Vercel | Serverless SSH runs each command on its own, so full-screen programs are reported instead of hanging. Use a live PTY for them: self-hosted Sushi or **Attach VPS Gateway**. These work fine in the Vercel terminal: `cat`, `tail -n 100`, `sed -i`, `top -bn1`, `systemctl status`, `journalctl -n 50`, `git log`. |
+| `su` says it needs the root password (Vercel) | `su` wants the *root account's* password. Use `sudo su` instead: Sushi asks for **your** sudo password (on NOPASSWD hosts it switches instantly). |
+
+### Root access (`sudo su`) in the Vercel terminal
+
+On Vercel each command is a separate SSH exec, so an interactive `su` prompt is impossible — Sushi
+emulates it:
+
+- `sudo su`, `sudo -i`, `sudo -s`, `sudo bash` → switch the session to **root mode**. The prompt turns
+  into `root@host:/path#`, every following command runs through `sudo`, and `exit` goes back to your
+  login user. On hosts with passwordless sudo (e.g. the default `ubuntu` user on Oracle/AWS/GCP
+  images) this is instant; otherwise Sushi asks for your sudo password once and masks it (`****`).
+- `sudo <command>` runs that one command elevated without entering root mode.
+- The sudo password is kept in memory only for that terminal tab, is never written to the Vault,
+  is never echoed into the terminal, and is dropped when you type `exit` or reconnect.
+- On a self-hosted instance or through a VPS gateway (live PTY) `sudo su` is the real thing — Sushi
+  does not intercept it.
 
 Supported private keys: OpenSSH (`BEGIN OPENSSH PRIVATE KEY`, incl. passphrase-protected), PEM
 (`BEGIN RSA/EC PRIVATE KEY`, incl. encrypted), **PKCS#8** (`BEGIN PRIVATE KEY` /

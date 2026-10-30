@@ -4,6 +4,11 @@ import type { ConnectionCredentials } from "@/types/connection";
 import { connectSsh, shellQuote } from "@/lib/server/ssh-client";
 import { getCorsHeaders, verifyRequestAccess } from "@/lib/server/security";
 import { META_REGEX, splitEmittable } from "@/lib/server/exec-stream";
+import {
+  buildExecScript,
+  createSudoAnswerer,
+  type ExecElevation,
+} from "@/lib/server/exec-script";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -29,6 +34,8 @@ export async function POST(req: NextRequest) {
     cwd?: string;
     cols?: number;
     rows?: number;
+    /** Run the command through sudo (used to emulate `sudo su` / `sudo <cmd>`). */
+    elevate?: ExecElevation;
   };
 
   try {
@@ -83,26 +90,23 @@ export async function POST(req: NextRequest) {
           banner: session.serverBanner,
         });
 
-        const cdPrefix =
-          cwd && cwd !== "~" ? `cd -- ${shellQuote(cwd)} 2>/dev/null || true\n` : "";
-
-        // Each serverless command runs on its own (no keystrokes can be forwarded),
-        // so disable pagers that would otherwise wait for "q" (systemctl, journalctl,
-        // git log, man, psql ...).
-        const pagerEnv =
-          "export PAGER=cat GIT_PAGER=cat MANPAGER=cat SYSTEMD_PAGER=cat LESS=-FRX 2>/dev/null\n";
-
-        const wrappedScript = [
-          pagerEnv + cdPrefix + (command.trim() ? command : ":"),
-          "__sushi_ec=$?",
-          'printf "\\n\\033]777;SUSHI_META;%s;%s\\007" "$__sushi_ec" "$(pwd)"',
-          "exit $__sushi_ec",
-        ].join("\n");
+        const { script, feedPassword, ptyModes } = buildExecScript({
+          command,
+          cwd,
+          elevate: body.elevate,
+        });
 
         await new Promise<void>((resolve) => {
+          const ptyOptions = {
+            term: "xterm-256color",
+            cols,
+            rows,
+            ...(ptyModes ? { modes: ptyModes } : {}),
+          };
+
           session!.client.exec(
-            wrappedScript,
-            { pty: { term: "xterm-256color", cols, rows } },
+            script,
+            { pty: ptyOptions },
             (err, ch) => {
               if (err) {
                 sendEvent({ type: "error", message: err.message });
@@ -114,6 +118,43 @@ export async function POST(req: NextRequest) {
               let parsedMeta = false;
               // Keeps multi-byte UTF-8 characters intact across SSH packets
               const utf8 = new StringDecoder("utf8");
+
+              const sudoAnswerer = createSudoAnswerer();
+              let finished = false;
+
+              let passwordWritten = false;
+              const sendPassword = () => {
+                if (!feedPassword || passwordWritten || finished) return;
+                passwordWritten = true;
+                try {
+                  ch.write(`${feedPassword}\n`);
+                } catch {
+                  // channel already closed
+                }
+              };
+
+              /** Answers sudo's prompt once, hiding it and the password from the stream. */
+              const answerSudo = (text: string): string => {
+                if (!feedPassword) return text;
+                const answer = sudoAnswerer.answer(text);
+                if (answer.sendPassword) sendPassword();
+                if (answer.gaveUp) {
+                  // sudo asked again → wrong password; fail fast instead of hanging
+                  finished = true;
+                  try {
+                    ch.close();
+                  } catch {
+                    // already closed
+                  }
+                }
+                return answer.text;
+              };
+
+              // Some sudo builds phrase the prompt differently: if nothing matched and
+              // the command has not finished, answer once anyway (echo is disabled).
+              const passwordFallback = feedPassword
+                ? setTimeout(sendPassword, 3500)
+                : null;
 
               const flushText = (text: string) => {
                 if (!text) return;
@@ -129,7 +170,7 @@ export async function POST(req: NextRequest) {
                 if (match) {
                   const before = carry.slice(0, match.index);
                   const after = carry.slice(match.index + match[0].length);
-                  flushText(before);
+                  flushText(answerSudo(before));
                   parsedMeta = true;
                   sendEvent({
                     type: "meta",
@@ -141,7 +182,7 @@ export async function POST(req: NextRequest) {
                   // Emit everything except a tail that may be a split META marker
                   const [emitPart, held] = splitEmittable(carry);
                   carry = held;
-                  flushText(emitPart);
+                  flushText(answerSudo(emitPart));
                 }
               });
 
@@ -153,11 +194,13 @@ export async function POST(req: NextRequest) {
               });
 
               ch.on("close", (code: number | null) => {
+                finished = true;
+                if (passwordFallback) clearTimeout(passwordFallback);
                 carry += utf8.end();
                 if (carry) {
                   const match = META_REGEX.exec(carry);
                   if (match) {
-                    flushText(carry.slice(0, match.index));
+                    flushText(answerSudo(carry.slice(0, match.index)));
                     parsedMeta = true;
                     sendEvent({
                       type: "meta",

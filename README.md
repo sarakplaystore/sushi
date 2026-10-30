@@ -26,6 +26,7 @@ It is designed around a **Hybrid VPS + Serverless Architecture**:
   - Works identically on **Vercel Serverless** and **VPS**
   - Interactive breadcrumb navigation, drag-and-drop multi-file uploads, binary downloads, `mkdir`, rename, recursive delete, and an interactive Unix `chmod` permissions matrix
   - **Folder download as `.zip`**: pick any directory (or click **Download ZIP** for the folder you are in) and Sushi streams the whole tree — nested folders, dotfiles, binary files, empty folders and permissions — straight to your browser. No remote `zip`/`tar` binary and no shell needed, so it works on Vercel exactly like on a VPS.
+  - **Multi-select download**: check any mix of files and folders (checkbox, ⌘/Ctrl-click, Shift-click, or the select-all box) and **Download** puts exactly those items into one archive, each kept under its own name.
   - **Built-in Remote Code Editor** (`⌘S` / `Ctrl+S` direct save over SFTP)
 - **RDP Remote Desktop (`guacamole-common-js` + `guacd` + X.224 Inspector)**
   - Live in-browser Windows & Linux `xrdp` desktop streaming via `/ws/rdp` -> `guacd` (`NLA / CredSSP`, `TLS`, `Standard RDP`)
@@ -109,9 +110,22 @@ bash scripts/install-vps.sh
    terminal says so and falls back to serverless SSH. A full Sushi install (`docker compose`) can act
    as the gateway too, as long as `SUSHI_GATEWAY_TOKEN` is set in its `.env`.
 
-### Folder download (SFTP → ZIP)
+### Downloading files and folders (SFTP → ZIP)
 
-Three ways to get a folder off the server:
+**Select what you want, then download it.** Every row has a checkbox and the header checkbox selects
+everything in the current folder. Clicking a row selects it too: plain click replaces the selection,
+⌘/Ctrl-click toggles one row, Shift-click extends the range. The bar above the list shows the
+selection (how many files and folders, total size) with a **Download** button and **Clear**.
+
+- **Download** on a selection: one file is fetched as the file itself, while a folder — or any mix of
+  files and folders — becomes a single archive named `<item>.zip` (one folder) or
+  `<current-folder>-selection.zip` (several items). Each selected item keeps its own name inside the
+  archive, so `app/` and `single.txt` sit side by side when you unzip it.
+- The selection is kept when the directory is refreshed and pruned when an item disappears; opening
+  another folder clears it.
+- **Right-click** a row that is part of a multi-selection → *Download N selected items (.zip)*.
+
+**One folder at a time** — three ways to get a folder off the server:
 
 - **ZIP** button on the folder's row (Actions column) — downloads that folder as `<folder>.zip`.
 - **Right-click a row** → *Download folder (.zip)* (or *Download file* for files; the menu also has
@@ -136,8 +150,9 @@ download.
   applies, so a folder that would stream for longer is rejected up front (a shorter, safe cut-off)
   instead of arriving as a truncated `.zip`. Anything larger should be pulled with `tar`/`rsync`
   over SSH, or from a self-hosted Sushi. Sushi reports exactly which limit was hit.
-- Archiving a single file is rejected with a hint to download it directly — the file download
-  button stays the right tool there.
+- Archiving a single file on its own is rejected with a hint to download it directly — the file
+  download button stays the right tool there. (It is fine inside a multi-item selection.)
+- A selection is capped at 500 items per request so one click cannot queue an unbounded walk.
 
 ---
 
@@ -155,6 +170,8 @@ download.
 | `su` says it needs the root password (Vercel) | `su` wants the *root account's* password. Use `sudo su` instead: Sushi asks for **your** sudo password (on NOPASSWD hosts it switches instantly). |
 | `Download ZIP` / the row **ZIP** button does nothing | If your browser shows a save dialog first, it was dismissed (Esc) — click again and confirm. Right-click the folder row → *Download folder (.zip)* is the same action. |
 | `Download ZIP` fails with "is not a folder" | The path is a file or a symlink to a file — use the single-file download button (or open its folder and archive that). |
+| The selection download produces `<folder>-selection.zip` | Expected: several selected items are packed into one archive named after the folder you are in. Each item keeps its own name inside. |
+| `Download` does nothing with several items selected | Same rules as the folder ZIP: a dismissed save dialog downloads nothing, and a selection that is too large / nested too deeply / has too many files is refused before streaming. |
 | A command sits on `Do you want to continue? [Y/n]` / `Password:` (Vercel) | Type the answer in the terminal and press Enter (or click **Yes (y)** / **No (n)**): Sushi re-runs the command with your answer piped in. To avoid the question entirely use `apt install -y docker`, `ssh-keygen -f ~/.ssh/id_ed25519 -N ''`, `DEBIAN_FRONTEND=noninteractive`. |
 | `Download ZIP` fails with "contains more than 20 000 files" / "larger than 2.0 GB" / "nested deeper than 24 levels" | Sushi stopped a runaway archive before streaming it. Download a sub-folder, or `tar -czf` / `rsync` the tree over SSH. |
 

@@ -24,6 +24,14 @@ import {
   getAuthHeaders,
 } from "@/lib/client/gateway";
 import { getStoredSessionToken } from "@/lib/client/auth-storage";
+import {
+  CONFIRM_PROMPT_RE,
+  PASSWORD_PROMPT_RE,
+  SUDO_NEEDS_PASSWORD_RE,
+  SUDO_WRONG_PASSWORD_RE,
+  detectInteractiveProgram,
+  parseElevationCommand,
+} from "@/lib/client/terminal-commands";
 
 interface SshTerminalSessionProps {
   profile: HostProfile;
@@ -85,63 +93,13 @@ function decodeBase64Bytes(b64: string): Uint8Array {
   return out;
 }
 
-/* ------------------------------------------------------------------ */
-/* Serverless-mode guards                                              */
-/* ------------------------------------------------------------------ */
+/** Result of an elevation (sudo) probe. */
+type ElevationProbe = { ok: boolean; needsPassword: boolean; message: string };
 
-/** Full-screen TUIs that can never work without a live, keystroke-forwarding PTY. */
-const FULLSCREEN_PROGRAMS = new Set([
-  "vim", "vi", "nvim", "view", "vimdiff", "nano", "pico", "emacs", "joe", "micro",
-  "mcedit", "ne", "less", "more", "most", "top", "htop", "btop", "atop", "iotop",
-  "iftop", "nload", "nethogs", "glances", "ctop", "nvtop", "tmux", "screen", "byobu",
-  "mc", "ranger", "nnn", "vifm", "ncdu", "tig", "lazygit", "lazydocker", "k9s",
-  "nmtui", "alsamixer", "cfdisk", "mutt", "neomutt", "irssi", "weechat", "w3m",
-  "lynx", "watch", "visudo", "vipw", "vigr", "sudoedit",
-]);
-
-/** Shells / REPLs that only become interactive when started without arguments. */
-const BARE_INTERACTIVE_PROGRAMS = new Set([
-  "bash", "sh", "zsh", "fish", "dash", "ksh", "python", "python3", "ipython", "node",
-  "irb", "php", "mysql", "mariadb", "psql", "redis-cli", "mongo", "mongosh",
-  "sqlite3", "ssh", "telnet", "ftp", "sftp", "su",
-]);
-
-const COMMAND_WRAPPERS = new Set(["sudo", "doas", "exec", "nohup", "time", "command", "env"]);
-const SUDO_FLAGS_WITH_VALUE = new Set(["-u", "-g", "-C", "-h", "-p", "-U", "-r", "-t"]);
-
-/**
- * Returns the program name when `command` would start an interactive full-screen
- * program (vim, top, less, tmux, a bare REPL ...) that serverless SSH cannot drive.
- */
-function detectFullscreenProgram(command: string): string | null {
-  for (const segment of command.split(/&&|\|\||;|\|/)) {
-    const words = segment.trim().split(/\s+/).filter(Boolean);
-    while (
-      words.length > 0 &&
-      (/^[A-Za-z_][A-Za-z0-9_]*=/.test(words[0]) || COMMAND_WRAPPERS.has(words[0]))
-    ) {
-      const wrapper = words.shift();
-      if (wrapper === "sudo" || wrapper === "doas") {
-        while (words.length > 0 && words[0].startsWith("-")) {
-          const flag = words.shift() as string;
-          if (SUDO_FLAGS_WITH_VALUE.has(flag)) words.shift();
-        }
-      }
-    }
-    if (words.length === 0) continue;
-    const program = (words[0].replace(/^\\/, "").split("/").pop() || "").toLowerCase();
-    const args = words.slice(1);
-    if (program === "top" && args.some((a) => /^-\w*b/.test(a))) continue; // batch mode
-    if (FULLSCREEN_PROGRAMS.has(program)) return program;
-    if (program === "crontab" && args.includes("-e")) return "crontab -e";
-    if (program === "systemctl" && args[0] === "edit") return "systemctl edit";
-    if (BARE_INTERACTIVE_PROGRAMS.has(program) && args.length === 0) return program;
-  }
-  return null;
-}
-
-const PASSWORD_PROMPT_RE = /(?:password|passphrase|passcode)[^\r\n]{0,60}:\s*$/i;
-const CONFIRM_PROMPT_RE = /\[(?:Y\/n|y\/N|yes\/no|Y\/N)\]\s*\??\s*$/;
+/** While a sudo password is being typed, keystrokes are captured here instead. */
+type SecretPrompt =
+  | { action: "enter-root" }
+  | { action: "run"; command: string; elevateUser: string };
 
 export function SshTerminalSession({
   profile,
@@ -187,6 +145,18 @@ export function SshTerminalSession({
   const historyRef = useRef<string[]>([]);
   const historyIdxRef = useRef<number>(-1);
   const execBusyRef = useRef<boolean>(false);
+  // Root mode: after `sudo su` / `sudo -i` every command runs through sudo.
+  const elevatedUserRef = useRef<string | null>(null);
+  const [elevatedUser, setElevatedUserState] = useState<string | null>(null);
+  const setElevatedUser = useCallback((user: string | null) => {
+    elevatedUserRef.current = user;
+    setElevatedUserState(user);
+  }, []);
+  // Kept in memory only (never persisted) and cleared on exit / reconnect.
+  const sudoPasswordRef = useRef<string | null>(null);
+  const sudoNoPasswordRef = useRef<boolean>(false);
+  const secretPromptRef = useRef<SecretPrompt | null>(null);
+  const secretBufferRef = useRef<string>("");
 
   useEffect(() => {
     cwdRef.current = currentCwd;
@@ -195,49 +165,36 @@ export function SshTerminalSession({
   const writePrompt = useCallback(
     (term: import("@xterm/xterm").Terminal, cwdVal?: string) => {
       const displayPath = cwdVal ?? cwdRef.current ?? "~";
+      const asRoot = elevatedUserRef.current !== null;
+      const user = elevatedUserRef.current ?? profile.username;
+      const color = asRoot ? "\x1b[1;31m" : "\x1b[1;32m";
       term.write(
-        `\r\n\x1b[1;32m${profile.username}@${profile.host}\x1b[0m:\x1b[1;34m${displayPath}\x1b[0m$ `
+        `\r\n${color}${user}@${profile.host}\x1b[0m:\x1b[1;34m${displayPath}\x1b[0m${asRoot ? "# " : "$ "}`
       );
     },
     [profile.username, profile.host]
   );
 
-  const runServerlessCommand = useCallback(
-    async (rawCmd: string) => {
+  /**
+   * Runs one command through the serverless exec API and streams its output.
+   * `elevateUser` wraps the command in sudo (root mode / `sudo <cmd>`).
+   */
+  const execServerless = useCallback(
+    async (
+      command: string,
+      options: {
+        elevateUser?: string | null;
+        password?: string;
+        stream?: (text: string) => void;
+      } = {}
+    ): Promise<{ exitCode: number; output: string; httpError?: string }> => {
       const term = termRef.current;
-      if (!term) return;
-
-      const trimmed = rawCmd.trim();
-      if (trimmed === "clear") {
-        term.clear();
-        writePrompt(term);
-        return;
-      }
-      if (trimmed === "exit" || trimmed === "logout") {
-        term.writeln("\r\n\x1b[33mSession closed.\x1b[0m");
-        setStatus("disconnected");
-        return;
-      }
-
-      const fullscreen = detectFullscreenProgram(trimmed);
-      if (fullscreen) {
-        term.writeln(
-          `\x1b[33m"${fullscreen}" is an interactive full-screen program. Serverless SSH runs each command on its own and can't forward keystrokes, so it would hang.\x1b[0m`
-        );
-        term.writeln(
-          "\x1b[90mFor vim/nano/top/htop/less/tmux use a live PTY: a self-hosted Sushi (VPS / Docker) or Attach VPS Gateway. Alternatives here: cat / tail -n 100 / sed -i, top -bn1.\x1b[0m"
-        );
-        writePrompt(term);
-        return;
-      }
-
-      execBusyRef.current = true;
       const controller = new AbortController();
       abortExecRef.current = controller;
       const utf8Decoder = new TextDecoder("utf-8");
+      let output = "";
+      let exitCode = 0;
       let gotReady = false;
-      let promptHintShown = false;
-      let outputTail = "";
 
       try {
         const res = await fetch("/api/ssh/exec", {
@@ -254,21 +211,28 @@ export function SshTerminalSession({
               privateKey: profile.privateKey,
               passphrase: profile.passphrase,
             },
-            command: rawCmd,
+            command,
             cwd: cwdRef.current,
-            cols: term.cols || 100,
-            rows: term.rows || 30,
+            cols: term?.cols || 100,
+            rows: term?.rows || 30,
+            ...(options.elevateUser
+              ? {
+                  elevate: {
+                    user: options.elevateUser,
+                    password: options.password,
+                  },
+                }
+              : {}),
           }),
         });
 
         if (!res.ok || !res.body) {
           const errJson = await res.json().catch(() => ({}));
-          term.writeln(
-            `\r\n\x1b[31mError: ${errJson.error || `HTTP ${res.status}`}\x1b[0m`
-          );
-          setStatus("error");
-          writePrompt(term);
-          return;
+          return {
+            exitCode: 1,
+            output: "",
+            httpError: String(errJson.error || `HTTP ${res.status}`),
+          };
         }
 
         const reader = res.body.getReader();
@@ -284,60 +248,277 @@ export function SshTerminalSession({
 
           for (const line of lines) {
             if (!line.trim()) continue;
+            let evt: Record<string, unknown>;
             try {
-              const evt = JSON.parse(line);
-              if (evt.type === "ready") {
-                gotReady = true;
-                setStatus("connected");
-                if (evt.fingerprint) setFingerprint(evt.fingerprint);
-              } else if (evt.type === "data" && typeof evt.data === "string") {
-                const decoded = utf8Decoder.decode(decodeBase64Bytes(evt.data), {
-                  stream: true,
-                });
-                term.write(decoded);
-                outputTail = (outputTail + decoded).slice(-200);
-                if (!promptHintShown && PASSWORD_PROMPT_RE.test(outputTail)) {
-                  promptHintShown = true;
-                  term.write(
-                    "\r\n\x1b[33m↳ This command is waiting for a password, but serverless SSH can't send keystrokes. Press Ctrl+C to cancel; use a live PTY (self-hosted Sushi or Attach VPS Gateway) or passwordless sudo for this.\x1b[0m\r\n"
-                  );
-                } else if (!promptHintShown && CONFIRM_PROMPT_RE.test(outputTail)) {
-                  promptHintShown = true;
-                  term.write(
-                    "\r\n\x1b[33m↳ This command is waiting for an answer, but serverless SSH can't send keystrokes. Press Ctrl+C and re-run it non-interactively (e.g. apt -y …) or use a live PTY.\x1b[0m\r\n"
-                  );
-                }
-              } else if (evt.type === "meta") {
-                if (typeof evt.cwd === "string" && evt.cwd) {
-                  cwdRef.current = evt.cwd;
-                  setCurrentCwd(evt.cwd);
-                }
-              } else if (evt.type === "error") {
-                if (!gotReady) setStatus("error");
-                term.writeln(`\r\n\x1b[31m${evt.message}\x1b[0m`);
-              }
+              evt = JSON.parse(line) as Record<string, unknown>;
             } catch {
-              // ignore malformed chunk
+              continue;
+            }
+            if (evt.type === "ready") {
+              gotReady = true;
+              setStatus("connected");
+              if (typeof evt.fingerprint === "string") setFingerprint(evt.fingerprint);
+            } else if (evt.type === "data" && typeof evt.data === "string") {
+              const text = utf8Decoder.decode(decodeBase64Bytes(evt.data), {
+                stream: true,
+              });
+              output += text;
+              options.stream?.(text);
+            } else if (evt.type === "meta") {
+              exitCode = Number(evt.exitCode ?? 0);
+              if (typeof evt.cwd === "string" && evt.cwd) {
+                cwdRef.current = evt.cwd;
+                setCurrentCwd(evt.cwd);
+              }
+            } else if (evt.type === "error") {
+              if (!gotReady) setStatus("error");
+              const message = String(evt.message || "SSH error");
+              output += `\n${message}`;
+              options.stream?.(`\r\n\x1b[31m${message}\x1b[0m`);
             }
           }
         }
       } catch (err) {
         if ((err as Error)?.name === "AbortError") {
-          term.write("^C");
+          exitCode = 130;
+          options.stream?.("^C");
         } else {
+          const message =
+            err instanceof Error ? err.message : "SSH stream interrupted.";
+          output += `\n${message}`;
+          exitCode = 1;
+          options.stream?.(`\r\n\x1b[31m${message}\x1b[0m`);
+        }
+      } finally {
+        abortExecRef.current = null;
+      }
+
+      return { exitCode, output };
+    },
+    [gatewaySettings, profile]
+  );
+
+  /** Checks (quietly) whether sudo works right now, and whether it needs a password. */
+  const probeElevation = useCallback(
+    async (user: string, password?: string): Promise<ElevationProbe> => {
+      const probe = await execServerless("true", { elevateUser: user, password });
+      if (probe.exitCode === 0) {
+        return { ok: true, needsPassword: false, message: "" };
+      }
+      const text = probe.output || probe.httpError || "";
+      if (SUDO_WRONG_PASSWORD_RE.test(text)) {
+        return { ok: false, needsPassword: true, message: "Incorrect sudo password." };
+      }
+      if (SUDO_NEEDS_PASSWORD_RE.test(text)) {
+        return { ok: false, needsPassword: true, message: "" };
+      }
+      const firstLine =
+        text.split(/\r?\n/).map((l) => l.trim()).find(Boolean) || probe.httpError || "";
+      if (/command not found|not found/i.test(firstLine)) {
+        return {
+          ok: false,
+          needsPassword: false,
+          message: "sudo is not installed on this server — log in as root instead.",
+        };
+      }
+      return {
+        ok: false,
+        needsPassword: false,
+        message: firstLine || "sudo did not grant root access on this server.",
+      };
+    },
+    [execServerless]
+  );
+
+  const askSudoPassword = useCallback(
+    (term: import("@xterm/xterm").Terminal, prompt: SecretPrompt) => {
+      secretPromptRef.current = prompt;
+      secretBufferRef.current = "";
+      term.write(
+        `\r\n\x1b[33m[sudo] password for ${profile.username}: \x1b[0m`
+      );
+    },
+    [profile.username]
+  );
+
+  /** Switches the session into root mode (what `sudo su` would do in a live PTY). */
+  const enterRootMode = useCallback(
+    async (
+      term: import("@xterm/xterm").Terminal,
+      password?: string
+    ): Promise<"done" | "prompting"> => {
+      if (profile.username.trim() === "root") {
+        setElevatedUser("root");
+        term.writeln("\r\n\x1b[90mAlready connected as root.\x1b[0m");
+        return "done";
+      }
+
+      const known = password ?? sudoPasswordRef.current ?? undefined;
+      if (!known && sudoNoPasswordRef.current) {
+        setElevatedUser("root");
+        return "done";
+      }
+
+      term.writeln("\r\n\x1b[90mChecking sudo…\x1b[0m");
+      const probe = await probeElevation("root", known);
+      if (probe.ok) {
+        if (known) sudoPasswordRef.current = known;
+        else sudoNoPasswordRef.current = true;
+        setElevatedUser("root");
+        term.writeln(
+          "\x1b[90m→ root shell — commands run with sudo, type \x1b[0mexit\x1b[90m to leave.\x1b[0m"
+        );
+        return "done";
+      }
+      if (probe.needsPassword) {
+        if (known) {
+          sudoPasswordRef.current = null;
+          term.writeln("\r\n\x1b[31mIncorrect sudo password.\x1b[0m");
+        }
+        askSudoPassword(term, { action: "enter-root" });
+        return "prompting";
+      }
+      term.writeln(
+        `\r\n\x1b[31mCould not switch to root: ${probe.message}\x1b[0m`
+      );
+      return "done";
+    },
+    [askSudoPassword, probeElevation, profile.username, setElevatedUser]
+  );
+
+  const runServerlessCommand = useCallback(
+    async (rawCmd: string, options: { password?: string } = {}) => {
+      const term = termRef.current;
+      if (!term) return;
+
+      const trimmed = rawCmd.trim();
+      if (trimmed === "clear") {
+        term.clear();
+        writePrompt(term);
+        return;
+      }
+      if (!trimmed) {
+        writePrompt(term);
+        return;
+      }
+
+      // Interactive shell builtins: sudo su / sudo -i / exit / su
+      const intent = parseElevationCommand(trimmed);
+      if (intent?.kind === "leave-root") {
+        if (elevatedUserRef.current) {
+          setElevatedUser(null);
+          sudoPasswordRef.current = null;
           term.writeln(
-            `\r\n\x1b[31m${
-              err instanceof Error ? err.message : "SSH stream interrupted."
-            }\x1b[0m`
+            `\r\n\x1b[90m→ left the root shell (back to ${profile.username})\x1b[0m`
           );
+          writePrompt(term);
+        } else {
+          term.writeln("\r\n\x1b[33mSession closed.\x1b[0m");
+          setStatus("disconnected");
+        }
+        return;
+      }
+      if (intent?.kind === "enter-root") {
+        execBusyRef.current = true;
+        let result: "done" | "prompting" = "done";
+        try {
+          result = await enterRootMode(term, options.password);
+        } finally {
+          execBusyRef.current = false;
+        }
+        if (result === "done") writePrompt(term);
+        return;
+      }
+      if (intent?.kind === "su-needs-root-password") {
+        term.writeln(
+          "\r\n\x1b[33m`su` needs the root account's own password, which this Vercel terminal can't prompt for.\r\nUse `sudo su` instead — Sushi asks for YOUR sudo password.\x1b[0m"
+        );
+        writePrompt(term);
+        return;
+      }
+
+      const loggedInAsRoot = profile.username.trim() === "root";
+      let commandToRun = rawCmd;
+      let elevateUser: string | null = null;
+      if (elevatedUserRef.current && !loggedInAsRoot) {
+        elevateUser = elevatedUserRef.current;
+      }
+      if (intent?.kind === "sudo") {
+        commandToRun = intent.command;
+        elevateUser = loggedInAsRoot ? null : intent.asUser;
+      }
+
+      const interactive = detectInteractiveProgram(commandToRun);
+      if (interactive) {
+        term.writeln(
+          `\x1b[33m"${interactive}" needs a live terminal, and this Vercel session can only run one command at a time — it would sit there waiting for keystrokes.`
+        );
+        term.writeln(
+          "Use these here: cat / tail -n 100 / sed -i / top -bn1, or open a self-hosted Sushi (VPS / Docker) or a VPS gateway for vim, nano, less, tmux…\x1b[0m"
+        );
+        writePrompt(term);
+        return;
+      }
+
+      // Elevation needs credentials first: remember NOPASSWD, otherwise ask once.
+      const password = options.password ?? sudoPasswordRef.current ?? undefined;
+      execBusyRef.current = true;
+      try {
+        if (elevateUser && !password && !sudoNoPasswordRef.current) {
+          const probe = await probeElevation(elevateUser, undefined);
+          if (probe.ok) {
+            sudoNoPasswordRef.current = true;
+          } else if (probe.needsPassword) {
+            askSudoPassword(term, { action: "run", command: rawCmd, elevateUser });
+            return;
+          } else {
+            term.writeln(`\r\n\x1b[31m${probe.message}\x1b[0m`);
+            writePrompt(term);
+            return;
+          }
+        }
+
+        let promptHintShown = false;
+        let outputTail = "";
+        const result = await execServerless(commandToRun, {
+          elevateUser,
+          password,
+          stream: (text) => {
+            term.write(text);
+            outputTail = (outputTail + text).slice(-200);
+            if (promptHintShown) return;
+            if (PASSWORD_PROMPT_RE.test(outputTail)) {
+              promptHintShown = true;
+              term.write(
+                "\r\n\x1b[33m↳ This command is asking for input, which this Vercel session can't type into. Press Ctrl+C to cancel, run it non-interactively, or use `sudo su` (Sushi will ask for your password up front).\x1b[0m\r\n"
+              );
+            } else if (CONFIRM_PROMPT_RE.test(outputTail)) {
+              promptHintShown = true;
+              term.write(
+                "\r\n\x1b[33m↳ This command is waiting for an answer. Press Ctrl+C and re-run it non-interactively (e.g. add -y), or use a live terminal.\x1b[0m\r\n"
+              );
+            }
+          },
+        });
+
+        // sudo accepted / rejected the password we used
+        if (elevateUser && options.password) {
+          if (SUDO_WRONG_PASSWORD_RE.test(result.output)) {
+            sudoPasswordRef.current = null;
+            sudoNoPasswordRef.current = false;
+            term.writeln("\r\n\x1b[31mIncorrect sudo password.\x1b[0m");
+            askSudoPassword(term, { action: "run", command: rawCmd, elevateUser });
+            return;
+          }
+          if (result.exitCode === 0) sudoPasswordRef.current = options.password;
         }
       } finally {
         execBusyRef.current = false;
-        abortExecRef.current = null;
-        writePrompt(term);
+        // When a password prompt was started, the prompt itself is the cursor
+        if (!secretPromptRef.current) writePrompt(term);
       }
     },
-    [gatewaySettings, profile, writePrompt]
+    [askSudoPassword, enterRootMode, execServerless, profile.username, probeElevation, writePrompt]
   );
 
   // Initialize xterm and transport session
@@ -402,6 +583,12 @@ export function SshTerminalSession({
       fitAddonRef.current = fitAddon;
       searchAddonRef.current = searchAddon;
 
+      setElevatedUser(null);
+      sudoPasswordRef.current = null;
+      sudoNoPasswordRef.current = false;
+      secretPromptRef.current = null;
+      secretBufferRef.current = "";
+
       const shouldUseWs = Boolean(wsAvailable || gatewaySettings.gatewayUrl.trim());
       modeRef.current = shouldUseWs ? "ws" : "serverless";
       setTransportMode(modeRef.current);
@@ -413,6 +600,44 @@ export function SshTerminalSession({
           const ws = wsRef.current;
           if (ws && ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify({ type: "input", data }));
+          }
+          return;
+        }
+
+        // A sudo password is being typed: capture it, never echo it
+        if (secretPromptRef.current) {
+          for (const ch of data) {
+            if (ch === "\r" || ch === "\n") {
+              const prompt = secretPromptRef.current;
+              const password = secretBufferRef.current;
+              secretPromptRef.current = null;
+              secretBufferRef.current = "";
+              term.write("\r\n");
+              if (!prompt) break;
+              if (!password) {
+                term.writeln("\x1b[33m(cancelled)\x1b[0m");
+                writePrompt(term);
+                break;
+              }
+              if (prompt.action === "enter-root") {
+                void runServerlessCommand("sudo su", { password });
+              } else {
+                void runServerlessCommand(prompt.command, { password });
+              }
+            } else if (ch === "\x7f" || ch === "\b") {
+              if (secretBufferRef.current.length > 0) {
+                secretBufferRef.current = secretBufferRef.current.slice(0, -1);
+                term.write("\b \b");
+              }
+            } else if (ch === "\x03") {
+              secretPromptRef.current = null;
+              secretBufferRef.current = "";
+              term.write("^C");
+              writePrompt(term);
+            } else if (ch >= " ") {
+              secretBufferRef.current += ch;
+              term.write("*");
+            }
           }
           return;
         }
@@ -781,6 +1006,16 @@ export function SshTerminalSession({
           <span className="font-mono-code text-xs text-slate-400">
             {profile.username}@{profile.host}:{profile.port}
           </span>
+
+          {elevatedUser && transportMode === "serverless" && (
+            <span
+              title="Commands run with sudo until you type exit"
+              className="inline-flex items-center gap-1 rounded-md border border-rose-500/30 bg-rose-500/10 px-2 py-0.5 text-[11px] font-semibold text-rose-200"
+            >
+              <ShieldCheck className="h-3 w-3" />
+              ROOT (sudo)
+            </span>
+          )}
 
           {fingerprint && (
             <span

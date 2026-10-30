@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import crypto from "node:crypto";
 import http from "node:http";
 import net from "node:net";
@@ -23,6 +24,14 @@ import {
 } from "../src/lib/server/guacd-bridge";
 import { createGatewayWebSockets } from "../src/lib/server/ws-gateway";
 import { META_REGEX, splitEmittable } from "../src/lib/server/exec-stream";
+import {
+  buildExecScript,
+  createSudoAnswerer,
+} from "../src/lib/server/exec-script";
+import {
+  detectInteractiveProgram,
+  parseElevationCommand,
+} from "../src/lib/client/terminal-commands";
 import {
   bootstrapAdminAccount,
   createChallengeToken,
@@ -397,6 +406,100 @@ async function runTests() {
     await sshErr({ port: closedPort, authMethod: "password", password: "x" }),
     new RegExp(`Connection refused by 127\\.0\\.0\\.1:${closedPort}`)
   );
+
+  // Serverless shell builtins: `sudo su`, `sudo -i`, `sudo <cmd>`, exit, bare su
+  {
+    const kind = (c: string) => {
+      const r = parseElevationCommand(c);
+      return r ? r.kind : null;
+    };
+    for (const cmd of ["sudo su", "sudo su -", "sudo su root", "sudo -i", "sudo -s", "sudo -Es", "sudo bash", "sudo -i bash", "sudo --login"]) {
+      assert.equal(kind(cmd), "enter-root", cmd);
+    }
+    assert.equal(kind("exit"), "leave-root");
+    assert.equal(kind("logout"), "leave-root");
+    assert.equal(kind("su"), "su-needs-root-password");
+    assert.equal(kind("su -"), "su-needs-root-password");
+    assert.equal(kind("su root"), "su-needs-root-password");
+    assert.equal(kind("su deploy"), null);
+    assert.equal(kind("sudo su - deploy"), null);
+    const sudo = parseElevationCommand("sudo apt update -y");
+    assert.deepEqual(sudo, { kind: "sudo", command: "apt update -y", asUser: "root" });
+    const sudoOther = parseElevationCommand("sudo -u postgres psql -c 'select 1'");
+    assert.equal(sudoOther?.kind, "sudo");
+    assert.equal(sudoOther?.kind === "sudo" ? sudoOther.asUser : "", "postgres");
+    for (const cmd of ["ls -la", "echo sudo su", "sudo -l", "sudo -k", "sudo", "!!"]) {
+      assert.equal(kind(cmd), null, cmd);
+    }
+
+    // Interactive-only programs are detected, but `sudo su` is not one of them
+    assert.equal(detectInteractiveProgram("vim /etc/hosts"), "vim");
+    assert.equal(detectInteractiveProgram("sudo nano x"), "nano");
+    assert.equal(detectInteractiveProgram("top"), "top");
+    assert.equal(detectInteractiveProgram("top -bn1"), null);
+    // `sudo su` is handled by the elevation parser before this check; `su` stays in
+    // the detector so `sudo su - <other-user>` is reported instead of hanging on a
+    // root password prompt.
+    assert.equal(detectInteractiveProgram("sudo su"), "su");
+    assert.equal(detectInteractiveProgram("systemctl status nginx"), null);
+    assert.equal(detectInteractiveProgram("crontab -e"), "crontab -e");
+    assert.equal(detectInteractiveProgram("python3"), "python3");
+    assert.equal(detectInteractiveProgram("python3 -V"), null);
+  }
+
+  // Serverless exec script: plain, sudo without a password, and sudo with one
+  {
+    const plain = buildExecScript({ command: "whoami", cwd: "/srv/app" });
+    assert.equal(plain.feedPassword, null);
+    assert.equal(plain.ptyModes, null);
+    assert.match(plain.script, /cd -- '\/srv\/app'/);
+    assert.match(plain.script, /whoami\n__sushi_ec=\$\?/);
+    assert.match(plain.script, /SUSHI_META/);
+
+    const nopass = buildExecScript({ command: "whoami", elevate: { user: "root" } });
+    assert.equal(nopass.feedPassword, null);
+    assert.equal(nopass.ptyModes, null);
+    assert.match(nopass.script, /^sudo -n -- \/bin\/sh -c '/);
+    assert.equal(nopass.script.includes("SushiPass"), false);
+
+    const withPass = buildExecScript({
+      command: "whoami",
+      elevate: { user: "root", password: "hunter2" },
+    });
+    assert.equal(withPass.feedPassword, "hunter2");
+    assert.deepEqual(withPass.ptyModes, { ECHO: 0 }); // password never echoed
+    assert.match(withPass.script, /^sudo -S -- \/bin\/sh -c '/);
+    assert.equal(withPass.script.includes("hunter2"), false, "password is not part of the script");
+
+    const otherUser = buildExecScript({ command: "id", elevate: { user: "www-data" } });
+    assert.match(otherUser.script, /^sudo -n -u 'www-data' -- \/bin\/sh -c '/);
+
+    // Quoting: the sudo shell receives exactly the wrapper body we built (round-trip
+    // through a real POSIX shell instead of eyeballing the escapes).
+    const tricky = "echo \"it's $HOME `pwd`\" && printf '%s\\n' 'x y'";
+    const bodyScript = buildExecScript({ command: tricky, cwd: "/srv/app" }).script;
+    const elevatedScript = buildExecScript({
+      command: tricky,
+      cwd: "/srv/app",
+      elevate: { user: "root" },
+    }).script;
+    const quotedArg = elevatedScript.slice(elevatedScript.indexOf("/bin/sh -c ") + "/bin/sh -c ".length);
+    const roundTripped = execFileSync("sh", ["-c", `printf %s ${quotedArg}`], { encoding: "utf8" });
+    assert.equal(roundTripped, bodyScript);
+  }
+
+  // sudo password prompt: answered exactly once, then give up (never hang)
+  {
+    const answerer = createSudoAnswerer();
+    const first = answerer.answer("[sudo] password for tester: ");
+    assert.deepEqual(first, { text: "", sendPassword: true, gaveUp: false });
+    assert.equal(answerer.passwordSent, true);
+    assert.deepEqual(answerer.answer("more output"), { text: "more output", sendPassword: false, gaveUp: false });
+    const retry = answerer.answer("Sorry, try again.\r\n[sudo] password for tester: ");
+    assert.equal(retry.sendPassword, false);
+    assert.equal(retry.gaveUp, true);
+    assert.equal(retry.text, "Sorry, try again.\r\n");
+  }
 
   // Serverless exec stream: prompts are emitted immediately (not held in a buffer),
   // while a META marker split across SSH packets is still reassembled and stripped.

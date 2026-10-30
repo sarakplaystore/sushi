@@ -36,6 +36,17 @@ import {
 import { createGatewayWebSockets } from "../src/lib/server/ws-gateway";
 import { META_REGEX, splitEmittable } from "../src/lib/server/exec-stream";
 import {
+  decodeExecChunk,
+  parseExecInputLine,
+  pumpExecInput,
+} from "../src/lib/server/exec-input";
+import {
+  __setStreamingRequestBodySupport,
+  canStreamExecStdin,
+  createExecRequestBody,
+  supportsStreamingRequestBody,
+} from "../src/lib/client/exec-stdin";
+import {
   buildExecScript,
   createSudoAnswerer,
 } from "../src/lib/server/exec-script";
@@ -1487,12 +1498,113 @@ async function runTests() {
     });
   });
 
-  console.log("==> [8/8] Cleaning up test servers...");
+  console.log(
+    "==> [8/9] Testing serverless exec stdin (live keystrokes + piped answers)..."
+  );
+
+  // --- request-line parsing ---------------------------------------------------
+  assert.deepEqual(parseExecInputLine('{"type":"input","data":"y\\r"}'), {
+    type: "input",
+    data: "y\r",
+  });
+  assert.deepEqual(parseExecInputLine('{"type":"signal","signal":"int"}'), {
+    type: "signal",
+    signal: "INT",
+  });
+  assert.deepEqual(parseExecInputLine('{"type":"signal","signal":"SIGTERM"}'), {
+    type: "signal",
+    signal: "TERM",
+  });
+  assert.equal(parseExecInputLine('{"type":"signal","signal":"NOPE"}'), null);
+  assert.equal(parseExecInputLine("not json"), null);
+  assert.equal(parseExecInputLine("   "), null);
+  const startEvent = parseExecInputLine(
+    '{"type":"start","payload":{"command":"echo hi","credentials":{"host":"h"}}}'
+  );
+  assert.equal(startEvent?.type, "start");
+  assert.equal(
+    (startEvent as { payload: { command: string } }).payload.command,
+    "echo hi"
+  );
+
+  // --- chunk splitting keeps a keystroke that spans two packets --------------
+  const firstHalf = decodeExecChunk("", '{"type":"input","data":"he');
+  assert.equal(firstHalf.events.length, 0);
+  assert.equal(firstHalf.carry, '{"type":"input","data":"he');
+  const secondHalf = decodeExecChunk(firstHalf.carry, 'llo"}\n{"type":"input","data":"!"}\n');
+  assert.deepEqual(secondHalf.events, [
+    { type: "input", data: "hello" },
+    { type: "input", data: "!" },
+  ]);
+  assert.equal(secondHalf.carry, "");
+
+  // --- the browser-side channel writes the start line first ------------------
+  const { body, channel } = createExecRequestBody({ command: "apt install docker" });
+  assert.equal(channel.canSendInput, true);
+  assert.equal(channel.sendInput("y\r"), true);
+  assert.equal(channel.sendSignal("INT"), true);
+  channel.close();
+  assert.equal(channel.sendInput("after-close"), false);
+  const sent = await new Response(body).text();
+  const sentLines = sent.trim().split("\n").map((line) => JSON.parse(line) as {
+    type: string;
+    payload?: { command?: string };
+    data?: string;
+    signal?: string;
+  });
+  assert.equal(sentLines[0].type, "start");
+  assert.equal(sentLines[0].payload?.command, "apt install docker");
+  assert.deepEqual(sentLines[1], { type: "input", data: "y\r" });
+  assert.deepEqual(sentLines[2], { type: "signal", signal: "INT" });
+
+  // --- pumping input onto a "channel" stops when the command exits -----------
+  const written: string[] = [];
+  const signals: string[] = [];
+  let open = true;
+  const inputBody = new ReadableStream<Uint8Array>({
+    start(controller) {
+      const enc = new TextEncoder();
+      controller.enqueue(enc.encode('{"type":"input","data":"y"}\n{"type":"inp'));
+      controller.enqueue(
+        enc.encode('ut","data":"\r"}\n{"type":"signal","signal":"INT"}\n')
+      );
+      controller.enqueue(enc.encode('{"type":"input","data":"ignored"}\n'));
+      controller.close();
+    },
+  });
+  await pumpExecInput(inputBody.getReader(), "", {
+    onInput: (data) => {
+      written.push(data);
+      open = false; // the command finished halfway through
+    },
+    onSignal: (signal) => signals.push(signal),
+    isClosed: () => !open,
+  });
+  assert.deepEqual(written, ["y"]);
+  assert.deepEqual(signals, [], "no signals after the command closed");
+
+  // --- capability detection --------------------------------------------------
+  __setStreamingRequestBodySupport(null);
+  assert.equal(
+    typeof supportsStreamingRequestBody(),
+    "boolean",
+    "capability probe returns a boolean in this runtime"
+  );
+  assert.equal(
+    typeof canStreamExecStdin(),
+    "boolean",
+    "stdin capability combines browser support and HTTP/2"
+  );
+  __setStreamingRequestBodySupport(null);
+
+  console.log("==> [9/9] Cleaning up test servers...");
   httpServer.close();
   guacdMock.close();
   rdpMock.close();
   sshServer.close();
-  console.log("ALL AUTH, PASSKEY, KEY WHITELIST, TERMIX, SSH, SFTP, AND RDP E2E TESTS PASSED!");
+  console.log(
+    "ALL AUTH, PASSKEY, KEY WHITELIST, TERMIX, SSH, SFTP, RDP, AND EXEC STDIN E2E TESTS PASSED!"
+  );
 }
 
 runTests().catch((err) => {

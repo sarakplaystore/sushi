@@ -1585,11 +1585,29 @@ async function runTests() {
   assert.deepEqual(signals, [], "no signals after the command closed");
 
   // --- capability detection --------------------------------------------------
+  // Firefox/Safari report "ReadableStream uploading is not supported" at fetch time
+  // because they ignore `duplex`; the probe must reject them up front. Node's
+  // undici honours duplex, which is the Chromium-equivalent case.
   __setStreamingRequestBodySupport(null);
+  // Outside a browser the probe must refuse: there is no `window`, so request-body
+  // streaming (an xterm-browser feature) is never attempted from the server runtime.
   assert.equal(
-    typeof supportsStreamingRequestBody(),
-    "boolean",
-    "capability probe returns a boolean in this runtime"
+    supportsStreamingRequestBody(),
+    false,
+    "probe is browser-only and reports false without a window"
+  );
+  // The rule the probe applies in a browser: an engine that drops the unknown
+  // `duplex` member cannot upload a stream (Firefox → "ReadableStream uploading is
+  // not supported"), so only `duplex === "half"` counts as support.
+  const duplexRequest = new Request("http://localhost/", {
+    method: "POST",
+    body: new ReadableStream<Uint8Array>({ start: (c) => c.close() }),
+    duplex: "half",
+  } as RequestInit & { duplex: "half" });
+  assert.equal(
+    (duplexRequest as Request & { duplex?: string }).duplex,
+    "half",
+    "this engine keeps the duplex flag (Chromium/undici behaviour)"
   );
   assert.equal(
     typeof canStreamExecStdin(),

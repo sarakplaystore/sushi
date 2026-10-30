@@ -294,14 +294,16 @@ export function SshTerminalSession({
         if (channel) stdinRef.current = channel.channel;
         options.onInputReady?.(Boolean(channel));
 
-        // A buffered request body means the response never starts; give up early and
-        // let the caller retry the classic way instead of hanging the terminal.
+        // The route answers with stream headers as soon as it has read the first body
+        // line, so "no response within a few seconds" means the request body is being
+        // buffered somewhere and live typing can never work here. Fall back quickly
+        // instead of leaving the terminal waiting.
         const startWatchdog = channel
           ? setTimeout(() => {
               if (settled) return;
               settled = true;
               controller.abort();
-            }, 8000)
+            }, 4000)
           : null;
 
         try {
@@ -367,9 +369,14 @@ export function SshTerminalSession({
             }
           }
         } catch (err) {
-          if (channel && !gotReady && (settled || err instanceof TypeError)) {
-            // Either the watchdog fired, or the browser refused the streamed body
-            // outright (ERR_H2_OR_QUIC_REQUIRED over HTTP/1.1). Retry the classic way.
+          // Any failure before the stream produced output means the streamed body was
+          // not usable: the watchdog fired, or the browser refused it outright
+          // (Chrome over HTTP/1.1: ERR_H2_OR_QUIC_REQUIRED; Firefox/Safari: a platform
+          // error like "ReadableStream uploading is not supported" that is NOT a
+          // page-realm TypeError, so it must not be identified by `instanceof`).
+          // A user cancel is the one thing that must not be retried.
+          const aborted = settled || (err as Error)?.name === "AbortError";
+          if (channel && !gotReady && (settled || !aborted)) {
             return { exitCode: 1, output: "", retryWithoutStreaming: true };
           }
           if ((err as Error)?.name === "AbortError") {
@@ -401,9 +408,9 @@ export function SshTerminalSession({
         streamingBlockedRef.current = true;
         setStreamingStdinBlocked(true);
         termRef.current?.writeln(
-          "\x1b[90m↳ Keystrokes can't be streamed to a running command on this connection\r\n" +
-            "  (browsers need HTTP/2 for that). Commands still run, but answer prompts up\r\n" +
-            "  front instead: `apt install -y docker`, `ssh-keygen -N ''`, …\x1b[0m"
+          "\x1b[90m↳ Live typing isn't available on this connection (it needs HTTP/2 and a\r\n" +
+            "  Chromium browser). Everything still works: when a command asks a question,\r\n" +
+            "  type the answer and press Enter — Sushi re-runs it with your answer.\x1b[0m"
         );
         options.onInputReady?.(false);
         return attempt(false);

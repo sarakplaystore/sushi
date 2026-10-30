@@ -13,6 +13,8 @@ import {
   Plus,
   X,
   Palette,
+  Loader2,
+  Ban,
 } from "lucide-react";
 import type {
   CommandSnippet,
@@ -23,6 +25,12 @@ import {
   buildWebSocketUrl,
   getAuthHeaders,
 } from "@/lib/client/gateway";
+import {
+  type ExecStdinChannel,
+  canStreamExecStdin,
+  createExecRequestBody,
+  supportsStreamingRequestBody,
+} from "@/lib/client/exec-stdin";
 import { getStoredSessionToken } from "@/lib/client/auth-storage";
 import {
   CONFIRM_PROMPT_RE,
@@ -119,6 +127,13 @@ export function SshTerminalSession({
   );
   const wsRef = useRef<WebSocket | null>(null);
   const abortExecRef = useRef<AbortController | null>(null);
+  /** Live stdin channel of the running serverless command (null when idle). */
+  const stdinRef = useRef<ExecStdinChannel | null>(null);
+  /** Set when streamed request bodies are not usable here (buffering proxy). */
+  const streamingBlockedRef = useRef(false);
+  /** Set once a streamed exec actually produced output (stdin confirmed working). */
+  const streamingConfirmedRef = useRef(false);
+  const [streamingStdinBlocked, setStreamingStdinBlocked] = useState(false);
 
   const [transportMode, setTransportMode] = useState<"ws" | "serverless">(
     wsAvailable ? "ws" : "serverless"
@@ -137,6 +152,16 @@ export function SshTerminalSession({
   const [showSnippets, setShowSnippets] = useState(false);
   const [showThemes, setShowThemes] = useState(false);
   const [connectSeq, setConnectSeq] = useState(0);
+  /** A serverless command is currently running (drives the input bar). */
+  const [running, setRunning] = useState(false);
+  /** The running command printed something that looks like a question. */
+  const [livePrompt, setLivePrompt] = useState<
+    { kind: "confirm" | "password" | "generic"; canType: boolean } | null
+  >(null);
+  /** True when keystrokes reach the running command's stdin. */
+  const [canTypeWhileRunning, setCanTypeWhileRunning] = useState(false);
+  /** The command behind the current prompt, so it can be re-run with an answer. */
+  const [pendingCommand, setPendingCommand] = useState<string | null>(null);
 
   // Refs used inside xterm.onData closure for Serverless Streaming Shell mode
   const modeRef = useRef<"ws" | "serverless">(wsAvailable ? "ws" : "serverless");
@@ -162,6 +187,13 @@ export function SshTerminalSession({
     cwdRef.current = currentCwd;
   }, [currentCwd]);
 
+  /** Keeps the ref (used inside xterm callbacks) and the UI in sync. */
+  const setExecBusy = useCallback((value: boolean) => {
+    execBusyRef.current = value;
+    setRunning(value);
+    if (!value) setLivePrompt(null);
+  }, []);
+
   const writePrompt = useCallback(
     (term: import("@xterm/xterm").Terminal, cwdVal?: string) => {
       const displayPath = cwdVal ?? cwdRef.current ?? "~";
@@ -177,6 +209,14 @@ export function SshTerminalSession({
 
   /**
    * Runs one command through the serverless exec API and streams its output.
+   *
+   * When the browser and the deployment both support it, the request body is a
+   * chunked NDJSON stream that stays open and carries keystrokes, so the command's
+   * stdin is live (`[Y/n]`, passphrase, sudo and REPL prompts are answerable). If no
+   * response starts within a few seconds — the signature of a proxy buffering the
+   * request body — the command is retried once as a plain JSON exec, which is the
+   * old fire-and-run behaviour.
+   *
    * `elevateUser` wraps the command in sudo (root mode / `sudo <cmd>`).
    */
   const execServerless = useCallback(
@@ -185,115 +225,186 @@ export function SshTerminalSession({
       options: {
         elevateUser?: string | null;
         password?: string;
+        /** Text piped into the command's stdin when live typing is not possible. */
+        stdin?: string;
         stream?: (text: string) => void;
+        /** Told whether keystrokes can reach this command's stdin. */
+        onInputReady?: (canSendInput: boolean) => void;
       } = {}
     ): Promise<{ exitCode: number; output: string; httpError?: string }> => {
       const term = termRef.current;
-      const controller = new AbortController();
-      abortExecRef.current = controller;
       const utf8Decoder = new TextDecoder("utf-8");
-      let output = "";
-      let exitCode = 0;
-      let gotReady = false;
 
-      try {
-        const res = await fetch("/api/ssh/exec", {
-          method: "POST",
-          headers: getAuthHeaders(gatewaySettings),
-          signal: controller.signal,
-          body: JSON.stringify({
-            credentials: {
-              host: profile.host,
-              port: profile.port,
-              username: profile.username,
-              authMethod: profile.authMethod,
-              password: profile.password,
-              privateKey: profile.privateKey,
-              passphrase: profile.passphrase,
-            },
-            command,
-            cwd: cwdRef.current,
-            cols: term?.cols || 100,
-            rows: term?.rows || 30,
-            ...(options.elevateUser
-              ? {
-                  elevate: {
-                    user: options.elevateUser,
-                    password: options.password,
-                  },
-                }
-              : {}),
-          }),
-        });
-
-        if (!res.ok || !res.body) {
-          const errJson = await res.json().catch(() => ({}));
-          return {
-            exitCode: 1,
-            output: "",
-            httpError: String(errJson.error || `HTTP ${res.status}`),
-          };
-        }
-
-        const reader = res.body.getReader();
-        const lineDec = new TextDecoder();
-        let ndjsonBuf = "";
-
-        while (true) {
-          const { value, done } = await reader.read();
-          if (done) break;
-          ndjsonBuf += lineDec.decode(value, { stream: true });
-          const lines = ndjsonBuf.split("\n");
-          ndjsonBuf = lines.pop() || "";
-
-          for (const line of lines) {
-            if (!line.trim()) continue;
-            let evt: Record<string, unknown>;
-            try {
-              evt = JSON.parse(line) as Record<string, unknown>;
-            } catch {
-              continue;
+      const payload = {
+        credentials: {
+          host: profile.host,
+          port: profile.port,
+          username: profile.username,
+          authMethod: profile.authMethod,
+          password: profile.password,
+          privateKey: profile.privateKey,
+          passphrase: profile.passphrase,
+        },
+        command,
+        cwd: cwdRef.current,
+        cols: term?.cols || 100,
+        rows: term?.rows || 30,
+        ...(options.stdin ? { stdin: options.stdin } : {}),
+        ...(options.elevateUser
+          ? {
+              elevate: {
+                user: options.elevateUser,
+                password: options.password,
+              },
             }
-            if (evt.type === "ready") {
-              gotReady = true;
-              setStatus("connected");
-              if (typeof evt.fingerprint === "string") setFingerprint(evt.fingerprint);
-            } else if (evt.type === "data" && typeof evt.data === "string") {
-              const text = utf8Decoder.decode(decodeBase64Bytes(evt.data), {
-                stream: true,
-              });
-              output += text;
-              options.stream?.(text);
-            } else if (evt.type === "meta") {
-              exitCode = Number(evt.exitCode ?? 0);
-              if (typeof evt.cwd === "string" && evt.cwd) {
-                cwdRef.current = evt.cwd;
-                setCurrentCwd(evt.cwd);
+          : {}),
+      };
+
+      type AttemptResult = {
+        exitCode: number;
+        output: string;
+        httpError?: string;
+        retryWithoutStreaming?: boolean;
+      };
+
+      const attempt = async (allowStreaming: boolean): Promise<AttemptResult> => {
+        const controller = new AbortController();
+        abortExecRef.current = controller;
+        let output = "";
+        let exitCode = 0;
+        let gotReady = false;
+        let settled = false;
+
+        const streaming = allowStreaming && canStreamExecStdin();
+        const channel = streaming ? createExecRequestBody(payload) : null;
+        const headers = getAuthHeaders(gatewaySettings);
+        if (channel) headers["Content-Type"] = "application/x-ndjson";
+        const requestInit: RequestInit & { duplex?: "half" } = {
+          method: "POST",
+          headers,
+          signal: controller.signal,
+          body: channel ? channel.body : JSON.stringify(payload),
+          ...(channel ? { duplex: "half" as const } : {}),
+        };
+        if (channel) stdinRef.current = channel.channel;
+        options.onInputReady?.(Boolean(channel));
+
+        // A buffered request body means the response never starts; give up early and
+        // let the caller retry the classic way instead of hanging the terminal.
+        const startWatchdog = channel
+          ? setTimeout(() => {
+              if (settled) return;
+              settled = true;
+              controller.abort();
+            }, 8000)
+          : null;
+
+        try {
+          const res = await fetch("/api/ssh/exec", requestInit);
+          if (startWatchdog) clearTimeout(startWatchdog);
+
+          if (!res.ok || !res.body) {
+            const errJson = await res.json().catch(() => ({}));
+            const errorCode = String((errJson as { code?: string }).code || "");
+            return {
+              exitCode: 1,
+              output: "",
+              httpError: String(
+                (errJson as { error?: string }).error || `HTTP ${res.status}`
+              ),
+              retryWithoutStreaming:
+                Boolean(channel) && errorCode === "streamed_body_timeout",
+            };
+          }
+
+          const reader = res.body.getReader();
+          const lineDec = new TextDecoder();
+          let ndjsonBuf = "";
+
+          while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            ndjsonBuf += lineDec.decode(value, { stream: true });
+            const lines = ndjsonBuf.split("\n");
+            ndjsonBuf = lines.pop() || "";
+
+            for (const line of lines) {
+              if (!line.trim()) continue;
+              let evt: Record<string, unknown>;
+              try {
+                evt = JSON.parse(line) as Record<string, unknown>;
+              } catch {
+                continue;
               }
-            } else if (evt.type === "error") {
-              if (!gotReady) setStatus("error");
-              const message = String(evt.message || "SSH error");
-              output += `\n${message}`;
-              options.stream?.(`\r\n\x1b[31m${message}\x1b[0m`);
+              if (evt.type === "ready") {
+                gotReady = true;
+                setStatus("connected");
+                if (channel) streamingConfirmedRef.current = true;
+                if (typeof evt.fingerprint === "string") setFingerprint(evt.fingerprint);
+              } else if (evt.type === "data" && typeof evt.data === "string") {
+                const text = utf8Decoder.decode(decodeBase64Bytes(evt.data), {
+                  stream: true,
+                });
+                output += text;
+                options.stream?.(text);
+              } else if (evt.type === "meta") {
+                exitCode = Number(evt.exitCode ?? 0);
+                if (typeof evt.cwd === "string" && evt.cwd) {
+                  cwdRef.current = evt.cwd;
+                  setCurrentCwd(evt.cwd);
+                }
+              } else if (evt.type === "error") {
+                if (!gotReady) setStatus("error");
+                const message = String(evt.message || "SSH error");
+                output += `\n${message}`;
+                options.stream?.(`\r\n\x1b[31m${message}\x1b[0m`);
+              }
             }
           }
+        } catch (err) {
+          if (channel && !gotReady && (settled || err instanceof TypeError)) {
+            // Either the watchdog fired, or the browser refused the streamed body
+            // outright (ERR_H2_OR_QUIC_REQUIRED over HTTP/1.1). Retry the classic way.
+            return { exitCode: 1, output: "", retryWithoutStreaming: true };
+          }
+          if ((err as Error)?.name === "AbortError") {
+            exitCode = 130;
+            options.stream?.("^C");
+          } else {
+            const message =
+              err instanceof Error ? err.message : "SSH stream interrupted.";
+            output += `\n${message}`;
+            exitCode = 1;
+            options.stream?.(`\r\n\x1b[31m${message}\x1b[0m`);
+          }
+        } finally {
+          if (startWatchdog) clearTimeout(startWatchdog);
+          abortExecRef.current = null;
+          stdinRef.current = null;
+          channel?.channel.close();
         }
-      } catch (err) {
-        if ((err as Error)?.name === "AbortError") {
-          exitCode = 130;
-          options.stream?.("^C");
-        } else {
-          const message =
-            err instanceof Error ? err.message : "SSH stream interrupted.";
-          output += `\n${message}`;
-          exitCode = 1;
-          options.stream?.(`\r\n\x1b[31m${message}\x1b[0m`);
-        }
-      } finally {
-        abortExecRef.current = null;
+
+        return { exitCode, output };
+      };
+
+      const wantsStreaming = !streamingBlockedRef.current && canStreamExecStdin();
+      const first = await attempt(wantsStreaming);
+
+      if (first.retryWithoutStreaming) {
+        // Remember it for the rest of the session: this deployment (or the network
+        // in front of it) does not pass request bodies through while streaming.
+        streamingBlockedRef.current = true;
+        setStreamingStdinBlocked(true);
+        termRef.current?.writeln(
+          "\x1b[90m↳ Keystrokes can't be streamed to a running command on this connection\r\n" +
+            "  (browsers need HTTP/2 for that). Commands still run, but answer prompts up\r\n" +
+            "  front instead: `apt install -y docker`, `ssh-keygen -N ''`, …\x1b[0m"
+        );
+        options.onInputReady?.(false);
+        return attempt(false);
       }
 
-      return { exitCode, output };
+      return first;
     },
     [gatewaySettings, profile]
   );
@@ -329,6 +440,19 @@ export function SshTerminalSession({
     },
     [execServerless]
   );
+
+  /** Sends bytes to the running command's stdin (false when unavailable). */
+  const sendTerminalInput = useCallback((data: string): boolean => {
+    const stdin = stdinRef.current;
+    return stdin?.canSendInput ? stdin.sendInput(data) : false;
+  }, []);
+
+  /** Ctrl+C: a real SIGINT when stdin works, otherwise cancel the request. */
+  const stopRunningCommand = useCallback(() => {
+    const stdin = stdinRef.current;
+    if (stdin?.canSendInput && stdin.sendSignal("INT")) return;
+    abortExecRef.current?.abort();
+  }, []);
 
   const askSudoPassword = useCallback(
     (term: import("@xterm/xterm").Terminal, prompt: SecretPrompt) => {
@@ -387,7 +511,7 @@ export function SshTerminalSession({
   );
 
   const runServerlessCommand = useCallback(
-    async (rawCmd: string, options: { password?: string } = {}) => {
+    async (rawCmd: string, options: { password?: string; stdin?: string } = {}) => {
       const term = termRef.current;
       if (!term) return;
 
@@ -419,12 +543,12 @@ export function SshTerminalSession({
         return;
       }
       if (intent?.kind === "enter-root") {
-        execBusyRef.current = true;
+        setExecBusy(true);
         let result: "done" | "prompting" = "done";
         try {
           result = await enterRootMode(term, options.password);
         } finally {
-          execBusyRef.current = false;
+          setExecBusy(false);
         }
         if (result === "done") writePrompt(term);
         return;
@@ -450,19 +574,28 @@ export function SshTerminalSession({
 
       const interactive = detectInteractiveProgram(commandToRun);
       if (interactive) {
+        const stdinWorks =
+          streamingConfirmedRef.current && !streamingBlockedRef.current;
+        if (!stdinWorks) {
+          term.writeln(
+            `\x1b[33m"${interactive}" needs a live terminal, and this session can only run one command at a time — it would sit there waiting for keystrokes.`
+          );
+          term.writeln(
+            "Use these here: cat / tail -n 100 / sed -i / top -bn1, or open a self-hosted Sushi (VPS / Docker) or a VPS gateway for vim, nano, less, tmux…\x1b[0m"
+          );
+          writePrompt(term);
+          return;
+        }
+        // Keystrokes reach this command's stdin, so a full-screen program really
+        // runs. It is not a perfect PTY (no window resizing), hence the heads-up.
         term.writeln(
-          `\x1b[33m"${interactive}" needs a live terminal, and this Vercel session can only run one command at a time — it would sit there waiting for keystrokes.`
+          `\x1b[90m↳ ${interactive}: keystrokes are forwarded to it; press Ctrl+C to leave. (Resizing isn't supported in serverless mode.)\x1b[0m`
         );
-        term.writeln(
-          "Use these here: cat / tail -n 100 / sed -i / top -bn1, or open a self-hosted Sushi (VPS / Docker) or a VPS gateway for vim, nano, less, tmux…\x1b[0m"
-        );
-        writePrompt(term);
-        return;
       }
 
       // Elevation needs credentials first: remember NOPASSWD, otherwise ask once.
       const password = options.password ?? sudoPasswordRef.current ?? undefined;
-      execBusyRef.current = true;
+      setExecBusy(true);
       try {
         if (elevateUser && !password && !sudoNoPasswordRef.current) {
           const probe = await probeElevation(elevateUser, undefined);
@@ -480,24 +613,36 @@ export function SshTerminalSession({
 
         let promptHintShown = false;
         let outputTail = "";
+        let canType = false;
+        setPendingCommand(rawCmd);
         const result = await execServerless(commandToRun, {
           elevateUser,
           password,
+          stdin: options.stdin,
+          onInputReady: (value) => {
+            canType = value;
+            setCanTypeWhileRunning(value);
+          },
           stream: (text) => {
             term.write(text);
             outputTail = (outputTail + text).slice(-200);
+
+            // Surface a question with buttons, so nothing ever leaves the user
+            // staring at a prompt they cannot answer.
+            const kind = PASSWORD_PROMPT_RE.test(outputTail)
+              ? "password"
+              : CONFIRM_PROMPT_RE.test(outputTail)
+                ? "confirm"
+                : null;
+            if (kind) setLivePrompt({ kind, canType });
+
             if (promptHintShown) return;
-            if (PASSWORD_PROMPT_RE.test(outputTail)) {
-              promptHintShown = true;
-              term.write(
-                "\r\n\x1b[33m↳ This command is asking for input, which this Vercel session can't type into. Press Ctrl+C to cancel, run it non-interactively, or use `sudo su` (Sushi will ask for your password up front).\x1b[0m\r\n"
-              );
-            } else if (CONFIRM_PROMPT_RE.test(outputTail)) {
-              promptHintShown = true;
-              term.write(
-                "\r\n\x1b[33m↳ This command is waiting for an answer. Press Ctrl+C and re-run it non-interactively (e.g. add -y), or use a live terminal.\x1b[0m\r\n"
-              );
-            }
+            if (!kind) return;
+            promptHintShown = true;
+            if (canType) return; // the answer bar is live; no scary warning needed
+            term.write(
+              "\r\n\x1b[33m↳ This command is waiting for an answer, and this browser can't stream keystrokes to it. Press Ctrl+C (or the Stop button) to cancel, or re-run it non-interactively (e.g. `apt install -y …`). Chrome, Edge and other Chromium browsers let you answer it directly.\x1b[0m\r\n"
+            );
           },
         });
 
@@ -513,7 +658,7 @@ export function SshTerminalSession({
           if (result.exitCode === 0) sudoPasswordRef.current = options.password;
         }
       } finally {
-        execBusyRef.current = false;
+        setExecBusy(false);
         // When a password prompt was started, the prompt itself is the cursor
         if (!secretPromptRef.current) writePrompt(term);
       }
@@ -524,6 +669,10 @@ export function SshTerminalSession({
   // Initialize xterm and transport session
   useEffect(() => {
     let disposed = false;
+    // Capability state is per connection: a new session re-probes the deployment.
+    streamingBlockedRef.current = false;
+    streamingConfirmedRef.current = false;
+    setStreamingStdinBlocked(false);
     let resizeObserver: ResizeObserver | null = null;
     let pingInterval: ReturnType<typeof setInterval> | null = null;
 
@@ -642,11 +791,23 @@ export function SshTerminalSession({
           return;
         }
 
-        // Serverless Streaming Shell interactive line editor
+        // A command is running: keystrokes belong to it, exactly like a real PTY.
+        // This is what makes `apt install` → `[Y/n]`, passphrase prompts and
+        // `ssh-keygen` questions answerable on Vercel.
         if (execBusyRef.current) {
+          const stdin = stdinRef.current;
           if (data === "\x03") {
-            // Ctrl+C cancels active streaming command
-            abortExecRef.current?.abort();
+            if (stdin?.canSendInput) {
+              // Real SIGINT so the remote command cleans up after itself.
+              stdin.sendSignal("INT");
+            } else {
+              abortExecRef.current?.abort();
+            }
+            return;
+          }
+          if (stdin?.canSendInput) {
+            // No local echo here — the remote PTY echoes what we type.
+            stdin.sendInput(data);
           }
           return;
         }
@@ -1017,6 +1178,28 @@ export function SshTerminalSession({
             </span>
           )}
 
+          {transportMode === "serverless" &&
+            (() => {
+              const liveInput = !streamingStdinBlocked && canStreamExecStdin();
+              return (
+                <span
+                  title={
+                    liveInput
+                      ? "Keystrokes are forwarded to the running command, so prompts like [Y/n] can be answered."
+                      : "Keystrokes can't reach a running command here (needs HTTP/2 + a Chromium browser). Sushi offers a one-click retry that answers the prompt, e.g. `apt install -y`."
+                  }
+                  className={`inline-flex items-center gap-1 rounded-md border px-2 py-0.5 text-[11px] font-medium ${
+                    liveInput
+                      ? "border-sky-500/30 bg-sky-500/10 text-sky-200"
+                      : "border-amber-500/30 bg-amber-500/10 text-amber-200"
+                  }`}
+                >
+                  <Radio className="h-3 w-3" />
+                  {liveInput ? "Live input" : "No live input"}
+                </span>
+              );
+            })()}
+
           {fingerprint && (
             <span
               title={fingerprint}
@@ -1183,6 +1366,85 @@ export function SshTerminalSession({
           </button>
         </div>
       </div>
+
+      {/* Running command / answerable prompt bar (serverless mode) */}
+      {transportMode === "serverless" && running && (
+        <div className="flex flex-wrap items-center gap-2 border-b border-amber-500/25 bg-amber-500/10 px-4 py-1.5 text-[11px] text-amber-100">
+          <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-amber-300" />
+          <span className="min-w-0 flex-1 truncate">
+            {livePrompt
+              ? livePrompt.kind === "password"
+                ? "This command is asking for a password — type it below."
+                : livePrompt.kind === "confirm"
+                  ? "This command is waiting for an answer — type it, or pick one:"
+                  : "Waiting for input…"
+              : "Command running — keystrokes go to it; Ctrl+C interrupts."}
+          </span>
+
+          {livePrompt && canTypeWhileRunning && (
+            <span className="flex items-center gap-1">
+              <button
+                type="button"
+                onClick={() => void sendTerminalInput(livePrompt.kind === "confirm" ? "y\r" : "\r")}
+                className="rounded-md border border-emerald-400/40 bg-emerald-500/15 px-2 py-0.5 font-semibold text-emerald-200 transition hover:bg-emerald-500/30"
+                title={livePrompt.kind === "confirm" ? "Answer yes" : "Press Enter"}
+              >
+                {livePrompt.kind === "confirm" ? "Yes (y)" : "Enter"}
+              </button>
+              {livePrompt.kind === "confirm" && (
+                <button
+                  type="button"
+                  onClick={() => void sendTerminalInput("n\r")}
+                  className="rounded-md border border-white/15 px-2 py-0.5 text-amber-100 transition hover:bg-white/10"
+                  title="Answer no"
+                >
+                  No (n)
+                </button>
+              )}
+            </span>
+          )}
+
+          <button
+            type="button"
+            onClick={stopRunningCommand}
+            className="flex shrink-0 items-center gap-1 rounded-md border border-rose-400/40 bg-rose-500/15 px-2 py-0.5 font-medium text-rose-200 transition hover:bg-rose-500/30"
+            title={canTypeWhileRunning ? "Send Ctrl+C to the command" : "Cancel the running command"}
+          >
+            <Ban className="h-3 w-3" /> Stop
+          </button>
+        </div>
+      )}
+
+      {transportMode === "serverless" && running && livePrompt && !canTypeWhileRunning && (
+        <div className="flex flex-wrap items-center gap-2 border-b border-amber-500/20 bg-[#141019] px-4 py-1.5 text-[11px] text-amber-200/90">
+          <span className="min-w-0 flex-1">
+            Live typing isn&apos;t available on this connection, so this command is stuck at
+            its question. Sushi can stop it and re-run it with{" "}
+            <span className="font-mono-code">{livePrompt.kind === "confirm" ? "y" : "Enter"}</span>{" "}
+            already piped in — or just answer it yourself next time with{" "}
+            <span className="font-mono-code">
+              {livePrompt.kind === "confirm" ? "apt install -y …" : "ssh-keygen -N '' …"}
+            </span>
+            .
+          </span>
+          {livePrompt.kind === "confirm" && pendingCommand && (
+            <button
+              type="button"
+              onClick={() => {
+                const command = pendingCommand;
+                stopRunningCommand();
+                setLivePrompt(null);
+                setTimeout(() => {
+                  void runServerlessCommand(command, { stdin: "y\n" });
+                }, 60);
+              }}
+              className="shrink-0 rounded-md border border-emerald-400/40 bg-emerald-500/15 px-2 py-0.5 font-semibold text-emerald-200 transition hover:bg-emerald-500/30"
+            >
+              Answer y &amp; retry
+            </button>
+          )}
+        </div>
+      )}
 
       {/* Optional Search Bar */}
       {showSearch && (

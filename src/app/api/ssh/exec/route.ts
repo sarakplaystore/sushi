@@ -4,6 +4,7 @@ import type { ConnectionCredentials } from "@/types/connection";
 import { connectSsh, shellQuote } from "@/lib/server/ssh-client";
 import { getCorsHeaders, verifyRequestAccess } from "@/lib/server/security";
 import { META_REGEX, splitEmittable } from "@/lib/server/exec-stream";
+import { pumpExecInput, readExecStart } from "@/lib/server/exec-input";
 import {
   buildExecScript,
   createSudoAnswerer,
@@ -12,7 +13,12 @@ import {
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-export const maxDuration = 60;
+// Long installs (`apt install docker`, `npm ci`, builds) are common in a terminal,
+// so give the exec the full window the platform allows instead of cutting it at 60 s.
+export const maxDuration = 300;
+
+/** Output that usually means the command is sitting on a question. */
+const PROMPT_HINT_RE = /\[[Yy]\/[Nn]\]|\(yes\/no\)|\[[Yy]\/N\]|\[y\/N\]|password[^\n]{0,30}:\s*$/i;
 
 export async function OPTIONS(req: NextRequest) {
   return new NextResponse(null, {
@@ -36,20 +42,75 @@ export async function POST(req: NextRequest) {
     rows?: number;
     /** Run the command through sudo (used to emulate `sudo su` / `sudo <cmd>`). */
     elevate?: ExecElevation;
+    /**
+     * Text piped into the command's stdin once the channel is open. Lets the UI
+     * re-run something that asked a question ("Do you want to continue? [Y/n]")
+     * when the browser cannot stream live keystrokes.
+     */
+    stdin?: string;
   };
 
-  try {
-    body = await req.json();
-  } catch {
-    return NextResponse.json(
-      { ok: false, error: "Invalid JSON payload." },
-      { status: 400, headers: cors }
-    );
+  // Two request shapes: a plain JSON body (fire-and-run) or a streaming NDJSON body
+  // that stays open and becomes the command's stdin, so prompts can be answered.
+  const isStreamedBody = (req.headers.get("content-type") || "").includes(
+    "application/x-ndjson"
+  );
+  let inputReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+  let inputCarry = "";
+
+  if (isStreamedBody) {
+    if (!req.body) {
+      return NextResponse.json(
+        { ok: false, error: "This request has no streamed body." },
+        { status: 400, headers: cors }
+      );
+    }
+    inputReader = req.body.getReader();
+    try {
+      const { start, carry, timedOut } = await readExecStart(inputReader);
+      inputCarry = carry;
+      if (timedOut) {
+        void inputReader.cancel().catch(() => {});
+        return NextResponse.json(
+          {
+            ok: false,
+            error:
+              "The exec request body did not arrive in time (this deployment may buffer request bodies). Retry with a plain JSON body.",
+            code: "streamed_body_timeout",
+          },
+          { status: 408, headers: cors }
+        );
+      }
+      if (!start) {
+        void inputReader.cancel().catch(() => {});
+        return NextResponse.json(
+          { ok: false, error: "Streamed exec needs a {type:\"start\"} line first." },
+          { status: 400, headers: cors }
+        );
+      }
+      body = start;
+    } catch {
+      void inputReader.cancel().catch(() => {});
+      return NextResponse.json(
+        { ok: false, error: "Could not read the exec request body." },
+        { status: 400, headers: cors }
+      );
+    }
+  } else {
+    try {
+      body = await req.json();
+    } catch {
+      return NextResponse.json(
+        { ok: false, error: "Invalid JSON payload." },
+        { status: 400, headers: cors }
+      );
+    }
   }
 
   const creds = body.credentials;
   const command = body.command ?? "";
   if (!creds?.host || !creds?.username) {
+    if (inputReader) void inputReader.cancel().catch(() => {});
     return NextResponse.json(
       { ok: false, error: "SSH host and username are required." },
       { status: 400, headers: cors }
@@ -121,6 +182,39 @@ export async function POST(req: NextRequest) {
 
               const sudoAnswerer = createSudoAnswerer();
               let finished = false;
+              let channelClosed = false;
+
+              // Keystrokes from the browser become this command's stdin. With a PTY
+              // allocated, SSH_MSG_CHANNEL_DATA is what a real keyboard would do, so
+              // `[Y/n]`, passphrase and sudo prompts all work — and SIGINT lets
+              // Ctrl+C interrupt the command instead of killing the connection.
+              if (inputReader) {
+                const chRef = ch;
+                void pumpExecInput(inputReader, inputCarry, {
+                  onInput: (data) => {
+                    try {
+                      chRef.write(data);
+                    } catch {
+                      // channel already closed
+                    }
+                  },
+                  onSignal: (signal) => {
+                    try {
+                      chRef.signal(signal);
+                    } catch {
+                      // fall back to the terminal's own interrupt character
+                      try {
+                        if (signal === "INT") chRef.write("\x03");
+                      } catch {
+                        // channel already closed
+                      }
+                    }
+                  },
+                  isClosed: () => finished || channelClosed,
+                }).catch(() => {
+                  // the browser closed the body (navigated away / command finished)
+                });
+              }
 
               let passwordWritten = false;
               const sendPassword = () => {
@@ -156,6 +250,49 @@ export async function POST(req: NextRequest) {
                 ? setTimeout(sendPassword, 3500)
                 : null;
 
+              // Piped stdin: written once the PTY is up, so a re-run of an interactive
+              // command can answer its question without live keystrokes.
+              const pipedInput =
+                typeof body.stdin === "string" && body.stdin.length > 0
+                  ? body.stdin.slice(0, 4096)
+                  : null;
+              let pipedWritten = false;
+              const writePipedInput = () => {
+                if (!pipedInput || pipedWritten || finished) return;
+                pipedWritten = true;
+                try {
+                  ch.write(pipedInput);
+                } catch {
+                  // channel already gone
+                }
+              };
+              // A question probably showed up: answer it now. Otherwise answer after
+              // ~1 s so slow starters (`apt` printing package lists) still get it.
+              const maybeAnswerPrompt = (text: string) => {
+                if (PROMPT_HINT_RE.test(text)) writePipedInput();
+              };
+              const pipedFallback = pipedInput ? setTimeout(writePipedInput, 1000) : null;
+
+              // Without live keystrokes, a command that reads stdin would wait forever
+              // (a PTY never reports EOF on its own). Close stdin once the piped answer
+              // is in, so `read`/`apt` behave like they do in a pipe instead of hanging
+              // until the function timeout.
+              const stdinCloseTimer =
+                inputReader || feedPassword
+                  ? null
+                  : setTimeout(() => {
+                      if (finished) return;
+                      writePipedInput();
+                      try {
+                        // Ctrl-D: in a PTY that means "end of input", so a blocked
+                        // `read` returns immediately (channel.close() would kill the
+                        // command's output too).
+                        ch.write("\x04");
+                      } catch {
+                        // channel already gone
+                      }
+                    }, pipedInput ? 1800 : 1200);
+
               const flushText = (text: string) => {
                 if (!text) return;
                 sendEvent({
@@ -165,6 +302,7 @@ export async function POST(req: NextRequest) {
               };
 
               ch.on("data", (chunk: Buffer) => {
+                if (pipedInput) maybeAnswerPrompt(chunk.toString("utf8"));
                 carry += utf8.write(chunk);
                 const match = META_REGEX.exec(carry);
                 if (match) {
@@ -195,7 +333,11 @@ export async function POST(req: NextRequest) {
 
               ch.on("close", (code: number | null) => {
                 finished = true;
+                channelClosed = true;
+                if (inputReader) void inputReader.cancel().catch(() => {});
                 if (passwordFallback) clearTimeout(passwordFallback);
+                if (pipedFallback) clearTimeout(pipedFallback);
+                if (stdinCloseTimer) clearTimeout(stdinCloseTimer);
                 carry += utf8.end();
                 if (carry) {
                   const match = META_REGEX.exec(carry);

@@ -22,10 +22,13 @@ import {
   ChevronLeft,
   ChevronRight,
   CornerDownLeft,
+  Cpu,
 } from "lucide-react";
 import type {
   CommandSnippet,
+  ConnectionCredentials,
   HostProfile,
+  SshSystemInfo,
 } from "@/types/connection";
 import {
   type GatewaySettings,
@@ -58,6 +61,13 @@ import {
   sendKeyChannelInput,
   type ExecKeyChannel,
 } from "@/lib/client/exec-keys";
+import {
+  formatOsLabel,
+  formatSystemDetails,
+  formatSystemLine,
+  formatTerminalSystemLine,
+  loadSshSystemInfo,
+} from "@/lib/client/sysinfo";
 
 interface SshTerminalSessionProps {
   profile: HostProfile;
@@ -176,6 +186,13 @@ export function SshTerminalSession({
     "connecting" | "connected" | "disconnected" | "error"
   >("connecting");
   const [fingerprint, setFingerprint] = useState<string | undefined>();
+  /**
+   * Distro + version and hosting platform of the remote machine, e.g.
+   * "Ubuntu 24.04.1 LTS · Oracle Cloud". Read once per connection.
+   */
+  const [systemInfo, setSystemInfo] = useState<SshSystemInfo | null>(null);
+  /** One in-flight probe per session, shared by the header and the banner. */
+  const sysinfoPromiseRef = useRef<Promise<SshSystemInfo | null> | null>(null);
   const [currentCwd, setCurrentCwd] = useState<string>(
     initialPath || profile.initialPath || "~"
   );
@@ -236,6 +253,38 @@ export function SshTerminalSession({
   useEffect(() => {
     cwdRef.current = currentCwd;
   }, [currentCwd]);
+
+  /**
+   * Asks the server what the machine actually is: the distro and version
+   * (Ubuntu 24.04.1 LTS, Debian 12, Rocky 9.4, …) plus the cloud the VPS runs on
+   * (Oracle Cloud, AWS EC2, Hetzner, KVM VPS, …). One short SSH connection, cached
+   * for five minutes, shared by the header badge and the session banner.
+   */
+  const ensureSystemInfo = useCallback(() => {
+    if (!sysinfoPromiseRef.current) {
+      const credentials: ConnectionCredentials = {
+        host: profile.host,
+        port: profile.port,
+        username: profile.username,
+        authMethod: profile.authMethod,
+        password: profile.password,
+        privateKey: profile.privateKey,
+        passphrase: profile.passphrase,
+      };
+      sysinfoPromiseRef.current = loadSshSystemInfo(credentials, gatewaySettings).then(
+        (info) => {
+          if (info) setSystemInfo(info);
+          return info;
+        }
+      );
+    }
+    return sysinfoPromiseRef.current;
+  }, [profile, gatewaySettings]);
+
+  useEffect(() => {
+    if (status !== "connected") return;
+    void ensureSystemInfo();
+  }, [status, ensureSystemInfo]);
 
   /** Keeps the ref (used inside xterm callbacks) and the UI in sync. */
   const setExecBusy = useCallback((value: boolean) => {
@@ -1206,8 +1255,17 @@ export function SshTerminalSession({
         term.writeln(
           `\x1b[38;2;255;107;87m● Sushi Serverless SSH Stream\x1b[0m \x1b[90m(${profile.username}@${profile.host}:${profile.port})\x1b[0m`
         );
-        // Perform initial handshake & working directory resolution
-        void runServerlessCommand("pwd && uname -sr 2>/dev/null || true");
+        // Name the machine under the banner, then resolve the working directory. The
+        // probe never holds the shell up for more than a couple of seconds.
+        void (async () => {
+          const info = await Promise.race([
+            ensureSystemInfo(),
+            new Promise<null>((resolve) => setTimeout(() => resolve(null), 2500)),
+          ]);
+          const line = formatTerminalSystemLine(info);
+          if (line) term.writeln(`\x1b[90m\u21b3 ${line}\x1b[0m`);
+          void runServerlessCommand("pwd");
+        })();
       };
 
       if (shouldUseWs) {
@@ -1463,6 +1521,16 @@ export function SshTerminalSession({
           <span className="font-mono-code text-xs text-slate-400">
             {profile.username}@{profile.host}:{profile.port}
           </span>
+
+          {(formatOsLabel(systemInfo) || systemInfo?.provider) && (
+            <span
+              title={formatSystemDetails(systemInfo).join("\n")}
+              className="inline-flex max-w-[260px] items-center gap-1 truncate rounded-md border border-violet-500/30 bg-violet-500/10 px-2 py-0.5 text-[11px] font-medium text-violet-200"
+            >
+              <Cpu className="h-3 w-3 shrink-0 text-violet-300" />
+              <span className="truncate">{formatSystemLine(systemInfo)}</span>
+            </span>
+          )}
 
           {elevatedUser && transportMode === "serverless" && (
             <span

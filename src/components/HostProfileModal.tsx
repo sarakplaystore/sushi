@@ -803,6 +803,32 @@ export function HostProfileModal({
                         : ""}
                     </div>
                   )}
+                  {sshTestResult.systemInfo?.provider && (
+                    <div>
+                      Hosted on: {sshTestResult.systemInfo.provider}
+                      {sshTestResult.systemInfo.providerId
+                        ? ` (${sshTestResult.systemInfo.providerId})`
+                        : ""}
+                    </div>
+                  )}
+                  {(sshTestResult.systemInfo?.cpu ||
+                    sshTestResult.systemInfo?.memoryMb ||
+                    sshTestResult.systemInfo?.arch) && (
+                    <div>
+                      Machine:{" "}
+                      {[
+                        sshTestResult.systemInfo?.arch,
+                        sshTestResult.systemInfo?.cpu
+                          ? `${sshTestResult.systemInfo.cpu} vCPU`
+                          : "",
+                        sshTestResult.systemInfo?.memoryMb
+                          ? `${Math.round(sshTestResult.systemInfo.memoryMb / 1024)} GB RAM`
+                          : "",
+                      ]
+                        .filter(Boolean)
+                        .join(" · ")}
+                    </div>
+                  )}
                 </div>
               ) : (
                 <div className="mt-1.5 text-rose-200/90">{sshTestResult.error}</div>

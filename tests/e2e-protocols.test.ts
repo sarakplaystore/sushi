@@ -68,6 +68,16 @@ import {
   parseKeyDeliveryResult,
 } from "../src/lib/server/exec-script";
 import {
+  SYSINFO_SCRIPT,
+  detectCloudProvider,
+  parseSysinfo,
+} from "../src/lib/server/sysinfo";
+import {
+  formatOsLabel,
+  formatSystemDetails,
+  formatSystemLine,
+} from "../src/lib/client/sysinfo";
+import {
   MENU_KEY,
   detectFullscreenMenu,
   detectInteractiveProgram,
@@ -277,7 +287,29 @@ async function runTests() {
         session.on("exec", (acceptExec, _reject, info) => {
           const stream = acceptExec();
           if (info.command.includes("HOST=")) {
-            stream.write("HOST=sushi-test-box\nKERNEL=Linux 6.8\nOS=Ubuntu Test\nUPTIME=up 5 days\n");
+            // Same shape as SYSINFO_SCRIPT: an Oracle Cloud Ubuntu box.
+            stream.write(
+              [
+                "HOST=sushi-test-box",
+                "PRETTY=Ubuntu 24.04.1 LTS",
+                "DISTRO=Ubuntu",
+                "VERSION=24.04",
+                "CODENAME=noble",
+                "KERNEL=Linux 6.8",
+                "ARCH=x86_64",
+                "UPTIME=up 5 days",
+                "CPU=4",
+                "MEM_MB=23846",
+                "LOAD=0.10 0.20 0.30",
+                "CLOUD_ID=oraclecloud",
+                "DMI_VENDOR=OracleCloud.com",
+                "DMI_PRODUCT=Standard.PC",
+                "DMI_BOARD=",
+                "DMI_ASSET=",
+                "VIRT=kvm",
+                "",
+              ].join("\n")
+            );
           } else {
             stream.write(`EXEC_OK:${info.command}\n`);
           }
@@ -457,6 +489,17 @@ async function runTests() {
   assert.equal(passTest.ok, true);
   assert.ok(passTest.fingerprint?.startsWith("SHA256:"));
   assert.equal(passTest.systemInfo?.hostname, "sushi-test-box");
+  // The same probe the terminal header uses: distro + version + hosting platform.
+  assert.equal(passTest.systemInfo?.os, "Ubuntu 24.04.1 LTS");
+  assert.equal(passTest.systemInfo?.version, "24.04");
+  assert.equal(passTest.systemInfo?.codename, "noble");
+  assert.equal(passTest.systemInfo?.kernel, "Linux 6.8");
+  assert.equal(passTest.systemInfo?.arch, "x86_64");
+  assert.equal(passTest.systemInfo?.cpu, 4);
+  assert.equal(passTest.systemInfo?.memoryMb, 23846);
+  assert.equal(passTest.systemInfo?.uptime, "up 5 days");
+  assert.equal(passTest.systemInfo?.provider, "Oracle Cloud");
+  assert.equal(passTest.systemInfo?.providerId, "oraclecloud");
 
   const keyTest = await testSshConnection({
     host: "127.0.0.1",
@@ -2047,13 +2090,119 @@ async function runTests() {
   assert.equal(plainExec.script.includes("mkfifo"), false);
   assert.equal(plainExec.script.includes("script -q"), false);
 
+  console.log(
+    "==> [9b] Testing remote system info (distro, version, cloud provider)..."
+  );
+
+  // One round trip, plain shell builtins only: no root, no curl, no extra packages.
+  assert.ok(SYSINFO_SCRIPT.includes("/etc/os-release"));
+  assert.ok(SYSINFO_SCRIPT.includes("/run/cloud-init/cloud-id"));
+  assert.ok(SYSINFO_SCRIPT.includes("systemd-detect-virt"));
+  assert.ok(!/\bsudo\b|\bcurl\b|\bwget\b/.test(SYSINFO_SCRIPT));
+
+  const sysinfoLine = (pairs: Record<string, string>) =>
+    Object.entries(pairs)
+      .map(([k, v]) => `${k}=${v}`)
+      .join("\n");
+
+  // An Oracle Cloud Ubuntu box, which is the case this feature was asked for.
+  const oracleUbuntu = parseSysinfo(
+    sysinfoLine({
+      HOST: "instance-2024",
+      PRETTY: "Ubuntu 24.04.1 LTS",
+      DISTRO: "Ubuntu",
+      VERSION: "24.04",
+      CODENAME: "noble",
+      KERNEL: "Linux 6.8.0-1017-oracle",
+      ARCH: "aarch64",
+      UPTIME: "up 12 days",
+      CPU: "4",
+      MEM_MB: "23846",
+      LOAD: "0.08 0.11 0.09",
+      CLOUD_ID: "oraclecloud",
+      DMI_VENDOR: "OracleCloud.com",
+      DMI_PRODUCT: "Standard.PC",
+      VIRT: "kvm",
+    })
+  );
+  assert.equal(oracleUbuntu.os, "Ubuntu 24.04.1 LTS");
+  assert.equal(oracleUbuntu.distro, "Ubuntu");
+  assert.equal(oracleUbuntu.version, "24.04");
+  assert.equal(oracleUbuntu.codename, "noble");
+  assert.equal(oracleUbuntu.arch, "aarch64");
+  assert.equal(oracleUbuntu.cpu, 4);
+  assert.equal(oracleUbuntu.memoryMb, 23846);
+  assert.equal(oracleUbuntu.provider, "Oracle Cloud");
+  assert.equal(oracleUbuntu.providerId, "oraclecloud");
+  assert.equal(oracleUbuntu.virtualization, "kvm");
+
+  // Other distros report themselves just as well.
+  assert.equal(
+    parseSysinfo(
+      sysinfoLine({ PRETTY: "Debian GNU/Linux 12 (bookworm)", DISTRO: "Debian GNU/Linux", VERSION: "12", VIRT: "kvm" })
+    ).os,
+    "Debian GNU/Linux 12 (bookworm)"
+  );
+  assert.equal(
+    parseSysinfo(sysinfoLine({ PRETTY: "Rocky Linux 9.4 (Blue Onyx)", DISTRO: "Rocky Linux", VERSION: "9.4" })).os,
+    "Rocky Linux 9.4 (Blue Onyx)"
+  );
+  // A minimal image without /etc/os-release still leaves the kernel.
+  assert.equal(parseSysinfo(sysinfoLine({ KERNEL: "Linux 5.10.0-28-amd64" })).os, "Linux 5.10.0-28-amd64");
+  // Empty probe output must not throw.
+  assert.equal(parseSysinfo("").os, "Linux");
+  assert.equal(parseSysinfo("").provider, undefined);
+
+  // Provider fingerprints: cloud-init id first, then the DMI strings.
+  const providerOf = (signals: Parameters<typeof detectCloudProvider>[0]) =>
+    detectCloudProvider(signals).provider;
+  assert.equal(providerOf({ cloudId: "oraclecloud" }), "Oracle Cloud");
+  assert.equal(providerOf({ cloudId: "aws", dmiVendor: "Amazon EC2" }), "AWS EC2");
+  assert.equal(providerOf({ dmiVendor: "Amazon EC2" }), "AWS EC2");
+  assert.equal(providerOf({ dmiVendor: "Google" }), "Google Cloud");
+  assert.equal(providerOf({ cloudId: "azure" }), "Microsoft Azure");
+  assert.equal(providerOf({ dmiVendor: "DigitalOcean" }), "DigitalOcean");
+  assert.equal(providerOf({ dmiVendor: "Hetzner" }), "Hetzner Cloud");
+  assert.equal(providerOf({ dmiVendor: "Linode, LLC" }), "Akamai / Linode");
+  assert.equal(providerOf({ dmiVendor: "Vultr" }), "Vultr");
+  assert.equal(providerOf({ dmiVendor: "Alibaba Cloud" }), "Alibaba Cloud");
+  // Hypervisor without a named cloud keeps a useful label.
+  assert.equal(providerOf({ virtualization: "kvm" }), "KVM VPS");
+  assert.equal(providerOf({ virtualization: "vmware" }), "VMware");
+  assert.equal(providerOf({ virtualization: "docker" }), "Docker container");
+  // Bare metal has no platform at all.
+  assert.equal(providerOf({ virtualization: "none" }), undefined);
+  // An unknown cloud-init datasource still names itself.
+  const unknownCloud = detectCloudProvider({ cloudId: "mycloud" });
+  assert.equal(unknownCloud.provider, undefined);
+  assert.equal(unknownCloud.providerId, "mycloud");
+
+  // How the header renders it: "Ubuntu 24.04.1 LTS · Oracle Cloud".
+  assert.equal(formatOsLabel(oracleUbuntu), "Ubuntu 24.04.1 LTS");
+  assert.equal(formatSystemLine(oracleUbuntu), "Ubuntu 24.04.1 LTS · Oracle Cloud");
+  assert.equal(formatSystemLine(null), "");
+  assert.equal(
+    formatOsLabel(parseSysinfo(sysinfoLine({ PRETTY: "Debian GNU/Linux 12 (bookworm)" }))),
+    "Debian 12"
+  );
+  assert.equal(
+    formatOsLabel(parseSysinfo(sysinfoLine({ PRETTY: "Red Hat Enterprise Linux 9.4 (Plow)" }))),
+    "RHEL 9.4"
+  );
+  assert.equal(formatOsLabel({ distro: "Alpine Linux", version: "3.20" }), "Alpine Linux 3.20");
+  const details = formatSystemDetails(oracleUbuntu);
+  assert.ok(details.includes("OS: Ubuntu 24.04.1 LTS"));
+  assert.ok(details.some((line) => line.startsWith("Platform: Oracle Cloud")));
+  assert.ok(details.some((line) => line.includes("4 vCPU")));
+  assert.ok(details.some((line) => line.includes("23 GB RAM")));
+
   console.log("==> [10/10] Cleaning up test servers...");
   httpServer.close();
   guacdMock.close();
   rdpMock.close();
   sshServer.close();
   console.log(
-    "ALL AUTH, PASSKEY, KEY WHITELIST, TERMIX, SSH, SFTP, RDP, EXEC STDIN, FOLDER-DOWNLOAD, SELECTION-DOWNLOAD, RDP-COMPANION, AND MENU-KEYS E2E TESTS PASSED!"
+    "ALL AUTH, PASSKEY, KEY WHITELIST, TERMIX, SSH, SFTP, RDP, EXEC STDIN, FOLDER-DOWNLOAD, SELECTION-DOWNLOAD, RDP-COMPANION, MENU-KEYS, AND SYSTEM-INFO E2E TESTS PASSED!"
   );
 }
 

@@ -16,6 +16,7 @@ import {
   ShieldCheck,
   Shrink,
   X,
+  UserRound,
 } from "lucide-react";
 import type { HostProfile, RdpProbeResult } from "@/types/connection";
 import {
@@ -32,6 +33,8 @@ interface RdpDesktopSessionProps {
   guacdAvailable: boolean;
   gatewaySettings: GatewaySettings;
   onOpenGatewayModal: () => void;
+  /** Adjust the desktop credentials (Windows user / domain / port). */
+  onEditCredentials: () => void;
 }
 
 function toBase64Url(json: string): string {
@@ -61,6 +64,7 @@ export function RdpDesktopSession({
   guacdAvailable,
   gatewaySettings,
   onOpenGatewayModal,
+  onEditCredentials,
 }: RdpDesktopSessionProps) {
   const stageRef = useRef<HTMLDivElement | null>(null);
   const displayHostRef = useRef<HTMLDivElement | null>(null);
@@ -534,6 +538,16 @@ export function RdpDesktopSession({
 
           <button
             type="button"
+            onClick={onEditCredentials}
+            className="flex items-center gap-1 rounded-lg border border-white/10 bg-white/5 px-2.5 py-1 text-xs text-slate-200 hover:bg-white/10"
+            title="Edit the desktop username, domain, port and password"
+          >
+            <UserRound className="h-3.5 w-3.5 text-[#ff6b57]" />
+            <span className="hidden sm:inline">Credentials</span>
+          </button>
+
+          <button
+            type="button"
             onClick={() => downloadRdpFile(profile)}
             className="flex items-center gap-1 rounded-lg border border-white/10 bg-white/5 px-2.5 py-1 text-xs text-slate-200 hover:bg-white/10"
             title="Download native .rdp connection file"
@@ -627,7 +641,23 @@ export function RdpDesktopSession({
               {errorMessage && (
                 <div className="mt-4 flex items-start gap-2 rounded-xl border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-200">
                   <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-amber-400" />
-                  <span>{errorMessage}</span>
+                  <div className="min-w-0 flex-1 space-y-1.5">
+                    <div>{errorMessage}</div>
+                    <div className="text-amber-200/80">
+                      Desktop logins are usually a Windows account
+                      (<span className="font-mono-code">Administrator</span>,
+                      a domain user, or the Linux user signed in to xrdp), which
+                      can differ from the SSH login this session was opened from.
+                    </div>
+                    <button
+                      type="button"
+                      onClick={onEditCredentials}
+                      className="inline-flex items-center gap-1 rounded-md border border-amber-400/40 px-2 py-0.5 font-medium text-amber-100 transition hover:bg-amber-500/20"
+                    >
+                      <UserRound className="h-3 w-3" />
+                      Edit desktop credentials
+                    </button>
+                  </div>
                 </div>
               )}
 

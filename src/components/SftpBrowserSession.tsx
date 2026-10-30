@@ -30,6 +30,7 @@ import {
   Copy,
   ShieldCheck,
   ListChecks,
+  Monitor,
 } from "lucide-react";
 import type { HostProfile, SftpEntry } from "@/types/connection";
 import { type GatewaySettings, getAuthHeaders } from "@/lib/client/gateway";
@@ -40,6 +41,7 @@ interface SftpBrowserSessionProps {
   initialPath?: string;
   gatewaySettings: GatewaySettings;
   onOpenCompanionSsh: (cwd?: string) => void;
+  onOpenRdp: () => void;
 }
 
 function formatBytes(bytes: number): string {
@@ -129,6 +131,7 @@ export function SftpBrowserSession({
   initialPath,
   gatewaySettings,
   onOpenCompanionSsh,
+  onOpenRdp,
 }: SftpBrowserSessionProps) {
   const [cwd, setCwd] = useState<string>(initialPath || profile.initialPath || ".");
   const [pathInput, setPathInput] = useState<string>(
@@ -823,6 +826,16 @@ export function SftpBrowserSession({
             >
               <Terminal className="h-3.5 w-3.5" />
               <span className="hidden md:inline">SSH Here</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={onOpenRdp}
+              className="flex items-center gap-1 rounded-lg border border-[#ff6b57]/35 bg-[#ff6b57]/10 px-2.5 py-1.5 text-xs font-medium text-[#ff9587] transition hover:bg-[#ff6b57]/20"
+              title="Open this server's desktop via RDP (port 3389)"
+            >
+              <Monitor className="h-3.5 w-3.5" />
+              <span className="hidden md:inline">RDP</span>
             </button>
           </div>
         </div>

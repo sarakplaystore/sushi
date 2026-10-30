@@ -68,6 +68,11 @@ import {
   getStoredPasskeyCertificates,
 } from "@/lib/client/auth-storage";
 import { isInsecureBrowserContext, randomUUID } from "@/lib/client/web-crypto";
+import {
+  buildRdpCompanionDraft,
+  buildRdpCompanionProfile,
+  rdpCompanionTitle,
+} from "@/lib/client/rdp-companion";
 
 export function SushiWorkspace() {
   // Authentication & Passkey Gate state
@@ -128,6 +133,9 @@ export function SushiWorkspace() {
   const [hostModalOpen, setHostModalOpen] = useState(false);
   const [editingProfile, setEditingProfile] =
     useState<Partial<HostProfile> | null>(null);
+  // "rdp" = the dialog was opened from an RDP session's Credentials button, so
+  // the header explains that saving creates a separate RDP host.
+  const [hostModalIntent, setHostModalIntent] = useState<"rdp" | null>(null);
   const [gatewayModalOpen, setGatewayModalOpen] = useState(false);
   const [vaultModalOpen, setVaultModalOpen] = useState(false);
   const [vaultModalTab, setVaultModalTab] =
@@ -321,7 +329,8 @@ export function SushiWorkspace() {
     (
       profile: HostProfile,
       overrideProtocol?: ProtocolType,
-      overrideInitialPath?: string
+      overrideInitialPath?: string,
+      overrideTitle?: string
     ) => {
       const proto = overrideProtocol || profile.protocol;
       const resolved = resolveProfileWithKeychain(
@@ -339,7 +348,7 @@ export function SushiWorkspace() {
       const tabId = `tab-${randomUUID()}`;
       const newTab: SessionTab = {
         id: tabId,
-        title: `${profile.name}`,
+        title: overrideTitle?.trim() || `${profile.name}`,
         protocol: proto,
         profile: resolved.profile,
         initialPath: overrideInitialPath ?? profile.initialPath,
@@ -349,6 +358,59 @@ export function SushiWorkspace() {
       setActiveTabId(tabId);
     },
     [enforceKeyWhitelist, sshKeys]
+  );
+
+  /**
+   * Opens the same machine as a desktop: one click from a host row, a host card,
+   * a terminal or the file manager. A saved RDP host just opens normally; an
+   * SSH/SFTP host gets a derived profile on port 3389 (see lib/client/rdp-companion)
+   * so nothing is duplicated in the Vault until the user saves it.
+   */
+  const openRdpCompanion = useCallback(
+    (source: HostProfile) => {
+      if (source.protocol === "rdp") {
+        openSessionTab(source);
+        return;
+      }
+      const companion = buildRdpCompanionProfile(source);
+      // One desktop per host: re-clicking the button focuses the open tab
+      // instead of stacking duplicates.
+      const existing = tabs.find(
+        (t) =>
+          t.protocol === "rdp" &&
+          t.profile.host === companion.host &&
+          Number(t.profile.port) === Number(companion.port) &&
+          t.profile.username === companion.username
+      );
+      if (existing) {
+        setActiveTabId(existing.id);
+        return;
+      }
+      openSessionTab(
+        companion,
+        "rdp",
+        undefined,
+        rdpCompanionTitle(source)
+      );
+    },
+    [openSessionTab, tabs]
+  );
+
+  /**
+   * "Credentials" in an RDP session: edit the saved RDP host when there is one,
+   * otherwise open a prefilled draft (no id → saving creates its own RDP host,
+   * the SSH entry is left untouched).
+   */
+  const editRdpConnection = useCallback(
+    (tab: SessionTab) => {
+      const saved = hosts.find(
+        (h) => h.id === tab.profile.id && h.protocol === "rdp"
+      );
+      setEditingProfile(saved ?? buildRdpCompanionDraft(tab.profile));
+      setHostModalIntent(saved ? null : "rdp");
+      setHostModalOpen(true);
+    },
+    [hosts]
   );
 
   const closeSessionTab = (tabId: string, e?: React.MouseEvent) => {
@@ -379,6 +441,7 @@ export function SushiWorkspace() {
     await persistVault(nextHosts, snippets);
     setHostModalOpen(false);
     setEditingProfile(null);
+    setHostModalIntent(null);
     if (connectAfterSave) {
       openSessionTab(profile);
     }
@@ -396,9 +459,11 @@ export function SushiWorkspace() {
     const parsed = parseQuickConnectInput(quickConnectInput);
     if (!parsed) {
       setEditingProfile({ protocol: "ssh" });
+      setHostModalIntent(null);
       setHostModalOpen(true);
       return;
     }
+    setHostModalIntent(null);
     setEditingProfile({
       name: `${parsed.username}@${parsed.host}`,
       protocol: parsed.protocol,
@@ -632,6 +697,7 @@ export function SushiWorkspace() {
                 type="button"
                 onClick={() => {
                   setEditingProfile(null);
+                  setHostModalIntent(null);
                   setHostModalOpen(true);
                 }}
                 className="flex h-8 w-8 shrink-0 items-center justify-center rounded-xl bg-[#ff6b57] text-white transition hover:bg-[#ff7f6e]"
@@ -674,6 +740,7 @@ export function SushiWorkspace() {
                   type="button"
                   onClick={() => {
                     setEditingProfile(null);
+                    setHostModalIntent(null);
                     setHostModalOpen(true);
                   }}
                   className="mt-3 inline-flex items-center gap-1 rounded-lg bg-white/8 px-3 py-1.5 text-xs font-medium text-white hover:bg-white/14"
@@ -720,51 +787,70 @@ export function SushiWorkspace() {
                           </div>
                         </div>
 
-                        <div className="hidden items-center gap-0.5 group-hover:flex">
+                        <div className="flex shrink-0 items-center gap-0.5">
+                          {/* Always visible so the desktop is one click away */}
                           {h.protocol !== "rdp" && (
                             <button
                               type="button"
                               onClick={(e) => {
                                 e.stopPropagation();
-                                openSessionTab(
-                                  h,
-                                  h.protocol === "ssh" ? "sftp" : "ssh"
-                                );
+                                openRdpCompanion(h);
                               }}
-                              className="rounded p-1 text-slate-400 hover:bg-white/10 hover:text-sky-300"
-                              title={
-                                h.protocol === "ssh"
-                                  ? "Open as SFTP"
-                                  : "Open as SSH"
-                              }
+                              className="rounded p-1 text-[#ff6b57]/75 transition hover:bg-[#ff6b57]/20 hover:text-[#ff9587]"
+                              title="Open desktop via RDP"
+                              aria-label={`Open ${h.name} via RDP`}
                             >
-                              {h.protocol === "ssh" ? (
-                                <FolderKanban className="h-3 w-3" />
-                              ) : (
-                                <Terminal className="h-3 w-3" />
-                              )}
+                              <Monitor className="h-3 w-3" />
                             </button>
                           )}
-                          <button
-                            type="button"
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              setEditingProfile(h);
-                              setHostModalOpen(true);
-                            }}
-                            className="rounded p-1 text-slate-400 hover:bg-white/10 hover:text-white"
-                            title="Edit host"
-                          >
-                            <Pencil className="h-3 w-3" />
-                          </button>
-                          <button
-                            type="button"
-                            onClick={(e) => void handleDeleteHost(h.id, e)}
-                            className="rounded p-1 text-slate-400 hover:bg-rose-500/20 hover:text-rose-400"
-                            title="Delete host"
-                          >
-                            <Trash2 className="h-3 w-3" />
-                          </button>
+
+                          <div className="hidden items-center gap-0.5 group-hover:flex">
+                            {h.protocol !== "rdp" && (
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  openSessionTab(
+                                    h,
+                                    h.protocol === "ssh" ? "sftp" : "ssh"
+                                  );
+                                }}
+                                className="rounded p-1 text-slate-400 hover:bg-white/10 hover:text-sky-300"
+                                title={
+                                  h.protocol === "ssh"
+                                    ? "Open as SFTP"
+                                    : "Open as SSH"
+                                }
+                              >
+                                {h.protocol === "ssh" ? (
+                                  <FolderKanban className="h-3 w-3" />
+                                ) : (
+                                  <Terminal className="h-3 w-3" />
+                                )}
+                              </button>
+                            )}
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setEditingProfile(h);
+                                setHostModalIntent(null);
+                                setHostModalOpen(true);
+                              }}
+                              className="rounded p-1 text-slate-400 hover:bg-white/10 hover:text-white"
+                              title="Edit host"
+                            >
+                              <Pencil className="h-3 w-3" />
+                            </button>
+                            <button
+                              type="button"
+                              onClick={(e) => void handleDeleteHost(h.id, e)}
+                              className="rounded p-1 text-slate-400 hover:bg-rose-500/20 hover:text-rose-400"
+                              title="Delete host"
+                            >
+                              <Trash2 className="h-3 w-3" />
+                            </button>
+                          </div>
                         </div>
                       </div>
                     );
@@ -904,6 +990,7 @@ export function SushiWorkspace() {
             type="button"
             onClick={() => {
               setEditingProfile(null);
+              setHostModalIntent(null);
               setHostModalOpen(true);
             }}
             className="ml-1 rounded-lg p-1.5 text-slate-400 transition hover:bg-white/6 hover:text-white"
@@ -1092,6 +1179,7 @@ export function SushiWorkspace() {
                   type="button"
                   onClick={() => {
                     setEditingProfile({ protocol: "ssh" });
+                    setHostModalIntent(null);
                     setHostModalOpen(true);
                   }}
                   className="group rounded-2xl border border-white/8 bg-[#111520] p-5 text-left transition hover:border-emerald-500/40 hover:bg-[#141a27]"
@@ -1112,6 +1200,7 @@ export function SushiWorkspace() {
                   type="button"
                   onClick={() => {
                     setEditingProfile({ protocol: "sftp" });
+                    setHostModalIntent(null);
                     setHostModalOpen(true);
                   }}
                   className="group rounded-2xl border border-white/8 bg-[#111520] p-5 text-left transition hover:border-sky-500/40 hover:bg-[#141a27]"
@@ -1132,6 +1221,7 @@ export function SushiWorkspace() {
                   type="button"
                   onClick={() => {
                     setEditingProfile({ protocol: "rdp" });
+                    setHostModalIntent(null);
                     setHostModalOpen(true);
                   }}
                   className="group rounded-2xl border border-white/8 bg-[#111520] p-5 text-left transition hover:border-[#ff6b57]/40 hover:bg-[#141a27]"
@@ -1223,6 +1313,17 @@ export function SushiWorkspace() {
                                   {h.protocol === "ssh" ? "SFTP" : "SSH"}
                                 </button>
                               )}
+                              {h.protocol !== "rdp" && (
+                                <button
+                                  type="button"
+                                  onClick={() => openRdpCompanion(h)}
+                                  className="flex items-center gap-1 rounded-lg border border-[#ff6b57]/35 bg-[#ff6b57]/10 px-2.5 py-1 text-xs text-[#ff9587] transition hover:bg-[#ff6b57]/20"
+                                  title="Open this host as an RDP desktop"
+                                >
+                                  <Monitor className="h-3 w-3" />
+                                  RDP
+                                </button>
+                              )}
                             </div>
 
                             <div className="flex items-center gap-1">
@@ -1230,6 +1331,7 @@ export function SushiWorkspace() {
                                 type="button"
                                 onClick={() => {
                                   setEditingProfile(h);
+                                  setHostModalIntent(null);
                                   setHostModalOpen(true);
                                 }}
                                 className="rounded-lg p-1.5 text-slate-400 hover:bg-white/8 hover:text-white"
@@ -1275,6 +1377,7 @@ export function SushiWorkspace() {
                     onOpenCompanionSftp={(cwd) =>
                       openSessionTab(tab.profile, "sftp", cwd)
                     }
+                    onOpenRdp={() => openRdpCompanion(tab.profile)}
                     onOpenGatewayModal={() => setGatewayModalOpen(true)}
                   />
                 )}
@@ -1286,6 +1389,7 @@ export function SushiWorkspace() {
                     onOpenCompanionSsh={(cwd) =>
                       openSessionTab(tab.profile, "ssh", cwd)
                     }
+                    onOpenRdp={() => openRdpCompanion(tab.profile)}
                   />
                 )}
                 {tab.protocol === "rdp" && (
@@ -1295,6 +1399,7 @@ export function SushiWorkspace() {
                     guacdAvailable={effectiveRdpGuacd}
                     gatewaySettings={gatewaySettings}
                     onOpenGatewayModal={() => setGatewayModalOpen(true)}
+                    onEditCredentials={() => editRdpConnection(tab)}
                   />
                 )}
               </div>
@@ -1307,6 +1412,12 @@ export function SushiWorkspace() {
       <HostProfileModal
         isOpen={hostModalOpen}
         initialProfile={editingProfile}
+        title={hostModalIntent === "rdp" ? "Open via RDP" : undefined}
+        subtitle={
+          hostModalIntent === "rdp"
+            ? "Desktop login for this server — set the Windows / xrdp account, domain and port. Saving keeps your SSH host untouched by creating a separate RDP entry."
+            : undefined
+        }
         gatewaySettings={gatewaySettings}
         sshKeys={sshKeys}
         enforceKeyWhitelist={enforceKeyWhitelist}
@@ -1325,11 +1436,13 @@ export function SushiWorkspace() {
         onClose={() => {
           setHostModalOpen(false);
           setEditingProfile(null);
+          setHostModalIntent(null);
         }}
         onSave={(p, connectNow) => void handleSaveHostProfile(p, connectNow)}
         onQuickConnectOnly={(p) => {
           setHostModalOpen(false);
           setEditingProfile(null);
+          setHostModalIntent(null);
           openSessionTab(p);
         }}
       />

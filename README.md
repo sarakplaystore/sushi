@@ -20,6 +20,7 @@ It is designed around a **Hybrid VPS + Serverless Architecture**:
 - **SSH Terminal (`@xterm/xterm` + `ssh2`)**
   - Live bidirectional **WebSocket PTY** (`/ws/ssh`) on VPS/Gateway (`vim`, `htop`, `tmux`, resize, 256-color ANSI)
   - Automatic **Serverless HTTP Streaming Shell** (`/api/ssh/exec`) fallback on Vercel with persistent working directory (`cd`), command history, and Ctrl+C cancellation
+  - **Keystroke channel for the serverless shell**: every command gets a private keystroke FIFO on the host, so `[Y/n]` prompts, passwords and full-screen `whiptail`/`debconf`/`ncurses` menus (`Configuring lightdm`, `tasksel`, `nmtui`) are answerable in any browser — with a menu bar that shows the box's real choices and buttons
   - Password, keyboard-interactive (PAM), and PEM/OpenSSH Private Key (`Ed25519`, `RSA`, `ECDSA` + passphrase) authentication
   - SHA-256 host key fingerprint verification, quick command snippets, scrollback search, and terminal themes
 - **SFTP File Manager (`/api/sftp/*`)**
@@ -192,6 +193,7 @@ download.
 | `Authentication failed … wrong username or password` | Or the server has `PasswordAuthentication no`. Use SSH key authentication. |
 | `Authentication failed … the server rejected this private key` | Add the key's public half to `~/.ssh/authorized_keys` for that user. |
 | `This private key is passphrase-protected` / `Incorrect passphrase` | Enter (or fix) the key passphrase in the host settings. |
+| An old installer shows a `┌─┤ Configuring … ├─┐` box and arrow keys type `[B` | Fixed: the box is detected and its keys are delivered through the host-side keystroke channel — see *Answering prompts*. |
 | `vim`/`top`/`less`/`tmux` don't run on Vercel | Serverless SSH runs each command on its own. When live input is available (see *Answering prompts* below) simple interactive programs work but nothing can resize or re-enter full-screen mode, so a live PTY is still better: self-hosted Sushi or **Attach VPS Gateway**. These always work in the Vercel terminal: `cat`, `tail -n 100`, `sed -i`, `top -bn1`, `systemctl status`, `journalctl -n 50`, `git log`. |
 | `su` says it needs the root password (Vercel) | `su` wants the *root account's* password. Use `sudo su` instead: Sushi asks for **your** sudo password (on NOPASSWD hosts it switches instantly). |
 | `Download ZIP` / the row **ZIP** button does nothing | If your browser shows a save dialog first, it was dismissed (Esc) — click again and confirm. Right-click the folder row → *Download folder (.zip)* is the same action. |
@@ -216,23 +218,34 @@ emulates it:
 - On a self-hosted instance or through a VPS gateway (live PTY) `sudo su` is the real thing — Sushi
   does not intercept it.
 
-### Answering prompts in the Vercel terminal (`[Y/n]`, passwords, …)
+### Answering prompts in the Vercel terminal (`[Y/n]`, passwords, whiptail menus, …)
 
-Serverless SSH runs one command per request, so there is no PTY to type into. Sushi gives you three
-ways past a question:
+Serverless SSH runs one command per request, so there is no PTY to type into. Sushi gives you four
+ways past a question — including the old curses installers (`Configuring lightdm`, `tasksel`,
+`debconf`) that only listen to key presses:
 
-1. **Type it.** When a command asks something, type the answer in the terminal and press **Enter**:
-   Sushi stops the stuck command and re-runs it with what you typed piped into its stdin — `y` really
-   answers `[Y/n]`, `n` aborts, an empty line takes the default. **Yes (y)** / **No (n)** buttons do
-   the same with one click. Typing something that isn't an answer runs it as a new command instead, so
-   a busy terminal never locks you out. This works in every browser.
-2. **Live typing**, where the platform allows it: if the browser can stream a request body *and* the
+1. **Key channel (default on every connection where live typing is impossible).** Each command runs
+   inside `script(1)` on the host, with a private keystroke FIFO (`/tmp/.sushi-keys-…`, mode 600,
+   owned by your login user, removed when the command ends). Every keystroke — `y`, arrows, `Tab`,
+   `Space`, `Enter`, `Esc`, Ctrl+C — is delivered as a tiny extra request (`/api/ssh/exec/keys`), so
+   it works in **Firefox, Safari, HTTP/1.1 and through buffering proxies**, and it does not depend on
+   the deployment keeping the same server instance. A `whiptail`/`debconf` screen is picked up
+   automatically: a **menu bar** appears above the terminal with the box's title, its choices
+   (`(*) gdm3`, `( ) lightdm`), its buttons (`<Ok>`, `<Cancel>`) and a keypad, so you can answer an old
+   Ubuntu installer with one click. Typed keys simply work; nothing is re-run and no install is
+   interrupted.
+2. **Type it, even without any channel.** If the host has no `script`/`mkfifo`, Sushi falls back to the
+   old behaviour: typing an answer and pressing **Enter** stops the stuck command and re-runs it with
+   that line piped into stdin — `y` really answers `[Y/n]`, `n` aborts, an empty line takes the
+   default. Typing something that isn't an answer runs it as a new command instead, so a busy terminal
+   never locks you out.
+3. **Live typing**, where the platform allows it: if the browser can stream a request body *and* the
    connection is HTTP/2 (Chrome/Edge on HTTPS), the running command's stdin is connected and
-   keystrokes reach it directly — the header then shows **Live input**. Browsers that report
-   *"ReadableStream uploading is not supported"* (Firefox, Safari) are detected before any request is
-   sent, and a deployment that buffers request bodies is detected within a few seconds; both simply
-   fall back to (1) with no error in the terminal.
-3. **Non-interactive flags** — the safest habit: `apt install -y`, `apt-get -y`, `ssh-keygen -N ''`,
+   keystrokes reach it directly — the header then shows **Live input** and no key channel is created.
+   Browsers that report *"ReadableStream uploading is not supported"* (Firefox, Safari) are detected
+   before any request is sent, and a deployment that buffers request bodies is detected within a few
+   seconds; both switch to (1) without an error in the terminal.
+4. **Non-interactive flags** — the safest habit: `apt install -y`, `apt-get -y`, `ssh-keygen -N ''`,
    `DEBIAN_FRONTEND=noninteractive`, `debconf-set-selections`.
 
 Ctrl+C sends a real SIGINT when stdin is live and cancels the request otherwise, and always leaves the

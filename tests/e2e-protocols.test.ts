@@ -61,11 +61,20 @@ import {
 } from "../src/lib/client/rdp-companion";
 import {
   buildExecScript,
+  buildKeyDeliveryScript,
+  createKeyChannelPath,
   createSudoAnswerer,
+  isKeyChannelPath,
+  parseKeyDeliveryResult,
 } from "../src/lib/server/exec-script";
 import {
+  MENU_KEY,
+  detectFullscreenMenu,
   detectInteractiveProgram,
+  menuButtonKeys,
+  menuSelectKeys,
   parseElevationCommand,
+  splitTerminalInput,
 } from "../src/lib/client/terminal-commands";
 import {
   bootstrapAdminAccount,
@@ -1626,7 +1635,7 @@ async function runTests() {
   });
 
   console.log(
-    "==> [8/9] Testing serverless exec stdin (live keystrokes + piped answers)..."
+    "==> [8/10] Testing serverless exec stdin (live keystrokes + piped answers)..."
   );
 
   // --- request-line parsing ---------------------------------------------------
@@ -1912,13 +1921,139 @@ async function runTests() {
     setWindow(realWindow);
   }
 
-  console.log("==> [9/9] Cleaning up test servers...");
+  console.log(
+    "==> [9/10] Testing terminal menus (whiptail / debconf key channel)..."
+  );
+
+  // A real whiptail box, drawn exactly the way newt prints it.
+  const lightdmBox = [
+    "\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2524 Configuring lightdm \u251c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510",
+    "\u2502                                                        \u2502",
+    "\u2502 Please select the default display manager:             \u2502",
+    "\u2502                                                        \u2502",
+    "\u2502                (*) gdm3                                \u2502",
+    "\u2502                ( ) lightdm                             \u2502",
+    "\u2502                                                        \u2502",
+    "\u2502                   <Ok>        <Cancel>                 \u2502",
+    "\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518",
+  ].join("\r\n");
+
+  const menu = detectFullscreenMenu("Some earlier output\r\n" + lightdmBox + "\r\n");
+  assert.ok(menu, "whiptail box detected");
+  assert.equal(menu!.title, "Configuring lightdm");
+  assert.equal(menu!.kind, "select");
+  assert.deepEqual(
+    menu!.items.map((item) => `${item.selected ? "*" : " "}${item.label}`),
+    ["*gdm3", " lightdm"]
+  );
+  assert.deepEqual(menu!.buttons, ["Ok", "Cancel"]);
+
+  // Picking the second entry: one arrow down from the selection, Space, Enter.
+  assert.equal(menuSelectKeys(menu!, 1), `${MENU_KEY.down} ${MENU_KEY.enter}`);
+  assert.equal(menuSelectKeys(menu!, 0), ` ${MENU_KEY.enter}`);
+  // <Ok> is the default button, <Cancel> is one Tab away.
+  assert.equal(menuButtonKeys(menu!, "Ok"), MENU_KEY.enter);
+  assert.equal(menuButtonKeys(menu!, "Cancel"), `${MENU_KEY.tab}${MENU_KEY.enter}`);
+
+  // Yes/No boxes and checklists
+  const yesNo = detectFullscreenMenu(
+    "\u250c\u2500\u2524 Configuring grub-pc \u251c\u2500\u2510\r\n\u2502 Continue without installing GRUB? \u2502\r\n\u2502            <Yes>    <No>            \u2502\r\n\u2514\u2500\u2518\r\n"
+  );
+  assert.ok(yesNo, "yes/no box detected");
+  assert.equal(yesNo!.kind, "confirm");
+  assert.deepEqual(yesNo!.buttons, ["Yes", "No"]);
+  assert.equal(menuButtonKeys(yesNo!, "Yes"), MENU_KEY.enter);
+  assert.equal(menuButtonKeys(yesNo!, "No"), `${MENU_KEY.tab}${MENU_KEY.enter}`);
+
+  const checklist = detectFullscreenMenu(
+    "\u250c\u2500\u2524 Tasksel \u251c\u2500\u2510\r\n\u2502 [*] Ubuntu desktop       \u2502\r\n\u2502 [ ] OpenSSH server       \u2502\r\n\u2502        <Ok>   <Cancel>   \u2502\r\n\u2514\u2500\u2518\r\n"
+  );
+  assert.equal(checklist?.kind, "checklist");
+  assert.deepEqual(checklist!.items.map((i) => i.selected), [true, false]);
+
+  // Ordinary output must never be mistaken for a menu.
+  assert.equal(detectFullscreenMenu("$ apt install nginx\r\nReading package lists...\r\n"), null);
+  assert.equal(detectFullscreenMenu("total 24\r\n-rw-r--r-- 1 root root 12 file.txt\r\n"), null);
+  assert.equal(detectFullscreenMenu(""), null);
+
+  // Escape sequences are not text: this is what made an arrow key run "[B" as a
+  // command ("[B[B[A: not found") in the old build.
+  assert.deepEqual(splitTerminalInput("\x1b[B"), { text: "", sequences: ["\x1b[B"] });
+  assert.deepEqual(splitTerminalInput("\x1b[A\x1b[Ay"), {
+    text: "y",
+    sequences: ["\x1b[A", "\x1b[A"],
+  });
+  assert.deepEqual(splitTerminalInput("hello\r"), { text: "hello\r", sequences: [] });
+  assert.deepEqual(splitTerminalInput("\x1b[3~"), { text: "", sequences: ["\x1b[3~"] });
+  assert.deepEqual(splitTerminalInput("\x1bOP"), { text: "", sequences: ["\x1bOP"] });
+  assert.deepEqual(splitTerminalInput("\t \x7f"), { text: "\t \x7f", sequences: [] });
+
+  // Keystroke FIFO: path shape, delivery script and its result parsing
+  const keyPath = createKeyChannelPath();
+  assert.match(keyPath, /^\/tmp\/\.sushi-keys-[0-9a-f]{18}$/);
+  assert.equal(isKeyChannelPath(keyPath), true);
+  assert.equal(isKeyChannelPath("/tmp/.sushi-keys-$(touch /tmp/pwned)"), false);
+  assert.equal(isKeyChannelPath("/etc/passwd"), false);
+  assert.equal(isKeyChannelPath("/tmp/.sushi-keys-ABCDEF0123456789"), false);
+
+  const delivery = buildKeyDeliveryScript(keyPath, "\x1b[B \r");
+  assert.match(delivery, /\[ -p '\/tmp\/\.sushi-keys-[0-9a-f]{18}' \]/);
+  assert.match(delivery, /printf %s '\x1b\[B \r' >/);
+  assert.equal(parseKeyDeliveryResult("SUSHI_KEYS_OK\n"), "delivered");
+  assert.equal(parseKeyDeliveryResult("SUSHI_KEYS_MISSING\n"), "missing");
+  assert.equal(parseKeyDeliveryResult("sh: 1: cannot create: Permission denied"), "failed");
+
+  // The command is wrapped in script(1) with the FIFO as its keyboard, and the FIFO
+  // is created (mode 600, by the login user) before sudo runs.
+  const menuScript = buildExecScript({
+    command: "apt install lightdm",
+    cwd: "/srv/app",
+    keyChannel: keyPath,
+  });
+  assert.equal(menuScript.keyChannel, keyPath);
+  assert.match(menuScript.script, /mkfifo -m 600 "\$__sushi_keys"/);
+  // A FIFO nobody reads would swallow key presses, so it only exists with script(1).
+  assert.match(menuScript.script, /if command -v mkfifo .*&& command -v script /);
+  assert.match(menuScript.script, /trap 'kill \$__sushi_writer/);
+  assert.match(menuScript.script, /exec 9<'\/tmp\/\.sushi-keys-/);
+  assert.match(menuScript.script, /SHELL=\/bin\/sh script -q -c '/);
+  assert.match(menuScript.script, /SUSHI_META/);
+  // ... and it still runs the command unchanged when script(1) is not installed.
+  assert.match(menuScript.script, /else\n  export PAGER=cat/);
+
+  const menuElevated = buildExecScript({
+    command: "apt install lightdm",
+    elevate: { user: "root", password: "hunter2" },
+    keyChannel: keyPath,
+  });
+  assert.match(menuElevated.script, /^__sushi_keys=/);
+  assert.match(menuElevated.script, /sudo -S -- \/bin\/sh -c '/);
+  assert.equal(menuElevated.feedPassword, "hunter2");
+  assert.deepEqual(menuElevated.ptyModes, { ECHO: 0 });
+  assert.equal(menuElevated.script.includes("hunter2"), false);
+
+  // A piped answer travels through the FIFO too, because stdin of the command is the
+  // terminal script(1) gave it, not the SSH channel.
+  const menuPiped = buildExecScript({
+    command: "read -r x; echo $x",
+    keyChannel: keyPath,
+    pipedInput: "hello\r",
+  });
+  assert.match(menuPiped.script, /printf %s 'hello\r' > '\/tmp\/\.sushi-keys-/);
+
+  // Without a key channel nothing changes for the normal (fast) path.
+  const plainExec = buildExecScript({ command: "whoami" });
+  assert.equal(plainExec.keyChannel, null);
+  assert.equal(plainExec.script.includes("mkfifo"), false);
+  assert.equal(plainExec.script.includes("script -q"), false);
+
+  console.log("==> [10/10] Cleaning up test servers...");
   httpServer.close();
   guacdMock.close();
   rdpMock.close();
   sshServer.close();
   console.log(
-    "ALL AUTH, PASSKEY, KEY WHITELIST, TERMIX, SSH, SFTP, RDP, EXEC STDIN, FOLDER-DOWNLOAD, SELECTION-DOWNLOAD, AND RDP-COMPANION E2E TESTS PASSED!"
+    "ALL AUTH, PASSKEY, KEY WHITELIST, TERMIX, SSH, SFTP, RDP, EXEC STDIN, FOLDER-DOWNLOAD, SELECTION-DOWNLOAD, RDP-COMPANION, AND MENU-KEYS E2E TESTS PASSED!"
   );
 }
 

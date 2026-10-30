@@ -29,6 +29,8 @@ export interface ExecStartPayload {
   cols?: number;
   rows?: number;
   elevate?: ExecElevation;
+  /** Ask for a remote keystroke FIFO so keys can arrive through a second exec. */
+  keyChannel?: boolean;
 }
 
 export type ExecInputEvent =

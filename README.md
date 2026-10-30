@@ -25,6 +25,7 @@ It is designed around a **Hybrid VPS + Serverless Architecture**:
 - **SFTP File Manager (`/api/sftp/*`)**
   - Works identically on **Vercel Serverless** and **VPS**
   - Interactive breadcrumb navigation, drag-and-drop multi-file uploads, binary downloads, `mkdir`, rename, recursive delete, and an interactive Unix `chmod` permissions matrix
+  - **Folder download as `.zip`**: pick any directory (or click **Download ZIP** for the folder you are in) and Sushi streams the whole tree — nested folders, dotfiles, binary files, empty folders and permissions — straight to your browser. No remote `zip`/`tar` binary and no shell needed, so it works on Vercel exactly like on a VPS.
   - **Built-in Remote Code Editor** (`⌘S` / `Ctrl+S` direct save over SFTP)
 - **RDP Remote Desktop (`guacamole-common-js` + `guacd` + X.224 Inspector)**
   - Live in-browser Windows & Linux `xrdp` desktop streaming via `/ws/rdp` -> `guacd` (`NLA / CredSSP`, `TLS`, `Standard RDP`)
@@ -108,6 +109,27 @@ bash scripts/install-vps.sh
    terminal says so and falls back to serverless SSH. A full Sushi install (`docker compose`) can act
    as the gateway too, as long as `SUSHI_GATEWAY_TOKEN` is set in its `.env`.
 
+### Folder download (SFTP → ZIP)
+
+Clicking the folder icon in the **Actions** column downloads that folder as `<folder>.zip`; the
+**Download ZIP** button in the toolbar archives the folder you are currently browsing.
+
+- Works without a remote shell or `zip` binary: Sushi walks the tree over the SFTP subsystem and
+  streams a standard ZIP (deflate, UNIX modes, UTF-8 names) as it reads, so nothing is written to
+  disk on the server and no archive is held in memory server-side.
+- Empty folders, dotfiles and file permissions (`0644`, `0755`, …) are preserved, so the extracted
+  tree matches the server.
+- Symlinks to files are included as regular files; symlinks to folders are skipped (counted in the
+  confirmation message) so cyclic links cannot loop forever.
+- Progress (bytes streamed + file count) is shown above the file list with a **Cancel** button.
+- Limits on the serverless/browser path prevent runaway downloads: 20 000 files, 24 levels of
+  nesting, and **300 MB on Vercel / 2 GB on a VPS**. On Vercel the function's 60 s response limit
+  applies, so a folder that would stream for longer is rejected up front (a shorter, safe cut-off)
+  instead of arriving as a truncated `.zip`. Anything larger should be pulled with `tar`/`rsync`
+  over SSH, or from a self-hosted Sushi. Sushi reports exactly which limit was hit.
+- Archiving a single file is rejected with a hint to download it directly — the file download
+  button stays the right tool there.
+
 ---
 
 ## SSH Troubleshooting
@@ -122,6 +144,8 @@ bash scripts/install-vps.sh
 | `This private key is passphrase-protected` / `Incorrect passphrase` | Enter (or fix) the key passphrase in the host settings. |
 | `vim`/`top`/`less`/`tmux` don't run on Vercel | Serverless SSH runs each command on its own, so full-screen programs are reported instead of hanging. Use a live PTY for them: self-hosted Sushi or **Attach VPS Gateway**. These work fine in the Vercel terminal: `cat`, `tail -n 100`, `sed -i`, `top -bn1`, `systemctl status`, `journalctl -n 50`, `git log`. |
 | `su` says it needs the root password (Vercel) | `su` wants the *root account's* password. Use `sudo su` instead: Sushi asks for **your** sudo password (on NOPASSWD hosts it switches instantly). |
+| `Download ZIP` fails with "is not a folder" | The path is a file or a symlink to a file — use the single-file download button (or open its folder and archive that). |
+| `Download ZIP` fails with "contains more than 20 000 files" / "larger than 2.0 GB" / "nested deeper than 24 levels" | Sushi stopped a runaway archive before streaming it. Download a sub-folder, or `tar -czf` / `rsync` the tree over SSH. |
 
 ### Root access (`sudo su`) in the Vercel terminal
 

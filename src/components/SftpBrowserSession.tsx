@@ -25,6 +25,8 @@ import {
   Loader2,
   AlertCircle,
   CheckCircle2,
+  FolderDown,
+  Ban,
 } from "lucide-react";
 import type { HostProfile, SftpEntry } from "@/types/connection";
 import { type GatewaySettings, getAuthHeaders } from "@/lib/client/gateway";
@@ -165,6 +167,12 @@ export function SftpBrowserSession({
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
+  // Folder → ZIP download progress (one archive at a time)
+  const [zipJob, setZipJob] = useState<
+    { label: string; received: number; total: number; files: number } | null
+  >(null);
+  const zipAbortRef = useRef<AbortController | null>(null);
+
   const credentialsPayload = {
     host: profile.host,
     port: profile.port,
@@ -291,6 +299,17 @@ export function SftpBrowserSession({
     }
   };
 
+  const saveBlob = (blob: Blob, filename: string) => {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 4000);
+  };
+
   const handleDownloadFile = async (entry: SftpEntry) => {
     showNotice(true, `Downloading ${entry.name}...`);
     try {
@@ -307,16 +326,92 @@ export function SftpBrowserSession({
         throw new Error(errData.error || `HTTP ${res.status}`);
       }
       const blob = await res.blob();
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = entry.name;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      URL.revokeObjectURL(url);
+      saveBlob(blob, entry.name);
     } catch (err) {
       showNotice(false, err instanceof Error ? err.message : "Download failed.");
+    }
+  };
+
+  /**
+   * Downloads a folder as a .zip archive. The server walks the tree over SFTP and
+   * streams the archive, so this works on Vercel (no remote shell) as well as on a
+   * VPS. Progress is shown as the bytes arrive.
+   */
+  const handleDownloadFolder = async (entry?: SftpEntry | null) => {
+    if (zipJob) return;
+    const targetPath = entry ? entry.path : cwd;
+    const label =
+      entry?.name || cwd.split("/").filter(Boolean).pop() || "folder";
+    const controller = new AbortController();
+    zipAbortRef.current = controller;
+    setZipJob({ label, received: 0, total: 0, files: 0 });
+
+    try {
+      const res = await fetch("/api/sftp/download-zip", {
+        method: "POST",
+        headers: getAuthHeaders(gatewaySettings),
+        signal: controller.signal,
+        body: JSON.stringify({
+          credentials: credentialsPayload,
+          path: targetPath,
+        }),
+      });
+
+      if (!res.ok || !res.body) {
+        const errData = await res.json().catch(() => ({}));
+        throw new Error(
+          errData.error ||
+            `Could not archive ${targetPath} (HTTP ${res.status}).`
+        );
+      }
+
+      const files = Number(res.headers.get("X-Sushi-File-Count") || 0);
+      const total = Number(res.headers.get("X-Sushi-Total-Bytes") || 0);
+      const skipped = Number(res.headers.get("X-Sushi-Skipped-Symlinks") || 0);
+      const headerName = res.headers.get("X-Sushi-Archive-Name");
+      let archiveName = headerName
+        ? decodeURIComponent(headerName)
+        : `${label}.zip`;
+      if (!/\.zip$/i.test(archiveName)) archiveName += ".zip";
+
+      const reader = res.body.getReader();
+      const chunks: Uint8Array[] = [];
+      let received = 0;
+      let lastPaint = 0;
+
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        if (!value) continue;
+        chunks.push(value);
+        received += value.byteLength;
+        const now = Date.now();
+        if (now - lastPaint > 150) {
+          lastPaint = now;
+          setZipJob({ label, received, total, files });
+        }
+      }
+
+      const blob = new Blob(chunks as BlobPart[], { type: "application/zip" });
+      saveBlob(blob, archiveName);
+      const skippedNote = skipped
+        ? ` • ${skipped} symlink${skipped === 1 ? "" : "s"} to folders skipped`
+        : "";
+      showNotice(
+        true,
+        `Downloaded ${archiveName} — ${files} file${files === 1 ? "" : "s"}, ${formatBytes(blob.size)}${skippedNote}`
+      );
+    } catch (err) {
+      const aborted = (err as Error)?.name === "AbortError";
+      const message = aborted
+        ? "Folder download cancelled."
+        : err instanceof Error
+          ? `${err.message}`
+          : "Folder download failed.";
+      showNotice(false, message);
+    } finally {
+      zipAbortRef.current = null;
+      setZipJob(null);
     }
   };
 
@@ -512,6 +607,17 @@ export function SftpBrowserSession({
             />
             <button
               type="button"
+              onClick={() => void handleDownloadFolder(null)}
+              disabled={Boolean(zipJob)}
+              className="flex items-center gap-1.5 rounded-lg border border-sky-500/30 bg-sky-500/10 px-2.5 py-1.5 text-xs font-medium text-sky-300 transition hover:bg-sky-500/20 disabled:opacity-50"
+              title="Download the current folder as a .zip archive"
+            >
+              <FolderDown className="h-3.5 w-3.5" />
+              <span className="hidden sm:inline">Download ZIP</span>
+            </button>
+
+            <button
+              type="button"
               onClick={() => fileInputRef.current?.click()}
               disabled={uploading}
               className="flex items-center gap-1.5 rounded-lg bg-sky-500 px-3 py-1.5 text-xs font-semibold text-slate-950 transition hover:bg-sky-400 disabled:opacity-50"
@@ -602,6 +708,39 @@ export function SftpBrowserSession({
           </div>
         </div>
       </div>
+
+      {/* Folder → ZIP progress */}
+      {zipJob && (
+        <div className="flex items-center gap-2 border-b border-sky-500/20 bg-sky-500/10 px-4 py-2 text-[11px] text-sky-200">
+          <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin" />
+          <span className="min-w-0 flex-1 truncate">
+            Zipping{" "}
+            <span className="font-mono-code text-sky-100">{zipJob.label}</span>{" "}
+            {formatBytes(zipJob.received)} streamed
+            {zipJob.total
+              ? ` of ${formatBytes(zipJob.total)} of files`
+              : ""}
+            {zipJob.files > 0 && ` • ${zipJob.files} file(s)`}
+          </span>
+          {zipJob.total > 0 && (
+            <span className="hidden w-32 shrink-0 overflow-hidden rounded-full bg-sky-900/60 sm:block">
+              <span
+                className="block h-1.5 rounded-full bg-sky-400 transition-[width]"
+                style={{
+                  width: `${Math.min(100, Math.round((zipJob.received / Math.max(1, zipJob.total)) * 100))}%`,
+                }}
+              />
+            </span>
+          )}
+          <button
+            type="button"
+            onClick={() => zipAbortRef.current?.abort()}
+            className="flex shrink-0 items-center gap-1 rounded-md border border-sky-400/30 px-2 py-0.5 text-sky-200 transition hover:bg-sky-500/20"
+          >
+            <Ban className="h-3 w-3" /> Cancel
+          </button>
+        </div>
+      )}
 
       {/* Inline Quick Prompts (New Folder / New File) */}
       {mkdirName !== null && (
@@ -812,6 +951,17 @@ export function SftpBrowserSession({
 
                     <td className="py-2 pl-3 pr-4 text-right">
                       <div className="inline-flex items-center justify-end gap-1 opacity-80 transition group-hover:opacity-100">
+                        {isDir && (
+                          <button
+                            type="button"
+                            onClick={() => void handleDownloadFolder(entry)}
+                            disabled={Boolean(zipJob)}
+                            className="rounded-md p-1 text-slate-400 hover:bg-white/8 hover:text-sky-300 disabled:opacity-40"
+                            title="Download folder as .zip"
+                          >
+                            <FolderDown className="h-3.5 w-3.5" />
+                          </button>
+                        )}
                         {!isDir && (
                           <>
                             <button

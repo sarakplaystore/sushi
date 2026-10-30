@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import crypto from "node:crypto";
+import fs from "node:fs";
+import { PassThrough } from "node:stream";
+import zlib from "node:zlib";
 import http from "node:http";
 import net from "node:net";
 import { Server as SshServer, utils as sshUtils } from "ssh2";
@@ -16,6 +19,14 @@ import {
   testSshConnection,
 } from "../src/lib/server/ssh-client";
 import { probeRdpServer } from "../src/lib/server/rdp-probe";
+import type { ConnectionCredentials } from "../src/types/connection";
+import {
+  SftpZipLimitError,
+  collectRemoteTree,
+  dosDateTime,
+  writeZipFromTree,
+  type RemoteTree,
+} from "../src/lib/server/sftp-zip";
 import {
   encodeGuacForBrowser,
   encodeGuacForDaemon,
@@ -94,6 +105,85 @@ interface MemNode {
   mode: number;
   content: Buffer;
   mtime: number;
+}
+
+
+interface ParsedZipEntry {
+  name: string;
+  method: number;
+  crc: number;
+  compressedSize: number;
+  uncompressedSize: number;
+  externalAttributes: number;
+  data: Buffer;
+}
+
+/**
+ * Independent ZIP reader used by the tests: locates the central directory,
+ * inflates every entry and checks its CRC, so a broken writer cannot pass.
+ */
+function parseZipEntries(buf: Buffer): ParsedZipEntry[] {
+  const eocdOffset = buf.lastIndexOf(Buffer.from([0x50, 0x4b, 0x05, 0x06]));
+  assert.ok(eocdOffset >= 0, "EOCD record present");
+  const total = buf.readUInt16LE(eocdOffset + 10);
+  const cdOffset = buf.readUInt32LE(eocdOffset + 16);
+  const entries: ParsedZipEntry[] = [];
+  let cursor = cdOffset;
+
+  for (let i = 0; i < total; i += 1) {
+    assert.equal(buf.readUInt32LE(cursor), 0x02014b50, "central header signature");
+    const method = buf.readUInt16LE(cursor + 10);
+    const crc = buf.readUInt32LE(cursor + 16);
+    const compressedSize = buf.readUInt32LE(cursor + 20);
+    const uncompressedSize = buf.readUInt32LE(cursor + 24);
+    const nameLen = buf.readUInt16LE(cursor + 28);
+    const extraLen = buf.readUInt16LE(cursor + 30);
+    const commentLen = buf.readUInt16LE(cursor + 32);
+    const externalAttributes = buf.readUInt32LE(cursor + 38);
+    const localOffset = buf.readUInt32LE(cursor + 42);
+    const name = buf.subarray(cursor + 46, cursor + 46 + nameLen).toString("utf8");
+
+    assert.equal(buf.readUInt32LE(localOffset), 0x04034b50, "local header signature");
+    const localNameLen = buf.readUInt16LE(localOffset + 26);
+    const localExtraLen = buf.readUInt16LE(localOffset + 28);
+    const dataStart = localOffset + 30 + localNameLen + localExtraLen;
+    const raw = buf.subarray(dataStart, dataStart + compressedSize);
+    const data = method === 8 ? zlib.inflateRawSync(raw) : Buffer.from(raw);
+
+    assert.equal(data.length, uncompressedSize, `uncompressed size of ${name}`);
+    assert.equal(
+      (zlib as typeof zlib & { crc32: (d: Buffer) => number }).crc32(data),
+      crc >>> 0,
+      `crc32 of ${name}`
+    );
+
+    entries.push({
+      name,
+      method,
+      crc,
+      compressedSize,
+      uncompressedSize,
+      externalAttributes,
+      data,
+    });
+    cursor += 46 + nameLen + extraLen + commentLen;
+  }
+  return entries;
+}
+
+/** Streams a remote tree into a ZIP buffer (what /api/sftp/download-zip does). */
+async function zipTreeToBuffer(
+  creds: ConnectionCredentials,
+  tree: RemoteTree
+): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  const sink = new PassThrough();
+  sink.on("data", (chunk: Buffer) => chunks.push(Buffer.from(chunk)));
+  const done = new Promise<void>((resolve) => sink.on("end", () => resolve()));
+  await writeZipFromTree(creds, tree, sink);
+  sink.end();
+  await done;
+  return Buffer.concat(chunks);
 }
 
 async function runTests() {
@@ -557,6 +647,111 @@ async function runTests() {
   await sftpDeleteItem(creds, "/configs");
   const listAfterDel = await sftpListDirectory(creds, "/");
   assert.equal(listAfterDel.entries.some((e) => e.name === "configs"), false);
+
+  // Folder download: SFTP tree walk + streaming ZIP (works without a remote shell).
+  console.log("==> [2b] Testing folder → ZIP download (SFTP walk + streaming archive)...");
+  await sftpMakeDir(creds, "/projects");
+  await sftpMakeDir(creds, "/projects/src");
+  await sftpMakeDir(creds, "/projects/empty");
+  const readme = Buffer.from("# Sushi projects\n");
+  const indexTs = Buffer.from("export const ok = true;\n");
+  const bigFile = Buffer.from("abcdefghij".repeat(20000));
+  await sftpWriteBuffer(creds, "/projects/README.md", readme);
+  await sftpWriteBuffer(creds, "/projects/src/index.ts", indexTs);
+  await sftpWriteBuffer(creds, "/projects/src/big.txt", bigFile);
+
+  const tree = await collectRemoteTree(creds, "/projects");
+  assert.equal(tree.rootPath, "/projects");
+  assert.equal(tree.rootName, "projects");
+  assert.equal(tree.fileCount, 3);
+  assert.equal(tree.directoryCount, 2);
+  assert.equal(tree.totalBytes, readme.length + indexTs.length + bigFile.length);
+  assert.equal(tree.skippedSymlinks, 0);
+
+  const archive = await zipTreeToBuffer(creds, tree);
+  assert.ok(archive.length > 0);
+  const zipEntries = parseZipEntries(archive);
+  const names = zipEntries.map((e) => e.name).sort();
+  assert.deepEqual(names, [
+    "README.md",
+    "empty/",
+    "src/",
+    "src/big.txt",
+    "src/index.ts",
+  ]);
+
+  const byName = new Map(zipEntries.map((e) => [e.name, e]));
+  assert.equal(byName.get("README.md")?.data.toString("utf8"), "# Sushi projects\n");
+  assert.equal(byName.get("src/index.ts")?.data.toString("utf8"), "export const ok = true;\n");
+  assert.equal(byName.get("src/big.txt")?.data.length, bigFile.length);
+  assert.equal(byName.get("src/big.txt")?.data.equals(bigFile), true);
+  // Deflate actually compresses the repetitive file
+  assert.ok(
+    (byName.get("src/big.txt")?.compressedSize ?? 0) < bigFile.length / 2,
+    "repetitive file is compressed"
+  );
+  // Directories keep their UNIX directory bit so unzip recreates empty folders
+  assert.equal(((byName.get("empty/")?.externalAttributes ?? 0) >>> 28) & 0xf, 0o4);
+
+  // A real unzip implementation must accept the archive (skipped if unavailable)
+  if (spawnSync("unzip", ["-v"], { stdio: "ignore" }).status === 0) {
+    const tmpZip = `/tmp/sushi-folder-${Date.now()}.zip`;
+    fs.writeFileSync(tmpZip, archive);
+    const check = spawnSync("unzip", ["-t", tmpZip], { encoding: "utf8" });
+    assert.equal(check.status, 0, `unzip -t accepts the archive: ${check.stdout}${check.stderr}`);
+    const listing = spawnSync("unzip", ["-Z1", tmpZip], { encoding: "utf8" });
+    assert.match(listing.stdout, /src\/index\.ts/);
+    const extractDir = `/tmp/sushi-folder-${Date.now()}`;
+    fs.mkdirSync(extractDir, { recursive: true });
+    spawnSync("unzip", ["-q", tmpZip, "-d", extractDir], { encoding: "utf8" });
+    assert.equal(
+      fs.readFileSync(`${extractDir}/src/index.ts`, "utf8"),
+      "export const ok = true;\n"
+    );
+    assert.equal(fs.existsSync(`${extractDir}/empty`), true);
+    fs.rmSync(tmpZip, { force: true });
+    fs.rmSync(extractDir, { recursive: true, force: true });
+  }
+
+  // ZIP timestamps survive a round-trip (DOS 2-second granularity)
+  const stamp = dosDateTime(Date.UTC(2024, 4, 17, 12, 34, 56));
+  assert.ok(stamp.date > 0 && stamp.time > 0);
+
+  // Limits: too many files / too large are rejected before streaming starts
+  await assert.rejects(
+    () =>
+      collectRemoteTree(creds, "/projects", {
+        maxFiles: 2,
+        maxDepth: 24,
+        maxTotalBytes: 1 << 30,
+      }),
+    (err: unknown) => err instanceof SftpZipLimitError && err.code === "too-many-files"
+  );
+  await assert.rejects(
+    () =>
+      collectRemoteTree(creds, "/projects", {
+        maxFiles: 100,
+        maxDepth: 24,
+        maxTotalBytes: 16,
+      }),
+    (err: unknown) => err instanceof SftpZipLimitError && err.code === "too-large"
+  );
+  await assert.rejects(
+    () =>
+      collectRemoteTree(creds, "/projects", {
+        maxFiles: 100,
+        maxDepth: 0,
+        maxTotalBytes: 1 << 30,
+      }),
+    (err: unknown) => err instanceof SftpZipLimitError && err.code === "too-deep"
+  );
+  // Archiving a plain file is rejected with a helpful message
+  await assert.rejects(
+    () => collectRemoteTree(creds, "/hello.txt"),
+    /not a folder/
+  );
+
+  await sftpDeleteItem(creds, "/projects");
 
   console.log("==> [3/8] Testing MS-RDPBCGR X.224 RDP Server Probe...");
   const rdpMock = net.createServer((sock) => {

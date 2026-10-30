@@ -31,3 +31,11 @@ export function splitEmittable(buffer: string): [emit: string, hold: string] {
   if (holdFrom > 0 && buffer[holdFrom - 1] === "\r") holdFrom--;
   return [buffer.slice(0, holdFrom), buffer.slice(holdFrom)];
 }
+
+/**
+ * Output that usually means a command is sitting on a question it wants answered
+ * (`[Y/n]`, `(yes/no)`, a password prompt at the end of the line). Used to offer the
+ * user an answer affordance and to replay a typed answer into a re-run command.
+ */
+export const PROMPT_HINT_RE =
+  /\[[Yy]\/[Nn]\]|\(yes\/no\)|\[[Yy]\/N\]|\[y\/N\]|password[^\n]{0,30}:\s*$/i;

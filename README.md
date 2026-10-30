@@ -145,7 +145,7 @@ Clicking the folder icon in the **Actions** column downloads that folder as `<fo
 | `vim`/`top`/`less`/`tmux` don't run on Vercel | Serverless SSH runs each command on its own. When live input is available (see *Answering prompts* below) simple interactive programs work but nothing can resize or re-enter full-screen mode, so a live PTY is still better: self-hosted Sushi or **Attach VPS Gateway**. These always work in the Vercel terminal: `cat`, `tail -n 100`, `sed -i`, `top -bn1`, `systemctl status`, `journalctl -n 50`, `git log`. |
 | `su` says it needs the root password (Vercel) | `su` wants the *root account's* password. Use `sudo su` instead: Sushi asks for **your** sudo password (on NOPASSWD hosts it switches instantly). |
 | `Download ZIP` fails with "is not a folder" | The path is a file or a symlink to a file — use the single-file download button (or open its folder and archive that). |
-| A command sits on `Do you want to continue? [Y/n]` / `Password:` and nothing can be typed (Vercel) | Sushi detects the question and shows a bar above the terminal with **Answer y & retry** and **Stop**. In Chrome/Edge on HTTPS, keystrokes go straight to the running command instead. Otherwise answer up front: `apt install -y docker`, `ssh-keygen -f ~/.ssh/id_ed25519 -N ''`, `debconf-set-selections` … |
+| A command sits on `Do you want to continue? [Y/n]` / `Password:` (Vercel) | Type the answer in the terminal and press Enter (or click **Yes (y)** / **No (n)**): Sushi re-runs the command with your answer piped in. To avoid the question entirely use `apt install -y docker`, `ssh-keygen -f ~/.ssh/id_ed25519 -N ''`, `DEBIAN_FRONTEND=noninteractive`. |
 | `Download ZIP` fails with "contains more than 20 000 files" / "larger than 2.0 GB" / "nested deeper than 24 levels" | Sushi stopped a runaway archive before streaming it. Download a sub-folder, or `tar -czf` / `rsync` the tree over SSH. |
 
 ### Root access (`sudo su`) in the Vercel terminal
@@ -166,20 +166,22 @@ emulates it:
 ### Answering prompts in the Vercel terminal (`[Y/n]`, passwords, …)
 
 Serverless SSH runs one command per request, so there is no PTY to type into. Sushi gives you three
-ways to get past a question instead of being stuck at it:
+ways past a question:
 
-1. **Type it** — when the browser and connection support streamed request bodies (Chrome/Edge over
-   HTTPS/HTTP2), the running command's stdin is live: keystrokes reach `apt`, `read`, `ssh-keygen`,
-   even `python3`. The header shows a **Live input** badge when this is active.
-2. **Answer y & retry** — if live typing isn't available, a detected question shows a bar with
-   **Answer y & retry**, which stops the stuck command and re-runs it with `y` piped into its stdin
-   (the same thing `yes | apt install …` does), plus **Stop** to cancel it.
-3. **Non-interactive flags** — the safest habit on Vercel: `apt install -y`, `apt-get -y`,
-   `ssh-keygen -N ''`, `DEBIAN_FRONTEND=noninteractive`, `debconf-set-selections`.
+1. **Type it.** When a command asks something, type the answer in the terminal and press **Enter**:
+   Sushi stops the stuck command and re-runs it with what you typed piped into its stdin — `y` really
+   answers `[Y/n]`, `n` aborts, an empty line takes the default. **Yes (y)** / **No (n)** buttons do
+   the same with one click. Typing something that isn't an answer runs it as a new command instead, so
+   a busy terminal never locks you out.
+2. **Live typing** (Chrome/Edge over HTTPS): the running command's stdin is connected, so keystrokes
+   reach it directly — `apt`, `read`, `ssh-keygen`, even `python3`. The header shows **Live input**.
+3. **Non-interactive flags** — the safest habit: `apt install -y`, `apt-get -y`, `ssh-keygen -N ''`,
+   `DEBIAN_FRONTEND=noninteractive`, `debconf-set-selections`.
 
-Commands that never get an answer no longer hang: stdin is closed shortly after start, so `read`
-and friends fail fast and the terminal is usable again immediately. Ctrl+C sends a real SIGINT to
-the remote command (it cleans up like a normal interrupt) and always leaves the session healthy.
+Ctrl+C sends a real SIGINT when stdin is live and cancels the request otherwise, and always leaves the
+session healthy. Output is streamed the whole time, so you can see what the command is doing while you
+decide. After a deployment, an open tab shows a **Reload** banner instead of silently keeping the old
+build.
 
 Supported private keys: OpenSSH (`BEGIN OPENSSH PRIVATE KEY`, incl. passphrase-protected), PEM
 (`BEGIN RSA/EC PRIVATE KEY`, incl. encrypted), **PKCS#8** (`BEGIN PRIVATE KEY` /

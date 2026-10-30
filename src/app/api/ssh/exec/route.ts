@@ -3,7 +3,7 @@ import { NextRequest, NextResponse } from "next/server";
 import type { ConnectionCredentials } from "@/types/connection";
 import { connectSsh, shellQuote } from "@/lib/server/ssh-client";
 import { getCorsHeaders, verifyRequestAccess } from "@/lib/server/security";
-import { META_REGEX, splitEmittable } from "@/lib/server/exec-stream";
+import { META_REGEX, PROMPT_HINT_RE, splitEmittable } from "@/lib/server/exec-stream";
 import { pumpExecInput, readExecStart } from "@/lib/server/exec-input";
 import {
   buildExecScript,
@@ -17,8 +17,6 @@ export const dynamic = "force-dynamic";
 // so give the exec the full window the platform allows instead of cutting it at 60 s.
 export const maxDuration = 300;
 
-/** Output that usually means the command is sitting on a question. */
-const PROMPT_HINT_RE = /\[[Yy]\/[Nn]\]|\(yes\/no\)|\[[Yy]\/N\]|\[y\/N\]|password[^\n]{0,30}:\s*$/i;
 
 export async function OPTIONS(req: NextRequest) {
   return new NextResponse(null, {
@@ -268,15 +266,27 @@ export async function POST(req: NextRequest) {
               };
               // A question probably showed up: answer it now. Otherwise answer after
               // ~1 s so slow starters (`apt` printing package lists) still get it.
+              let promptAnnounced = false;
               const maybeAnswerPrompt = (text: string) => {
-                if (PROMPT_HINT_RE.test(text)) writePipedInput();
+                if (!PROMPT_HINT_RE.test(text)) return;
+                if (pipedInput) {
+                  writePipedInput();
+                  return;
+                }
+                // Let the UI show an answer bar / enable typed answers right away.
+                if (!promptAnnounced && !inputReader) {
+                  promptAnnounced = true;
+                  sendEvent({ type: "prompt", kind: "input" });
+                }
               };
               const pipedFallback = pipedInput ? setTimeout(writePipedInput, 1000) : null;
 
               // Without live keystrokes, a command that reads stdin would wait forever
-              // (a PTY never reports EOF on its own). Close stdin once the piped answer
-              // is in, so `read`/`apt` behave like they do in a pipe instead of hanging
-              // until the function timeout.
+              // (a PTY never reports EOF on its own), so stdin is closed eventually to
+              // keep the terminal usable. The window matters: the user needs time to
+              // type an answer, which Sushi replays by re-running the command with that
+              // answer piped in. A piped answer only needs a moment; an unanswerable
+              // prompt gets a generous grace period instead of being killed instantly.
               const stdinCloseTimer =
                 inputReader || feedPassword
                   ? null
@@ -291,7 +301,7 @@ export async function POST(req: NextRequest) {
                       } catch {
                         // channel already gone
                       }
-                    }, pipedInput ? 1800 : 1200);
+                    }, pipedInput ? 2500 : 20000);
 
               const flushText = (text: string) => {
                 if (!text) return;
@@ -302,7 +312,7 @@ export async function POST(req: NextRequest) {
               };
 
               ch.on("data", (chunk: Buffer) => {
-                if (pipedInput) maybeAnswerPrompt(chunk.toString("utf8"));
+                maybeAnswerPrompt(chunk.toString("utf8"));
                 carry += utf8.write(chunk);
                 const match = META_REGEX.exec(carry);
                 if (match) {

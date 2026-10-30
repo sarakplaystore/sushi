@@ -161,7 +161,12 @@ export function SshTerminalSession({
   /** True when keystrokes reach the running command's stdin. */
   const [canTypeWhileRunning, setCanTypeWhileRunning] = useState(false);
   /** The command behind the current prompt, so it can be re-run with an answer. */
-  const [pendingCommand, setPendingCommand] = useState<string | null>(null);
+  const pendingCommandRef = useRef<string | null>(null);
+  /** Local line buffer used while a command runs with no live stdin channel. */
+  const busyInputRef = useRef<string>("");
+  /** True while the running command is (probably) waiting for an answer. */
+  const awaitingAnswerRef = useRef(false);
+  const [awaitingAnswer, setAwaitingAnswer] = useState(false);
 
   // Refs used inside xterm.onData closure for Serverless Streaming Shell mode
   const modeRef = useRef<"ws" | "serverless">(wsAvailable ? "ws" : "serverless");
@@ -614,7 +619,7 @@ export function SshTerminalSession({
         let promptHintShown = false;
         let outputTail = "";
         let canType = false;
-        setPendingCommand(rawCmd);
+        pendingCommandRef.current = rawCmd;
         const result = await execServerless(commandToRun, {
           elevateUser,
           password,
@@ -634,14 +639,20 @@ export function SshTerminalSession({
               : CONFIRM_PROMPT_RE.test(outputTail)
                 ? "confirm"
                 : null;
-            if (kind) setLivePrompt({ kind, canType });
+            if (kind) {
+              setLivePrompt({ kind, canType });
+              awaitingAnswerRef.current = true;
+              setAwaitingAnswer(true);
+            }
 
             if (promptHintShown) return;
             if (!kind) return;
             promptHintShown = true;
             if (canType) return; // the answer bar is live; no scary warning needed
             term.write(
-              "\r\n\x1b[33m↳ This command is waiting for an answer, and this browser can't stream keystrokes to it. Press Ctrl+C (or the Stop button) to cancel, or re-run it non-interactively (e.g. `apt install -y …`). Chrome, Edge and other Chromium browsers let you answer it directly.\x1b[0m\r\n"
+              "\r\n\x1b[33m↳ Waiting for your answer — type it here and press Enter " +
+                "(e.g. y or n), or click Yes / No above. Sushi re-runs the command with " +
+                "your answer. Ctrl+C cancels it.\x1b[0m\r\n"
             );
           },
         });
@@ -658,6 +669,9 @@ export function SshTerminalSession({
           if (result.exitCode === 0) sudoPasswordRef.current = options.password;
         }
       } finally {
+        awaitingAnswerRef.current = false;
+        setAwaitingAnswer(false);
+        busyInputRef.current = "";
         setExecBusy(false);
         // When a password prompt was started, the prompt itself is the cursor
         if (!secretPromptRef.current) writePrompt(term);
@@ -665,6 +679,61 @@ export function SshTerminalSession({
     },
     [askSudoPassword, enterRootMode, execServerless, profile.username, probeElevation, writePrompt]
   );
+
+  /**
+   * Enter while a command is running without a live stdin channel.
+   *
+   * The stuck command cannot be typed into, so Sushi cancels it and re-runs it with
+   * the typed line piped into stdin — the same result `printf 'y\\n' | apt install …`
+   * has. A line typed when no question is pending simply replaces the command, so the
+   * terminal is never wedged.
+   */
+  const submitWhileBusy = useCallback(
+    (line: string) => {
+      const term = termRef.current;
+      const answer = line.replace(/\s+$/, "");
+      const command = pendingCommandRef.current;
+      const awaiting = awaitingAnswerRef.current;
+
+      if (!awaiting && !answer) return;
+
+      // Stop the running exec first: its stdin is out of reach.
+      abortExecRef.current?.abort();
+      awaitingAnswerRef.current = false;
+      setAwaitingAnswer(false);
+      setLivePrompt(null);
+
+      // The aborted command redraws the prompt in its own cleanup, so start the new
+      // output on a fresh line a moment later instead of gluing it to that prompt.
+      const rerun = (fn: () => void) => {
+        setTimeout(() => {
+          term?.write("\r\n");
+          fn();
+        }, 120);
+      };
+
+      if (awaiting && command) {
+        term?.writeln(
+          `\x1b[90m↳ answering "${answer || "Enter"}" and re-running the command…\x1b[0m`
+        );
+        rerun(() => void runServerlessCommand(command, { stdin: `${answer}\r` }));
+        return;
+      }
+
+      const next = answer.trim();
+      if (next) {
+        term?.writeln(`\x1b[90m↳ stopping the running command…\x1b[0m`);
+        rerun(() => void runServerlessCommand(next));
+      }
+    },
+    [runServerlessCommand]
+  );
+
+  const submitWhileBusyRef = useRef(submitWhileBusy);
+  useEffect(() => {
+    submitWhileBusyRef.current = submitWhileBusy;
+  }, [submitWhileBusy]);
+
 
   // Initialize xterm and transport session
   useEffect(() => {
@@ -801,6 +870,7 @@ export function SshTerminalSession({
               // Real SIGINT so the remote command cleans up after itself.
               stdin.sendSignal("INT");
             } else {
+              busyInputRef.current = "";
               abortExecRef.current?.abort();
             }
             return;
@@ -808,6 +878,34 @@ export function SshTerminalSession({
           if (stdin?.canSendInput) {
             // No local echo here — the remote PTY echoes what we type.
             stdin.sendInput(data);
+            return;
+          }
+
+          // No live channel (HTTP/1.1, Safari, …): let the user type a line anyway.
+          // Enter replays the stuck command with that line piped into its stdin, so
+          // typing `y` really does answer `[Y/n]`; anything else replaces the command.
+          for (let i = 0; i < data.length; i += 1) {
+            const ch = data[i];
+            if (ch === "\r" || ch === "\n") {
+              const line = busyInputRef.current;
+              busyInputRef.current = "";
+              term.write("\r\n");
+              submitWhileBusyRef.current(line);
+            } else if (ch === "\x7f" || ch === "\b") {
+              if (busyInputRef.current.length > 0) {
+                busyInputRef.current = busyInputRef.current.slice(0, -1);
+                term.write("\b \b");
+              }
+            } else if (ch === "\x15") {
+              const len = busyInputRef.current.length;
+              if (len > 0) {
+                term.write("\b \b".repeat(len));
+                busyInputRef.current = "";
+              }
+            } else if (ch >= " ") {
+              busyInputRef.current += ch;
+              term.write(ch);
+            }
           }
           return;
         }
@@ -1376,16 +1474,22 @@ export function SshTerminalSession({
               ? livePrompt.kind === "password"
                 ? "This command is asking for a password — type it below."
                 : livePrompt.kind === "confirm"
-                  ? "This command is waiting for an answer — type it, or pick one:"
+                  ? canTypeWhileRunning
+                    ? "Waiting for an answer — type it, or pick one:"
+                    : "Waiting for an answer — type it and press Enter, or pick one:"
                   : "Waiting for input…"
               : "Command running — keystrokes go to it; Ctrl+C interrupts."}
           </span>
 
-          {livePrompt && canTypeWhileRunning && (
+          {livePrompt && (
             <span className="flex items-center gap-1">
               <button
                 type="button"
-                onClick={() => void sendTerminalInput(livePrompt.kind === "confirm" ? "y\r" : "\r")}
+                onClick={() =>
+                  canTypeWhileRunning
+                    ? void sendTerminalInput(livePrompt.kind === "confirm" ? "y\r" : "\r")
+                    : submitWhileBusy(livePrompt.kind === "confirm" ? "y" : "")
+                }
                 className="rounded-md border border-emerald-400/40 bg-emerald-500/15 px-2 py-0.5 font-semibold text-emerald-200 transition hover:bg-emerald-500/30"
                 title={livePrompt.kind === "confirm" ? "Answer yes" : "Press Enter"}
               >
@@ -1394,7 +1498,11 @@ export function SshTerminalSession({
               {livePrompt.kind === "confirm" && (
                 <button
                   type="button"
-                  onClick={() => void sendTerminalInput("n\r")}
+                  onClick={() =>
+                    canTypeWhileRunning
+                      ? void sendTerminalInput("n\r")
+                      : submitWhileBusy("n")
+                  }
                   className="rounded-md border border-white/15 px-2 py-0.5 text-amber-100 transition hover:bg-white/10"
                   title="Answer no"
                 >
@@ -1415,36 +1523,24 @@ export function SshTerminalSession({
         </div>
       )}
 
-      {transportMode === "serverless" && running && livePrompt && !canTypeWhileRunning && (
-        <div className="flex flex-wrap items-center gap-2 border-b border-amber-500/20 bg-[#141019] px-4 py-1.5 text-[11px] text-amber-200/90">
-          <span className="min-w-0 flex-1">
-            Live typing isn&apos;t available on this connection, so this command is stuck at
-            its question. Sushi can stop it and re-run it with{" "}
-            <span className="font-mono-code">{livePrompt.kind === "confirm" ? "y" : "Enter"}</span>{" "}
-            already piped in — or just answer it yourself next time with{" "}
-            <span className="font-mono-code">
-              {livePrompt.kind === "confirm" ? "apt install -y …" : "ssh-keygen -N '' …"}
+      {transportMode === "serverless" &&
+        (running || awaitingAnswer) &&
+        livePrompt &&
+        !canTypeWhileRunning && (
+          <div className="flex flex-wrap items-center gap-2 border-b border-sky-500/20 bg-[#101621] px-4 py-1.5 text-[11px] text-sky-100/90">
+            <span className="min-w-0 flex-1">
+              Type your answer in the terminal and press{" "}
+              <span className="font-semibold">Enter</span> — Sushi stops the stuck command
+              and re-runs it with what you typed (so <span className="font-mono-code">y</span>{" "}
+              answers <span className="font-mono-code">[Y/n]</span>). You can also just type
+              a different command. Next time, avoid the question with{" "}
+              <span className="font-mono-code">
+                {livePrompt.kind === "confirm" ? "apt install -y …" : "ssh-keygen -N '' …"}
+              </span>
+              .
             </span>
-            .
-          </span>
-          {livePrompt.kind === "confirm" && pendingCommand && (
-            <button
-              type="button"
-              onClick={() => {
-                const command = pendingCommand;
-                stopRunningCommand();
-                setLivePrompt(null);
-                setTimeout(() => {
-                  void runServerlessCommand(command, { stdin: "y\n" });
-                }, 60);
-              }}
-              className="shrink-0 rounded-md border border-emerald-400/40 bg-emerald-500/15 px-2 py-0.5 font-semibold text-emerald-200 transition hover:bg-emerald-500/30"
-            >
-              Answer y &amp; retry
-            </button>
-          )}
-        </div>
-      )}
+          </div>
+        )}
 
       {/* Optional Search Bar */}
       {showSearch && (

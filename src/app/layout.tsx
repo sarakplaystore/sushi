@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import BuildUpdateBanner from "@/components/BuildUpdateBanner";
 import "./globals.css";
 
 export const metadata: Metadata = {
@@ -16,6 +17,7 @@ export default function RootLayout({
     <html lang="en" className="dark h-full">
       <body className="h-full overflow-hidden bg-[#090b10] text-slate-100 antialiased selection:bg-[#ff6b57]/30 selection:text-white">
         {children}
+        <BuildUpdateBanner />
       </body>
     </html>
   );

@@ -172,16 +172,19 @@ ways past a question:
    Sushi stops the stuck command and re-runs it with what you typed piped into its stdin — `y` really
    answers `[Y/n]`, `n` aborts, an empty line takes the default. **Yes (y)** / **No (n)** buttons do
    the same with one click. Typing something that isn't an answer runs it as a new command instead, so
-   a busy terminal never locks you out.
-2. **Live typing** (Chrome/Edge over HTTPS): the running command's stdin is connected, so keystrokes
-   reach it directly — `apt`, `read`, `ssh-keygen`, even `python3`. The header shows **Live input**.
+   a busy terminal never locks you out. This works in every browser.
+2. **Live typing**, where the platform allows it: if the browser can stream a request body *and* the
+   connection is HTTP/2 (Chrome/Edge on HTTPS), the running command's stdin is connected and
+   keystrokes reach it directly — the header then shows **Live input**. Browsers that report
+   *"ReadableStream uploading is not supported"* (Firefox, Safari) are detected before any request is
+   sent, and a deployment that buffers request bodies is detected within a few seconds; both simply
+   fall back to (1) with no error in the terminal.
 3. **Non-interactive flags** — the safest habit: `apt install -y`, `apt-get -y`, `ssh-keygen -N ''`,
    `DEBIAN_FRONTEND=noninteractive`, `debconf-set-selections`.
 
 Ctrl+C sends a real SIGINT when stdin is live and cancels the request otherwise, and always leaves the
-session healthy. Output is streamed the whole time, so you can see what the command is doing while you
-decide. After a deployment, an open tab shows a **Reload** banner instead of silently keeping the old
-build.
+session healthy. After a deployment, an open tab shows a **Reload** banner instead of silently keeping
+the old build.
 
 Supported private keys: OpenSSH (`BEGIN OPENSSH PRIVATE KEY`, incl. passphrase-protected), PEM
 (`BEGIN RSA/EC PRIVATE KEY`, incl. encrypted), **PKCS#8** (`BEGIN PRIVATE KEY` /

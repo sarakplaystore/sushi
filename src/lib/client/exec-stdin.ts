@@ -40,31 +40,46 @@ export function canStreamExecStdin(): boolean {
   return supportsStreamingRequestBody() && streamingTransportAvailable();
 }
 
-/** True when this browser can send a `ReadableStream` as a fetch request body. */
+/**
+ * True when this browser can send a `ReadableStream` as a fetch request body.
+ *
+ * The probe rejects an engine for either of two reasons, both of which are checked
+ * without any network traffic:
+ *
+ *  - constructing the Request throws (Chromium < 105: "duplex option is required");
+ *  - the engine silently ignores `duplex`, i.e. it has no support for request
+ *    streams at all. Firefox does exactly this and then fails at fetch time with
+ *    "ReadableStream uploading is not supported"; Safari behaves the same way for
+ *    a request body it cannot stream. Requiring `request.duplex === "half"` keeps
+ *    those browsers on the plain JSON path instead of surfacing that error.
+ */
 export function supportsStreamingRequestBody(): boolean {
   if (cachedSupport !== null) return cachedSupport;
   if (typeof window === "undefined" || typeof ReadableStream === "undefined") {
     cachedSupport = false;
     return false;
   }
+  let probeBody: ReadableStream<Uint8Array> | null = null;
   try {
-    const probe = new ReadableStream<Uint8Array>({
+    probeBody = new ReadableStream<Uint8Array>({
       start(controller) {
         controller.close();
       },
     });
     const init: DuplexRequestInit = {
       method: "POST",
-      body: probe,
+      body: probeBody,
       duplex: "half",
     };
-    // Constructing the Request is the capability test: engines that cannot stream
-    // request bodies throw here ("duplex option is required", "body stream not
-    // supported", ...) without any network traffic.
-    new Request("http://localhost/", init);
-    cachedSupport = true;
+    const request = new Request("http://localhost/", init) as Request & {
+      duplex?: string;
+    };
+    cachedSupport = request.duplex === "half";
   } catch {
     cachedSupport = false;
+  } finally {
+    // Never leave the probe stream dangling.
+    void probeBody?.cancel().catch(() => {});
   }
   return cachedSupport;
 }

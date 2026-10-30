@@ -48,6 +48,10 @@ import {
   supportsStreamingRequestBody,
 } from "../src/lib/client/exec-stdin";
 import {
+  canSaveStreamToDisk,
+  openArchiveSink,
+} from "../src/lib/client/zip-sink";
+import {
   buildExecScript,
   createSudoAnswerer,
 } from "../src/lib/server/exec-script";
@@ -1622,13 +1626,87 @@ async function runTests() {
   assert.equal(PROMPT_HINT_RE.test("Are you sure (yes/no)? "), true);
   assert.equal(PROMPT_HINT_RE.test("root@host:~# "), false);
 
+  // --- folder download sink (File System Access API vs. blob fallback) ------
+  // The client module reads `window`, so a tiny stub stands in for a browser here.
+  const fakeWindow = { isSecureContext: true } as {
+    isSecureContext: boolean;
+    showSaveFilePicker?: (options?: unknown) => Promise<unknown>;
+  };
+  const realWindow = (globalThis as { window?: unknown }).window;
+  const setWindow = (value: unknown) => {
+    (globalThis as { window?: unknown }).window = value;
+  };
+
+  try {
+    // 1. no picker at all (Safari/Firefox) → in-memory download
+    setWindow(fakeWindow);
+    assert.equal(canSaveStreamToDisk(), false);
+    assert.deepEqual(await openArchiveSink("app.zip"), { kind: "memory" });
+
+    // 2. picker present → chunks are forwarded to the chosen file in order
+    const written: number[] = [];
+    let closed = false;
+    let aborted = false;
+    let suggested: string | undefined;
+    fakeWindow.showSaveFilePicker = async (options?: unknown) => {
+      suggested = (options as { suggestedName?: string })?.suggestedName;
+      return {
+        createWritable: async () => ({
+          write: async (chunk: Uint8Array) => {
+            written.push(chunk.byteLength);
+          },
+          close: async () => {
+            closed = true;
+          },
+          abort: async () => {
+            aborted = true;
+          },
+        }),
+      };
+    };
+    assert.equal(canSaveStreamToDisk(), true);
+    const sink = await openArchiveSink("project.zip");
+    assert.equal(suggested, "project.zip");
+    assert.equal(sink.kind, "stream");
+    if (sink.kind === "stream") {
+      await sink.write(new Uint8Array(10));
+      await sink.write(new Uint8Array(25));
+      await sink.close();
+      await sink.abort();
+    }
+    assert.deepEqual(written, [10, 25], "every chunk reaches the file");
+    assert.equal(closed, true);
+    assert.equal(aborted, true);
+
+    // 3. the user dismisses the save dialog → cancelled, archive never starts
+    fakeWindow.showSaveFilePicker = async () => {
+      const err = new Error("The user aborted a request.");
+      err.name = "AbortError";
+      throw err;
+    };
+    assert.deepEqual(await openArchiveSink("app.zip"), { kind: "cancelled" });
+
+    // 4. picker blocked by policy → fall back instead of failing the download
+    fakeWindow.showSaveFilePicker = async () => {
+      throw new Error("Not allowed");
+    };
+    assert.deepEqual(await openArchiveSink("app.zip"), { kind: "memory" });
+
+    // 5. insecure context never gets a picker prompt
+    fakeWindow.isSecureContext = false;
+    assert.equal(canSaveStreamToDisk(), false);
+    assert.deepEqual(await openArchiveSink("app.zip"), { kind: "memory" });
+  } finally {
+    setWindow(realWindow);
+  }
+
   console.log("==> [9/9] Cleaning up test servers...");
   httpServer.close();
   guacdMock.close();
   rdpMock.close();
   sshServer.close();
   console.log(
-    "ALL AUTH, PASSKEY, KEY WHITELIST, TERMIX, SSH, SFTP, RDP, AND EXEC STDIN E2E TESTS PASSED!"
+    "ALL AUTH, PASSKEY, KEY WHITELIST, TERMIX, SSH, SFTP, RDP, EXEC STDIN, AND FOLDER-DOWNLOAD E2E TESTS PASSED!"
   );
 }
 

@@ -40,6 +40,7 @@ import {
   parseExecInputLine,
   pumpExecInput,
 } from "../src/lib/server/exec-input";
+import { PROMPT_HINT_RE } from "../src/lib/server/exec-stream";
 import {
   __setStreamingRequestBodySupport,
   canStreamExecStdin,
@@ -1596,6 +1597,12 @@ async function runTests() {
     "stdin capability combines browser support and HTTP/2"
   );
   __setStreamingRequestBodySupport(null);
+
+  // --- stdin grace period: an unanswerable prompt is answerable by retry ----
+  // (server side: prompt detection for the `stdin` replay path)
+  assert.equal(PROMPT_HINT_RE.test("Do you want to continue? [Y/n] "), true);
+  assert.equal(PROMPT_HINT_RE.test("Are you sure (yes/no)? "), true);
+  assert.equal(PROMPT_HINT_RE.test("root@host:~# "), false);
 
   console.log("==> [9/9] Cleaning up test servers...");
   httpServer.close();

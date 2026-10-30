@@ -75,19 +75,42 @@ export interface SftpEntry {
   gid: number;
 }
 
+/**
+ * What the remote machine is: distro + version (`Ubuntu 24.04.1 LTS`) and, when it
+ * can be recognised, the cloud provider it is hosted on (`Oracle Cloud`, `AWS EC2`,
+ * `Hetzner Cloud`, `KVM VPS`, …). Shown in the SSH session header after connecting.
+ */
+export interface SshSystemInfo {
+  hostname?: string;
+  /** `PRETTY_NAME` from `/etc/os-release`, e.g. "Ubuntu 24.04.1 LTS". */
+  os?: string;
+  /** `NAME`, e.g. "Ubuntu". */
+  distro?: string;
+  /** `VERSION_ID`, e.g. "24.04". */
+  version?: string;
+  /** `VERSION_CODENAME`, e.g. "noble". */
+  codename?: string;
+  kernel?: string;
+  arch?: string;
+  uptime?: string;
+  load?: string;
+  /** Cores reported by `nproc`. */
+  cpu?: number;
+  memoryMb?: number;
+  /** Human label for the hosting platform ("Oracle Cloud", "KVM VPS", …). */
+  provider?: string;
+  /** Raw platform id (cloud-init datasource id, virtualization type, …). */
+  providerId?: string;
+  /** `systemd-detect-virt` output ("kvm", "none", …). */
+  virtualization?: string;
+}
+
 export interface SshTestResult {
   ok: boolean;
   latencyMs: number;
   serverBanner?: string;
   fingerprint?: string;
-  systemInfo?: {
-    hostname?: string;
-    os?: string;
-    kernel?: string;
-    uptime?: string;
-    load?: string;
-    memory?: string;
-  };
+  systemInfo?: SshSystemInfo;
   error?: string;
 }
 

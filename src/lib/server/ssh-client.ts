@@ -4,10 +4,12 @@ import { Client, type ConnectConfig, type SFTPWrapper, type Attributes } from "s
 import type {
   ConnectionCredentials,
   SftpEntry,
+  SshSystemInfo,
   SshTestResult,
 } from "@/types/connection";
 import net from "node:net";
 import { isPrivateIp, validateTargetHost } from "./security";
+import { SYSINFO_SCRIPT, parseSysinfo } from "./sysinfo";
 import { normalizePrivateKeyForSsh } from "./ssh-key-utils";
 
 export interface ConnectedSshSession {
@@ -297,6 +299,28 @@ function execSimple(client: Client, cmd: string, timeoutMs = 8000): Promise<stri
   });
 }
 
+/**
+ * Opens a short-lived SSH connection just to describe the remote machine.
+ *
+ * Used by the terminal header ("Ubuntu 24.04.1 LTS · Oracle Cloud") and by the host
+ * dialog's "Test SSH Auth", so both report the same thing.
+ */
+export async function fetchSshSystemInfo(
+  creds: ConnectionCredentials
+): Promise<SshSystemInfo | null> {
+  let session: ConnectedSshSession | null = null;
+  try {
+    session = await connectSsh(creds, 12000);
+    const raw = await execSimple(session.client, SYSINFO_SCRIPT, 8000);
+    const info = parseSysinfo(raw);
+    return info.os || info.hostname ? info : null;
+  } catch {
+    return null;
+  } finally {
+    session?.client.end();
+  }
+}
+
 export async function testSshConnection(
   creds: ConnectionCredentials
 ): Promise<SshTestResult> {
@@ -306,33 +330,15 @@ export async function testSshConnection(
     session = await connectSsh(creds, 12000);
     const latencyMs = Date.now() - started;
 
-    const probeScript = [
-      'printf "HOST=%s\\n" "$(hostname 2>/dev/null || uname -n 2>/dev/null)"',
-      'printf "KERNEL=%s\\n" "$(uname -sr 2>/dev/null)"',
-      'printf "OS=%s\\n" "$( ( . /etc/os-release 2>/dev/null && printf "%s" "$PRETTY_NAME" ) || uname -s 2>/dev/null )"',
-      'printf "UPTIME=%s\\n" "$(uptime -p 2>/dev/null || uptime 2>/dev/null | sed "s/^ *//")"',
-    ].join("; ");
-
-    const raw = await execSimple(session.client, probeScript, 6000);
-    const map: Record<string, string> = {};
-    for (const line of raw.split("\n")) {
-      const idx = line.indexOf("=");
-      if (idx > 0) {
-        map[line.slice(0, idx).trim()] = line.slice(idx + 1).trim();
-      }
-    }
+    const raw = await execSimple(session.client, SYSINFO_SCRIPT, 8000);
+    const systemInfo = parseSysinfo(raw);
 
     return {
       ok: true,
       latencyMs,
       fingerprint: session.fingerprint,
       serverBanner: session.serverBanner,
-      systemInfo: {
-        hostname: map.HOST || undefined,
-        kernel: map.KERNEL || undefined,
-        os: map.OS || undefined,
-        uptime: map.UPTIME || undefined,
-      },
+      systemInfo: systemInfo.hostname || systemInfo.os ? systemInfo : undefined,
     };
   } catch (err) {
     return {

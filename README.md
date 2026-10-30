@@ -22,6 +22,7 @@ It is designed around a **Hybrid VPS + Serverless Architecture**:
   - Automatic **Serverless HTTP Streaming Shell** (`/api/ssh/exec`) fallback on Vercel with persistent working directory (`cd`), command history, and Ctrl+C cancellation
   - **Keystroke channel for the serverless shell**: every command gets a private keystroke FIFO on the host, so `[Y/n]` prompts, passwords and full-screen `whiptail`/`debconf`/`ncurses` menus (`Configuring lightdm`, `tasksel`, `nmtui`) are answerable in any browser — with a menu bar that shows the box's real choices and buttons
   - Password, keyboard-interactive (PAM), and PEM/OpenSSH Private Key (`Ed25519`, `RSA`, `ECDSA` + passphrase) authentication
+  - **Distro & cloud badge on connect**: the header names the machine you are on — `Ubuntu 24.04.1 LTS · Oracle Cloud`, `Debian 12 · KVM VPS`, `Rocky Linux 9.4 · AWS EC2` — read in one non-root exec (`/etc/os-release`, cloud-init's `cloud-id`, DMI strings) and cached for five minutes; the **Test SSH Auth** card in *New Connection* shows the same OS, hosting platform and vCPU/RAM before you connect
   - SHA-256 host key fingerprint verification, quick command snippets, scrollback search, and terminal themes
 - **SFTP File Manager (`/api/sftp/*`)**
   - Works identically on **Vercel Serverless** and **VPS**
@@ -137,6 +138,39 @@ ephemeral, or save it — saving creates a separate RDP host and leaves the SSH 
 Live pixels need `guacd` (self-hosted `docker compose`) or an attached VPS gateway; without one the
 tab still gives you the X.224/TLS/NLA probe and a native `.rdp` launcher.
 
+### Which Ubuntu (or Debian, Rocky, …) version is this host?
+
+As soon as an SSH session connects, the header shows a badge next to `user@host:port` with the remote
+distro and version and, where Sushi can tell, the cloud the machine runs on:
+
+| Badge | Means |
+|---|---|
+| `Ubuntu 24.04.1 LTS · Oracle Cloud` | Oracle Cloud instance (cloud-init `oraclecloud`, or `OracleCloud.com` in the DMI data) |
+| `Ubuntu 22.04.5 LTS · AWS EC2` | Amazon EC2 |
+| `Debian 12 · KVM VPS` | A plain KVM/QEMU VPS without a cloud identity |
+| `Rocky Linux 9.4 (Blue Onyx) · Hetzner Cloud` | Hetzner, any distro |
+| `Ubuntu 24.04.1 LTS · VMware` / `· Docker container` | Virtualised, but not on a named cloud |
+
+Hover the badge for kernel/arch, codename, vCPU + RAM and uptime. It is read by
+`/api/ssh/sysinfo`, which runs a single `KEY=value` exec as your **login user** — no root, no extra
+packages, no outbound network from the host:
+
+- `/etc/os-release` → `PRETTY_NAME`, `VERSION_ID`, `VERSION_CODENAME` (so Ubuntu reports `LTS` and the
+  release number exactly as `lsb_release -a` would);
+- `/run/cloud-init/cloud-id` → the provider that booted the image;
+- `/sys/class/dmi/id/*` → `sys_vendor` / `product_name` / `board_vendor` for images without cloud-init;
+- `systemd-detect-virt`, `uname -sr`, `nproc`, `/proc/meminfo`, `/proc/loadavg`.
+
+Recognised clouds: Oracle Cloud, AWS EC2, Google Cloud, Microsoft Azure, DigitalOcean, Hetzner,
+Akamai/Linode, Vultr, Scaleway, OVHcloud, UpCloud, Contabo, netcup, Alibaba, Tencent, Huawei, IBM
+Cloud, Rackspace, Equinix Metal and OpenStack; anything else still shows its hypervisor (`KVM VPS`,
+`VMware`, `Hyper-V`, `Xen`, `LXC`…) or its cloud-init datasource id.
+
+The same probe powers **Test SSH Auth** in *New Connection* (`Remote OS`, `Hosted on`, `Machine`), so
+you can confirm you opened the Ubuntu 22.04 box and not the 24.04 one *before* saving the host. If a
+host's shell is restricted (no `/etc/os-release`, a jailed `rbash`), the badge simply stays hidden and
+connecting still works.
+
 ### Downloading files and folders (SFTP → ZIP)
 
 **Select what you want, then download it.** Every row has a checkbox and the header checkbox selects
@@ -194,6 +228,8 @@ download.
 | `Authentication failed … the server rejected this private key` | Add the key's public half to `~/.ssh/authorized_keys` for that user. |
 | `This private key is passphrase-protected` / `Incorrect passphrase` | Enter (or fix) the key passphrase in the host settings. |
 | An old installer shows a `┌─┤ Configuring … ├─┐` box and arrow keys type `[B` | Fixed: the box is detected and its keys are delivered through the host-side keystroke channel — see *Answering prompts*. |
+| The distro badge (`Ubuntu 24.04.1 LTS · Oracle Cloud`) is missing | The host answered SSH but not the probe: a restricted shell (`rbash`, no `/etc/os-release`, no `uname`), or the deployment cannot open a second connection to it. The session itself is unaffected. |
+| The badge says `KVM VPS` on a cloud server | That image has no cloud-init `cloud-id` and no vendor string in its DMI data, so only the hypervisor is identifiable. Everything else (distro, version, kernel, CPU, RAM) is still exact. |
 | `vim`/`top`/`less`/`tmux` don't run on Vercel | Serverless SSH runs each command on its own. When live input is available (see *Answering prompts* below) simple interactive programs work but nothing can resize or re-enter full-screen mode, so a live PTY is still better: self-hosted Sushi or **Attach VPS Gateway**. These always work in the Vercel terminal: `cat`, `tail -n 100`, `sed -i`, `top -bn1`, `systemctl status`, `journalctl -n 50`, `git log`. |
 | `su` says it needs the root password (Vercel) | `su` wants the *root account's* password. Use `sudo su` instead: Sushi asks for **your** sudo password (on NOPASSWD hosts it switches instantly). |
 | `Download ZIP` / the row **ZIP** button does nothing | If your browser shows a save dialog first, it was dismissed (Esc) — click again and confirm. Right-click the folder row → *Download folder (.zip)* is the same action. |

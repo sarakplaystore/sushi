@@ -16,6 +16,12 @@ import {
   Palette,
   Loader2,
   Ban,
+  Keyboard,
+  ChevronUp,
+  ChevronDown,
+  ChevronLeft,
+  ChevronRight,
+  CornerDownLeft,
 } from "lucide-react";
 import type {
   CommandSnippet,
@@ -35,12 +41,23 @@ import {
 import { getStoredSessionToken } from "@/lib/client/auth-storage";
 import {
   CONFIRM_PROMPT_RE,
+  MENU_KEY,
   PASSWORD_PROMPT_RE,
   SUDO_NEEDS_PASSWORD_RE,
   SUDO_WRONG_PASSWORD_RE,
+  detectFullscreenMenu,
   detectInteractiveProgram,
+  menuButtonKeys,
+  menuSelectKeys,
   parseElevationCommand,
+  splitTerminalInput,
+  type FullscreenMenu,
 } from "@/lib/client/terminal-commands";
+import {
+  createKeyBatcher,
+  sendKeyChannelInput,
+  type ExecKeyChannel,
+} from "@/lib/client/exec-keys";
 
 interface SshTerminalSessionProps {
   profile: HostProfile;
@@ -132,6 +149,20 @@ export function SshTerminalSession({
   const abortExecRef = useRef<AbortController | null>(null);
   /** Live stdin channel of the running serverless command (null when idle). */
   const stdinRef = useRef<ExecStdinChannel | null>(null);
+  /**
+   * Keystroke FIFO of the running command. Used when this browser/deployment cannot
+   * stream keystrokes into the running request (Firefox, HTTP/1.1, buffering proxy):
+   * each key press is then one tiny request that writes into the remote FIFO.
+   */
+  const keyChannelRef = useRef<ExecKeyChannel | null>(null);
+  /** Coalesces fast key presses into one key-channel round trip. */
+  const keyBatcherRef = useRef<ReturnType<typeof createKeyBatcher> | null>(null);
+  /** Serialises key deliveries so they reach the remote FIFO in the order typed. */
+  const keySendChainRef = useRef<Promise<void>>(Promise.resolve());
+  /** Signature of the box on screen, so an unchanged redraw does not re-render. */
+  const menuSignatureRef = useRef<string>("");
+  /** The "arrow keys need a real menu" hint is only printed once per command. */
+  const menuHintShownRef = useRef(false);
   /** Set when streamed request bodies are not usable here (buffering proxy). */
   const streamingBlockedRef = useRef(false);
   /** Set once a streamed exec actually produced output (stdin confirmed working). */
@@ -163,6 +194,17 @@ export function SshTerminalSession({
   >(null);
   /** True when keystrokes reach the running command's stdin. */
   const [canTypeWhileRunning, setCanTypeWhileRunning] = useState(false);
+  /**
+   * A full-screen terminal menu (whiptail / debconf / ncurses) is on screen. It can
+   * only be driven with key presses, so Sushi offers the keys next to the terminal.
+   */
+  const [menu, setMenu] = useState<FullscreenMenu | null>(null);
+  /** Transient note under the menu panel ("keys sent", "no key channel", …). */
+  const [menuNote, setMenuNote] = useState<string | null>(null);
+  /** The running command has a keystroke FIFO, so key presses can reach it. */
+  const [keyChannelActive, setKeyChannelActive] = useState(false);
+  /** True when keystrokes reach the running command, by either route. */
+  const canSendKeys = canTypeWhileRunning || keyChannelActive;
   /** The command behind the current prompt, so it can be re-run with an answer. */
   const pendingCommandRef = useRef<string | null>(null);
   /** Local line buffer used while a command runs with no live stdin channel. */
@@ -243,20 +285,28 @@ export function SshTerminalSession({
       const term = termRef.current;
       const utf8Decoder = new TextDecoder("utf-8");
 
-      const payload = {
-        credentials: {
-          host: profile.host,
-          port: profile.port,
-          username: profile.username,
-          authMethod: profile.authMethod,
-          password: profile.password,
-          privateKey: profile.privateKey,
-          passphrase: profile.passphrase,
-        },
+      const credentials = {
+        host: profile.host,
+        port: profile.port,
+        username: profile.username,
+        authMethod: profile.authMethod,
+        password: profile.password,
+        privateKey: profile.privateKey,
+        passphrase: profile.passphrase,
+      };
+
+      /**
+       * `keyChannel` is only asked for when keystrokes cannot travel up the request
+       * body: the command then runs inside `script(1)` with a keystroke FIFO, so
+       * whiptail / debconf / ncurses menus stay answerable from any browser.
+       */
+      const buildPayload = (withKeyChannel: boolean) => ({
+        credentials,
         command,
         cwd: cwdRef.current,
         cols: term?.cols || 100,
         rows: term?.rows || 30,
+        ...(withKeyChannel ? { keyChannel: true } : {}),
         ...(options.stdin ? { stdin: options.stdin } : {}),
         ...(options.elevateUser
           ? {
@@ -266,7 +316,7 @@ export function SshTerminalSession({
               },
             }
           : {}),
-      };
+      });
 
       type AttemptResult = {
         exitCode: number;
@@ -284,6 +334,7 @@ export function SshTerminalSession({
         let settled = false;
 
         const streaming = allowStreaming && canStreamExecStdin();
+        const payload = buildPayload(!streaming);
         const channel = streaming ? createExecRequestBody(payload) : null;
         const headers = getAuthHeaders(gatewaySettings);
         if (channel) headers["Content-Type"] = "application/x-ndjson";
@@ -350,6 +401,10 @@ export function SshTerminalSession({
                 gotReady = true;
                 setStatus("connected");
                 if (channel) streamingConfirmedRef.current = true;
+                if (typeof evt.keyChannel === "string" && evt.keyChannel) {
+                  keyChannelRef.current = { path: evt.keyChannel, credentials };
+                  setKeyChannelActive(true);
+                }
                 if (typeof evt.fingerprint === "string") setFingerprint(evt.fingerprint);
               } else if (evt.type === "data" && typeof evt.data === "string") {
                 const text = utf8Decoder.decode(decodeBase64Bytes(evt.data), {
@@ -396,6 +451,10 @@ export function SshTerminalSession({
           if (startWatchdog) clearTimeout(startWatchdog);
           abortExecRef.current = null;
           stdinRef.current = null;
+          keyChannelRef.current = null;
+          keyBatcherRef.current?.dispose();
+          keyBatcherRef.current = null;
+          setKeyChannelActive(false);
           channel?.channel.close();
         }
 
@@ -411,9 +470,10 @@ export function SshTerminalSession({
         streamingBlockedRef.current = true;
         setStreamingStdinBlocked(true);
         termRef.current?.writeln(
-          "\x1b[90m↳ Live typing isn't available on this connection (it needs HTTP/2 and a\r\n" +
-            "  Chromium browser). Everything still works: when a command asks a question,\r\n" +
-            "  type the answer and press Enter — Sushi re-runs it with your answer.\x1b[0m"
+          "\x1b[90m↳ Live typing can't stream into a running command on this connection (that\r\n" +
+            "  needs HTTP/2 and a Chromium browser), so Sushi gives each command a keystroke\r\n" +
+            "  channel on the host instead: prompts and full-screen menus (whiptail, debconf,\r\n" +
+            "  tasksel) still answer to your keys, just with a little delay per key.\x1b[0m"
         );
         options.onInputReady?.(false);
         return attempt(false);
@@ -456,18 +516,101 @@ export function SshTerminalSession({
     [execServerless]
   );
 
-  /** Sends bytes to the running command's stdin (false when unavailable). */
-  const sendTerminalInput = useCallback((data: string): boolean => {
-    const stdin = stdinRef.current;
-    return stdin?.canSendInput ? stdin.sendInput(data) : false;
-  }, []);
-
   /** Ctrl+C: a real SIGINT when stdin works, otherwise cancel the request. */
   const stopRunningCommand = useCallback(() => {
     const stdin = stdinRef.current;
     if (stdin?.canSendInput && stdin.sendSignal("INT")) return;
     abortExecRef.current?.abort();
   }, []);
+
+  /**
+   * Writes raw bytes into the running command's keystroke FIFO.
+   *
+   * This is the path that makes an old-Ubuntu `Configuring lightdm` screen usable on
+   * Vercel: the keys travel over their own tiny request, so nothing depends on the
+   * browser streaming its request body.
+   */
+  const flushChannelKeys = useCallback(
+    async (keys: string): Promise<boolean> => {
+      const channel = keyChannelRef.current;
+      if (!channel || !keys) return false;
+      // Key presses are queued: two round trips started at the same time could
+      // otherwise reach the FIFO out of order (an arrow before the Enter it follows).
+      const previous = keySendChainRef.current;
+      let release: () => void = () => {};
+      keySendChainRef.current = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      await previous;
+      const result = await sendKeyChannelInput(channel, keys, gatewaySettings).finally(
+        release
+      );
+      if (result === "missing") {
+        // The command finished, or this host cannot host a key channel (no
+        // `script`/`mkfifo`). Drop it so typing falls back to the replay path.
+        keyChannelRef.current = null;
+        keyBatcherRef.current?.dispose();
+        keyBatcherRef.current = null;
+        setKeyChannelActive(false);
+        setMenuNote(
+          "This host has no key channel for the running command — typing an answer and pressing Enter works instead."
+        );
+      } else if (result === "failed") {
+        setMenuNote("The key press could not be delivered. Check the connection and try again.");
+      } else {
+        setMenuNote(null);
+      }
+      return result === "delivered";
+    },
+    [gatewaySettings]
+  );
+
+  /** Queues keystrokes typed in the terminal (coalesced into one round trip). */
+  const queueChannelKeys = useCallback(
+    (keys: string) => {
+      if (!keys) return;
+      if (!keyBatcherRef.current) {
+        keyBatcherRef.current = createKeyBatcher((batch) => {
+          void flushChannelKeys(batch);
+        });
+      }
+      keyBatcherRef.current.push(keys);
+      // A menu or a prompt must react at once; ordinary typing is worth batching.
+      if (/[\r\n\x1b]/.test(keys)) keyBatcherRef.current.flushNow();
+    },
+    [flushChannelKeys]
+  );
+
+  /**
+   * Sends key presses to the running command: through the live stdin channel when
+   * the browser has one, otherwise through the remote keystroke FIFO.
+   */
+  const deliverKeys = useCallback(
+    (keys: string) => {
+      if (!keys) return;
+      const stdin = stdinRef.current;
+      if (stdin?.canSendInput) {
+        stdin.sendInput(keys);
+        setMenuNote(null);
+        return;
+      }
+      if (keyChannelRef.current) {
+        void flushChannelKeys(keys);
+        return;
+      }
+      setMenuNote(
+        "This screen only takes key presses and this host has no key channel. Press Ctrl+C and run the command again from a terminal that supports it."
+      );
+    },
+    [flushChannelKeys]
+  );
+
+  // xterm's onData handler is installed once per connection, so it reads the key
+  // helpers through refs (settings can change without re-registering the terminal).
+  const queueChannelKeysRef = useRef(queueChannelKeys);
+  useEffect(() => {
+    queueChannelKeysRef.current = queueChannelKeys;
+  }, [queueChannelKeys]);
 
   const askSudoPassword = useCallback(
     (term: import("@xterm/xterm").Terminal, prompt: SecretPrompt) => {
@@ -629,6 +772,10 @@ export function SshTerminalSession({
         let promptHintShown = false;
         let outputTail = "";
         let canType = false;
+        menuHintShownRef.current = false;
+        menuSignatureRef.current = "";
+        setMenu(null);
+        setMenuNote(null);
         pendingCommandRef.current = rawCmd;
         const result = await execServerless(commandToRun, {
           elevateUser,
@@ -640,13 +787,31 @@ export function SshTerminalSession({
           },
           stream: (text) => {
             term.write(text);
-            outputTail = (outputTail + text).slice(-200);
+            outputTail = (outputTail + text).slice(-8000);
+
+            // A full-screen box (whiptail / debconf / ncurses — `Configuring
+            // lightdm`) cannot be answered with a typed line: it wants key presses.
+            // Show the actual entries and keys right above the terminal.
+            const detected = detectFullscreenMenu(outputTail);
+            if (detected) {
+              const signature = [
+                detected.title,
+                detected.kind,
+                detected.items.map((i) => `${i.selected ? "*" : " "}${i.label}`).join("|"),
+                detected.buttons.join("|"),
+              ].join("~");
+              if (signature !== menuSignatureRef.current) {
+                menuSignatureRef.current = signature;
+                setMenu(detected);
+                setMenuNote(null);
+              }
+            }
 
             // Surface a question with buttons, so nothing ever leaves the user
             // staring at a prompt they cannot answer.
-            const kind = PASSWORD_PROMPT_RE.test(outputTail)
+            const kind = PASSWORD_PROMPT_RE.test(outputTail.slice(-200))
               ? "password"
-              : CONFIRM_PROMPT_RE.test(outputTail)
+              : CONFIRM_PROMPT_RE.test(outputTail.slice(-200))
                 ? "confirm"
                 : null;
             if (kind) {
@@ -658,7 +823,7 @@ export function SshTerminalSession({
             if (promptHintShown) return;
             if (!kind) return;
             promptHintShown = true;
-            if (canType) return; // the answer bar is live; no scary warning needed
+            if (canType || keyChannelRef.current) return; // the answer bar is live
             term.write(
               "\r\n\x1b[33m↳ Waiting for your answer — type it here and press Enter " +
                 "(e.g. y or n), or click Yes / No above. Sushi re-runs the command with " +
@@ -682,6 +847,8 @@ export function SshTerminalSession({
         awaitingAnswerRef.current = false;
         setAwaitingAnswer(false);
         busyInputRef.current = "";
+        menuSignatureRef.current = "";
+        setMenu(null);
         setExecBusy(false);
         // When a password prompt was started, the prompt itself is the cursor
         if (!secretPromptRef.current) writePrompt(term);
@@ -891,11 +1058,32 @@ export function SshTerminalSession({
             return;
           }
 
-          // No live channel (HTTP/1.1, Safari, …): let the user type a line anyway.
-          // Enter replays the stuck command with that line piped into its stdin, so
-          // typing `y` really does answer `[Y/n]`; anything else replaces the command.
-          for (let i = 0; i < data.length; i += 1) {
-            const ch = data[i];
+          // No live channel (Firefox, HTTP/1.1, a buffering proxy), but the command
+          // does have a keystroke FIFO: forward the bytes verbatim, so arrows, Tab,
+          // Space and Enter drive whiptail / debconf / ncurses screens instead of
+          // landing in the shell as literal "[B" text.
+          if (keyChannelRef.current) {
+            queueChannelKeysRef.current(data);
+            return;
+          }
+
+          // Neither. Escape sequences are not text: dropping them keeps an arrow key
+          // from being executed as a command ("[B[B: not found") while a full-screen
+          // menu is up.
+          const parsed = splitTerminalInput(data);
+          if (parsed.sequences.length > 0 && !menuHintShownRef.current) {
+            menuHintShownRef.current = true;
+            setMenuNote(
+              "That screen needs key presses, and this host has no key channel for it — press Ctrl+C and re-run the command."
+            );
+          }
+          const typed = parsed.text;
+
+          // Let the user type a line anyway: Enter replays the stuck command with
+          // that line piped into its stdin, so typing `y` really does answer
+          // `[Y/n]`; anything else replaces the command.
+          for (let i = 0; i < typed.length; i += 1) {
+            const ch = typed[i];
             if (ch === "\r" || ch === "\n") {
               const line = busyInputRef.current;
               busyInputRef.current = "";
@@ -1293,8 +1481,8 @@ export function SshTerminalSession({
                 <span
                   title={
                     liveInput
-                      ? "Keystrokes are forwarded to the running command, so prompts like [Y/n] can be answered."
-                      : "Keystrokes can't reach a running command here (needs HTTP/2 + a Chromium browser). Sushi offers a one-click retry that answers the prompt, e.g. `apt install -y`."
+                      ? "Keystrokes are forwarded to the running command, so prompts like [Y/n] and whiptail menus can be answered."
+                      : "Keystrokes can't stream into the running command here (that needs HTTP/2 + a Chromium browser), so every command gets a keystroke channel on the host instead — prompts, whiptail/debconf menus and arrow keys still reach it."
                   }
                   className={`inline-flex items-center gap-1 rounded-md border px-2 py-0.5 text-[11px] font-medium ${
                     liveInput
@@ -1303,7 +1491,7 @@ export function SshTerminalSession({
                   }`}
                 >
                   <Radio className="h-3 w-3" />
-                  {liveInput ? "Live input" : "No live input"}
+                  {liveInput ? "Live input" : "Key channel input"}
                 </span>
               );
             })()}
@@ -1486,6 +1674,134 @@ export function SshTerminalSession({
         </div>
       </div>
 
+      {/*
+        Full-screen terminal menu bar (serverless mode).
+        whiptail / debconf / ncurses screens (`Configuring lightdm`) only listen to
+        their own terminal, so Sushi puts the keys they expect above the terminal —
+        and delivers them through the command's keystroke FIFO when the browser
+        cannot stream keystrokes into the running request.
+      */}
+      {transportMode === "serverless" && menu && (
+        <div className="space-y-1 border-b border-sky-500/25 bg-sky-500/10 px-4 py-1.5 text-[11px] text-sky-50">
+          <div className="flex flex-wrap items-center gap-1.5">
+            <Keyboard className="h-3.5 w-3.5 shrink-0 text-sky-300" />
+            <span className="min-w-0 max-w-[220px] truncate font-semibold text-sky-100">
+              {menu.title || "Terminal menu"}
+            </span>
+            <span className="hidden text-sky-200/70 sm:inline">— keys go to the screen:</span>
+            <span className="flex items-center gap-1">
+              {[
+                { label: "↑", title: "Arrow up", keys: MENU_KEY.up, Icon: ChevronUp },
+                { label: "↓", title: "Arrow down", keys: MENU_KEY.down, Icon: ChevronDown },
+                { label: "←", title: "Arrow left", keys: MENU_KEY.left, Icon: ChevronLeft },
+                { label: "→", title: "Arrow right", keys: MENU_KEY.right, Icon: ChevronRight },
+              ].map(({ label, title, keys, Icon }) => (
+                <button
+                  key={label}
+                  type="button"
+                  title={title}
+                  onClick={() => deliverKeys(keys)}
+                  className="flex items-center gap-0.5 rounded-md border border-sky-400/40 bg-sky-500/15 px-1.5 py-0.5 font-semibold text-sky-100 transition hover:bg-sky-500/30"
+                >
+                  <Icon className="h-3 w-3" />
+                  <span>{label}</span>
+                </button>
+              ))}
+              <button
+                type="button"
+                title="Move to the next field / button"
+                onClick={() => deliverKeys(MENU_KEY.tab)}
+                className="rounded-md border border-sky-400/40 bg-sky-500/15 px-1.5 py-0.5 font-semibold text-sky-100 transition hover:bg-sky-500/30"
+              >
+                Tab
+              </button>
+              <button
+                type="button"
+                title="Toggle the highlighted entry"
+                onClick={() => deliverKeys(MENU_KEY.space)}
+                className="rounded-md border border-sky-400/40 bg-sky-500/15 px-1.5 py-0.5 font-semibold text-sky-100 transition hover:bg-sky-500/30"
+              >
+                Space
+              </button>
+              <button
+                type="button"
+                title="Press the default button"
+                onClick={() => deliverKeys(MENU_KEY.enter)}
+                className="flex items-center gap-0.5 rounded-md border border-emerald-400/40 bg-emerald-500/20 px-1.5 py-0.5 font-semibold text-emerald-100 transition hover:bg-emerald-500/30"
+              >
+                <CornerDownLeft className="h-3 w-3" />
+                Enter
+              </button>
+              <button
+                type="button"
+                title="Escape"
+                onClick={() => deliverKeys(MENU_KEY.escape)}
+                className="rounded-md border border-white/15 px-1.5 py-0.5 text-sky-100 transition hover:bg-white/10"
+              >
+                Esc
+              </button>
+            </span>
+            <button
+              type="button"
+              title="Hide this bar (the menu stays on screen)"
+              onClick={() => {
+                menuSignatureRef.current = "";
+                setMenu(null);
+              }}
+              className="ml-auto text-sky-200/70 transition hover:text-white"
+            >
+              <X className="h-3.5 w-3.5" />
+            </button>
+          </div>
+
+          {menu.items.length > 0 && (
+            <div className="flex flex-wrap items-center gap-1.5">
+              <span className="text-sky-200/70">Choices:</span>
+              {menu.items.map((item, index) => (
+                <button
+                  key={`${item.label}-${index}`}
+                  type="button"
+                  title={`Select ${item.label}`}
+                  onClick={() => deliverKeys(menuSelectKeys(menu, index))}
+                  className={
+                    item.selected
+                      ? "rounded-md border border-emerald-400/50 bg-emerald-500/20 px-1.5 py-0.5 font-semibold text-emerald-100 transition hover:bg-emerald-500/30"
+                      : "rounded-md border border-white/15 px-1.5 py-0.5 text-sky-50 transition hover:bg-white/10"
+                  }
+                >
+                  {item.selected ? "(*)" : "( )"} {item.label}
+                </button>
+              ))}
+            </div>
+          )}
+
+          <div className="flex flex-wrap items-center gap-1.5">
+            <span className="text-sky-200/70">Buttons:</span>
+            {menu.buttons.map((button) => (
+              <button
+                key={button}
+                type="button"
+                title={`Press <${button}>`}
+                onClick={() => deliverKeys(menuButtonKeys(menu, button))}
+                className={
+                  menu.buttons.indexOf(button) === 0
+                    ? "rounded-md border border-emerald-400/50 bg-emerald-500/20 px-1.5 py-0.5 font-semibold text-emerald-100 transition hover:bg-emerald-500/30"
+                    : "rounded-md border border-white/15 px-1.5 py-0.5 text-sky-50 transition hover:bg-white/10"
+                }
+              >
+                &lt;{button}&gt;
+              </button>
+            ))}
+            {!canSendKeys && (
+              <span className="text-amber-200/90">
+                No key channel for this command — restart it to use these keys.
+              </span>
+            )}
+            {menuNote && <span className="text-amber-200/90">{menuNote}</span>}
+          </div>
+        </div>
+      )}
+
       {/* Running command / answerable prompt bar (serverless mode) */}
       {transportMode === "serverless" && running && (
         <div className="flex flex-wrap items-center gap-2 border-b border-amber-500/25 bg-amber-500/10 px-4 py-1.5 text-[11px] text-amber-100">
@@ -1495,7 +1811,7 @@ export function SshTerminalSession({
               ? livePrompt.kind === "password"
                 ? "This command is asking for a password — type it below."
                 : livePrompt.kind === "confirm"
-                  ? canTypeWhileRunning
+                  ? canSendKeys
                     ? "Waiting for an answer — type it, or pick one:"
                     : "Waiting for an answer — type it and press Enter, or pick one:"
                   : "Waiting for input…"
@@ -1507,8 +1823,8 @@ export function SshTerminalSession({
               <button
                 type="button"
                 onClick={() =>
-                  canTypeWhileRunning
-                    ? void sendTerminalInput(livePrompt.kind === "confirm" ? "y\r" : "\r")
+                  canSendKeys
+                    ? deliverKeys(livePrompt.kind === "confirm" ? "y\r" : "\r")
                     : submitWhileBusy(livePrompt.kind === "confirm" ? "y" : "")
                 }
                 className="rounded-md border border-emerald-400/40 bg-emerald-500/15 px-2 py-0.5 font-semibold text-emerald-200 transition hover:bg-emerald-500/30"
@@ -1519,11 +1835,7 @@ export function SshTerminalSession({
               {livePrompt.kind === "confirm" && (
                 <button
                   type="button"
-                  onClick={() =>
-                    canTypeWhileRunning
-                      ? void sendTerminalInput("n\r")
-                      : submitWhileBusy("n")
-                  }
+                  onClick={() => (canSendKeys ? deliverKeys("n\r") : submitWhileBusy("n"))}
                   className="rounded-md border border-white/15 px-2 py-0.5 text-amber-100 transition hover:bg-white/10"
                   title="Answer no"
                 >
@@ -1537,7 +1849,7 @@ export function SshTerminalSession({
             type="button"
             onClick={stopRunningCommand}
             className="flex shrink-0 items-center gap-1 rounded-md border border-rose-400/40 bg-rose-500/15 px-2 py-0.5 font-medium text-rose-200 transition hover:bg-rose-500/30"
-            title={canTypeWhileRunning ? "Send Ctrl+C to the command" : "Cancel the running command"}
+            title={canSendKeys ? "Send Ctrl+C to the command" : "Cancel the running command"}
           >
             <Ban className="h-3 w-3" /> Stop
           </button>
@@ -1547,7 +1859,7 @@ export function SshTerminalSession({
       {transportMode === "serverless" &&
         (running || awaitingAnswer) &&
         livePrompt &&
-        !canTypeWhileRunning && (
+        !canSendKeys && (
           <div className="flex flex-wrap items-center gap-2 border-b border-sky-500/20 bg-[#101621] px-4 py-1.5 text-[11px] text-sky-100/90">
             <span className="min-w-0 flex-1">
               Type your answer in the terminal and press{" "}

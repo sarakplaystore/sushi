@@ -7,6 +7,7 @@ import { META_REGEX, PROMPT_HINT_RE, splitEmittable } from "@/lib/server/exec-st
 import { pumpExecInput, readExecStart } from "@/lib/server/exec-input";
 import {
   buildExecScript,
+  createKeyChannelPath,
   createSudoAnswerer,
   type ExecElevation,
 } from "@/lib/server/exec-script";
@@ -46,6 +47,13 @@ export async function POST(req: NextRequest) {
      * when the browser cannot stream live keystrokes.
      */
     stdin?: string;
+    /**
+     * Ask for a keystroke FIFO on the remote host (see `buildExecScript`). Used when
+     * the browser cannot stream keystrokes into the running command: every key press
+     * then arrives as its own tiny exec that writes into the FIFO, so terminal menus
+     * (whiptail / debconf / ncurses) stay answerable.
+     */
+    keyChannel?: boolean;
   };
 
   // Two request shapes: a plain JSON body (fire-and-run) or a streaming NDJSON body
@@ -143,16 +151,23 @@ export async function POST(req: NextRequest) {
 
       try {
         session = await connectSsh(creds, 14000);
+        const keyChannel = body.keyChannel ? createKeyChannelPath() : null;
         sendEvent({
           type: "ready",
           fingerprint: session.fingerprint,
           banner: session.serverBanner,
+          ...(keyChannel ? { keyChannel } : {}),
         });
 
         const { script, feedPassword, ptyModes } = buildExecScript({
           command,
           cwd,
           elevate: body.elevate,
+          keyChannel,
+          // With a key channel the piped answer travels through the FIFO instead of
+          // the SSH channel's stdin (that stdin belongs to `script(1)`, not the
+          // command), so it must be part of the remote script.
+          pipedInput: keyChannel ? body.stdin ?? null : null,
         });
 
         await new Promise<void>((resolve) => {
@@ -254,7 +269,7 @@ export async function POST(req: NextRequest) {
                 typeof body.stdin === "string" && body.stdin.length > 0
                   ? body.stdin.slice(0, 4096)
                   : null;
-              let pipedWritten = false;
+              let pipedWritten = Boolean(keyChannel);
               const writePipedInput = () => {
                 if (!pipedInput || pipedWritten || finished) return;
                 pipedWritten = true;

@@ -167,3 +167,214 @@ export const SUDO_WRONG_PASSWORD_RE =
 
 export const PASSWORD_PROMPT_RE = /(?:password|passphrase|passcode)[^\r\n]{0,60}:\s*$/i;
 export const CONFIRM_PROMPT_RE = /\[(?:Y\/n|y\/N|yes\/no|Y\/N)\]\s*\??\s*$/;
+
+// ---------------------------------------------------------------------------
+// Full-screen terminal menus (whiptail / dialog / debconf / ncurses)
+// ---------------------------------------------------------------------------
+
+/**
+ * Raw terminal keys. Menus only ever see key presses — there is no line to type —
+ * which is exactly why a plain `[Y/n]` answer bar cannot drive one.
+ */
+export const MENU_KEY = {
+  up: "\x1b[A",
+  down: "\x1b[B",
+  right: "\x1b[C",
+  left: "\x1b[D",
+  tab: "\t",
+  enter: "\r",
+  space: " ",
+  escape: "\x1b",
+  backspace: "\x7f",
+} as const;
+
+export interface FullscreenMenuItem {
+  label: string;
+  /** `(*)` / `[X]` in the box. */
+  selected: boolean;
+  kind: "radio" | "check";
+}
+
+export interface FullscreenMenu {
+  /** Title from `┤ Configuring lightdm ├` ("" when the box has none). */
+  title: string;
+  /** Body lines of the box, without the border and the labels. */
+  message: string;
+  kind: "select" | "checklist" | "confirm" | "box";
+  items: FullscreenMenuItem[];
+  /** `<Ok>` → "Ok". Left to right, which is also the Tab order. */
+  buttons: string[];
+}
+
+const DEFAULT_BUTTONS = ["Ok", "Cancel"];
+
+function cleanLabel(value: string): string {
+  return value
+    .replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "")
+    .replace(/[\u2500-\u257f|]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/**
+ * Recognises the box whiptail / debconf / ncurses draw on screen.
+ *
+ * Call it with the tail of the command's output: the *last* box wins, because a
+ * redraw only repeats the same box while an earlier one is already answered.
+ * Returns null for ordinary text, so it is safe to run on every chunk.
+ */
+export function detectFullscreenMenu(text: string): FullscreenMenu | null {
+  if (!text) return null;
+  const tail = text.slice(-8000);
+  const start = tail.lastIndexOf("\u250c"); // ┄ box drawing "┌"
+  const hasChrome =
+    start !== -1 ||
+    tail.includes("\u2514") || // └
+    tail.includes("\u2524"); // ┤
+  const scanned = start !== -1 ? tail.slice(start) : tail.slice(-3000);
+
+  const buttons: string[] = [];
+  for (const match of scanned.matchAll(/<\s*([A-Za-z][A-Za-z0-9 _-]{0,20}?)\s*>/g)) {
+    const label = match[1].trim();
+    if (label && !buttons.some((b) => b.toLowerCase() === label.toLowerCase())) {
+      buttons.push(label);
+    }
+  }
+
+  const items: FullscreenMenuItem[] = [];
+  // `(*)` radio lists, `[*]` / `[X]` check lists (newt draws a selected checkbox as
+  // `[*]`, the old dialog frontend uses `[X]`).
+  for (const match of scanned.matchAll(/(\(\*\)|\( \)|\[\*\]|\[[Xx ]\])\s*([^\x1b\r\n]{1,80})/g)) {
+    const marker = match[1];
+    const label = cleanLabel(match[2]);
+    if (!label) continue;
+    items.push({
+      label,
+      selected: marker === "(*)" || marker === "[*]" || marker === "[X]" || marker === "[x]",
+      kind: marker.startsWith("[") ? "check" : "radio",
+    });
+  }
+
+  if (!hasChrome && buttons.length === 0 && items.length === 0) return null;
+  if (buttons.length === 0 && items.length === 0) return null;
+
+  const titleMatch = /[\u2524|]\s*([^\u251c|\r\n\x1b]{1,70}?)\s*[\u251c|]/.exec(scanned);
+  const title = titleMatch ? cleanLabel(titleMatch[1]) : "";
+  const message = cleanLabel(
+    scanned
+      .split(/\r?\n/)
+      .filter((line) => /[\u2502|]/.test(line) && !/\(\*\)|\( \)|\[X\]|\[ \]|<\w/.test(line))
+      .join(" ")
+  ).slice(0, 400);
+
+  const lowerButtons = buttons.map((b) => b.toLowerCase());
+  const kind: FullscreenMenu["kind"] =
+    items.length === 0
+      ? lowerButtons.includes("yes") || lowerButtons.includes("no")
+        ? "confirm"
+        : "box"
+      : items.some((item) => item.kind === "check")
+        ? "checklist"
+        : "select";
+
+  return {
+    title,
+    message,
+    kind,
+    items,
+    buttons: buttons.length > 0 ? buttons : DEFAULT_BUTTONS,
+  };
+}
+
+/**
+ * Keys that pick `index` in a whiptail/newt list.
+ *
+ * Newt starts on the entry that is already selected, so the arrows are relative to
+ * that one; Space toggles it and Enter presses the default button (`<Ok>`).
+ */
+export function menuSelectKeys(menu: FullscreenMenu, index: number): string {
+  if (index < 0 || index >= menu.items.length) return "";
+  const current = Math.max(
+    0,
+    menu.items.findIndex((item) => item.selected)
+  );
+  const delta = index - current;
+  let keys = delta >= 0 ? MENU_KEY.down.repeat(delta) : MENU_KEY.up.repeat(-delta);
+  keys += MENU_KEY.space;
+  keys += MENU_KEY.enter;
+  return keys;
+}
+
+/** Keys that press one of the box's buttons (left to right = Tab order). */
+export function menuButtonKeys(menu: FullscreenMenu, label: string): string {
+  const index = menu.buttons.findIndex((b) => b.toLowerCase() === label.toLowerCase());
+  if (index <= 0) return MENU_KEY.enter; // <Ok> / <Yes> is the default button
+  return MENU_KEY.tab.repeat(index) + MENU_KEY.enter;
+}
+
+/**
+ * Splits typed terminal input into printable/editing characters and escape
+ * sequences (arrows, Home/End, function keys, Delete …).
+ *
+ * Without this, an arrow key pressed while a serverless command runs with no live
+ * stdin used to fall through as the literal text "[B" — which the shell then tried
+ * to execute ("[B[B[A: not found") — and a whiptail box could never be answered.
+ */
+export function splitTerminalInput(data: string): { text: string; sequences: string[] } {
+  let text = "";
+  const sequences: string[] = [];
+
+  for (let i = 0; i < data.length; i += 1) {
+    const ch = data[i];
+    if (ch !== "\x1b") {
+      text += ch;
+      continue;
+    }
+    const next = data[i + 1];
+    if (next === "[") {
+      // CSI: parameters/intermediate bytes, then one final byte in @-~
+      let j = i + 2;
+      while (j < data.length && /[0-9;:?<=>]/.test(data[j])) j += 1;
+      while (j < data.length && /[ -/]/.test(data[j])) j += 1;
+      if (j < data.length) {
+        sequences.push(data.slice(i, j + 1));
+        i = j;
+      } else {
+        sequences.push(data.slice(i));
+        i = data.length;
+      }
+      continue;
+    }
+    if (next === "O") {
+      // SS3: ESC O <final>
+      if (i + 2 < data.length) {
+        sequences.push(data.slice(i, i + 3));
+        i += 2;
+      } else {
+        sequences.push(data.slice(i));
+        i = data.length;
+      }
+      continue;
+    }
+    if (next === "]") {
+      // OSC: terminated by BEL or ST
+      let j = i + 2;
+      while (j < data.length && data[j] !== "\x07" && !(data[j] === "\x1b" && data[j + 1] === "\\")) {
+        j += 1;
+      }
+      const end = data[j] === "\x07" ? j + 1 : data[j] === "\x1b" ? j + 2 : data.length;
+      sequences.push(data.slice(i, end));
+      i = end - 1;
+      continue;
+    }
+    // A lone ESC (or ESC + one character): Alt+key / menu escape
+    if (next && /[a-zA-Z]/.test(next)) {
+      sequences.push(data.slice(i, i + 2));
+      i += 1;
+    } else {
+      sequences.push(data.slice(i, i + 1));
+    }
+  }
+
+  return { text, sequences };
+}

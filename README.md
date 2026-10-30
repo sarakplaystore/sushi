@@ -111,8 +111,17 @@ bash scripts/install-vps.sh
 
 ### Folder download (SFTP → ZIP)
 
-Clicking the folder icon in the **Actions** column downloads that folder as `<folder>.zip`; the
-**Download ZIP** button in the toolbar archives the folder you are currently browsing.
+Three ways to get a folder off the server:
+
+- **ZIP** button on the folder's row (Actions column) — downloads that folder as `<folder>.zip`.
+- **Right-click a row** → *Download folder (.zip)* (or *Download file* for files; the menu also has
+  open/edit, copy path, rename, permissions and delete).
+- **Download ZIP** in the toolbar — archives the folder you are currently browsing.
+
+In Chromium browsers Sushi asks where to save the archive first and then writes it straight to disk as
+it streams in, so even a multi-GB folder is never held in the tab's memory. Everywhere else (Safari,
+Firefox, or if you dismiss the dialog with Esc → nothing is downloaded) it uses a normal browser
+download.
 
 - Works without a remote shell or `zip` binary: Sushi walks the tree over the SFTP subsystem and
   streams a standard ZIP (deflate, UNIX modes, UTF-8 names) as it reads, so nothing is written to
@@ -144,6 +153,7 @@ Clicking the folder icon in the **Actions** column downloads that folder as `<fo
 | `This private key is passphrase-protected` / `Incorrect passphrase` | Enter (or fix) the key passphrase in the host settings. |
 | `vim`/`top`/`less`/`tmux` don't run on Vercel | Serverless SSH runs each command on its own. When live input is available (see *Answering prompts* below) simple interactive programs work but nothing can resize or re-enter full-screen mode, so a live PTY is still better: self-hosted Sushi or **Attach VPS Gateway**. These always work in the Vercel terminal: `cat`, `tail -n 100`, `sed -i`, `top -bn1`, `systemctl status`, `journalctl -n 50`, `git log`. |
 | `su` says it needs the root password (Vercel) | `su` wants the *root account's* password. Use `sudo su` instead: Sushi asks for **your** sudo password (on NOPASSWD hosts it switches instantly). |
+| `Download ZIP` / the row **ZIP** button does nothing | If your browser shows a save dialog first, it was dismissed (Esc) — click again and confirm. Right-click the folder row → *Download folder (.zip)* is the same action. |
 | `Download ZIP` fails with "is not a folder" | The path is a file or a symlink to a file — use the single-file download button (or open its folder and archive that). |
 | A command sits on `Do you want to continue? [Y/n]` / `Password:` (Vercel) | Type the answer in the terminal and press Enter (or click **Yes (y)** / **No (n)**): Sushi re-runs the command with your answer piped in. To avoid the question entirely use `apt install -y docker`, `ssh-keygen -f ~/.ssh/id_ed25519 -N ''`, `DEBIAN_FRONTEND=noninteractive`. |
 | `Download ZIP` fails with "contains more than 20 000 files" / "larger than 2.0 GB" / "nested deeper than 24 levels" | Sushi stopped a runaway archive before streaming it. Download a sub-folder, or `tar -czf` / `rsync` the tree over SSH. |

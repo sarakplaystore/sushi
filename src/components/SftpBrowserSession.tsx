@@ -27,9 +27,12 @@ import {
   CheckCircle2,
   FolderDown,
   Ban,
+  Copy,
+  ShieldCheck,
 } from "lucide-react";
 import type { HostProfile, SftpEntry } from "@/types/connection";
 import { type GatewaySettings, getAuthHeaders } from "@/lib/client/gateway";
+import { openArchiveSink } from "@/lib/client/zip-sink";
 
 interface SftpBrowserSessionProps {
   profile: HostProfile;
@@ -172,6 +175,13 @@ export function SftpBrowserSession({
     { label: string; received: number; total: number; files: number } | null
   >(null);
   const zipAbortRef = useRef<AbortController | null>(null);
+
+  // Right-click menu on a row: the discoverable way to download a folder.
+  const [rowMenu, setRowMenu] = useState<{
+    entry: SftpEntry;
+    x: number;
+    y: number;
+  } | null>(null);
 
   const credentialsPayload = {
     host: profile.host,
@@ -344,6 +354,12 @@ export function SftpBrowserSession({
       entry?.name || cwd.split("/").filter(Boolean).pop() || "folder";
     const controller = new AbortController();
     zipAbortRef.current = controller;
+
+    // Pick the destination first (Chromium): a big folder can then be written
+    // straight to disk instead of being held in this tab's memory.
+    const sink = await openArchiveSink(`${label}.zip`);
+    if (sink.kind === "cancelled") return;
+
     setZipJob({ label, received: 0, total: 0, files: 0 });
 
     try {
@@ -383,7 +399,11 @@ export function SftpBrowserSession({
         const { value, done } = await reader.read();
         if (done) break;
         if (!value) continue;
-        chunks.push(value);
+        if (sink.kind === "stream") {
+          await sink.write(value);
+        } else {
+          chunks.push(value);
+        }
         received += value.byteLength;
         const now = Date.now();
         if (now - lastPaint > 150) {
@@ -392,16 +412,26 @@ export function SftpBrowserSession({
         }
       }
 
-      const blob = new Blob(chunks as BlobPart[], { type: "application/zip" });
-      saveBlob(blob, archiveName);
+      if (sink.kind === "stream") {
+        await sink.close();
+      } else {
+        const blob = new Blob(chunks as BlobPart[], { type: "application/zip" });
+        saveBlob(blob, archiveName);
+        received = blob.size;
+      }
+
       const skippedNote = skipped
         ? ` • ${skipped} symlink${skipped === 1 ? "" : "s"} to folders skipped`
         : "";
       showNotice(
         true,
-        `Downloaded ${archiveName} — ${files} file${files === 1 ? "" : "s"}, ${formatBytes(blob.size)}${skippedNote}`
+        `Downloaded ${archiveName} — ${files} file${files === 1 ? "" : "s"}, ${formatBytes(received)}${skippedNote}`
       );
     } catch (err) {
+      // Don't leave a half-written archive behind on disk.
+      if (sink.kind === "stream") {
+        await sink.abort().catch(() => {});
+      }
       const aborted = (err as Error)?.name === "AbortError";
       const message = aborted
         ? "Folder download cancelled."
@@ -414,6 +444,22 @@ export function SftpBrowserSession({
       setZipJob(null);
     }
   };
+
+  useEffect(() => {
+    if (!rowMenu) return;
+    const close = () => setRowMenu(null);
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setRowMenu(null);
+    };
+    window.addEventListener("click", close);
+    window.addEventListener("resize", close);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("click", close);
+      window.removeEventListener("resize", close);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [rowMenu]);
 
   const uploadFiles = async (fileList: FileList | File[]) => {
     const files = Array.from(fileList);
@@ -674,6 +720,106 @@ export function SftpBrowserSession({
           </div>
 
           <div className="flex items-center gap-3 text-xs text-slate-400">
+            {/* Right-click row menu: keeps folder download one click away */}
+            {rowMenu && (
+              <div
+                className="fixed z-50 w-56 overflow-hidden rounded-xl border border-white/12 bg-[#141924] py-1 shadow-2xl"
+                style={{
+                  left: Math.min(rowMenu.x, window.innerWidth - 240),
+                  top: Math.min(rowMenu.y, window.innerHeight - 300),
+                }}
+                onClick={(e) => e.stopPropagation()}
+              >
+                <div className="truncate px-3 py-1.5 font-mono-code text-[11px] text-slate-400">
+                  {rowMenu.entry.name}
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const entry = rowMenu.entry;
+                    setRowMenu(null);
+                    if (entry.type === "directory") void loadDirectory(entry.path);
+                    else void openRemoteFileEditor(entry);
+                  }}
+                  className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs text-slate-200 hover:bg-white/8"
+                >
+                  {rowMenu.entry.type === "directory" ? (
+                    <Folder className="h-3.5 w-3.5 text-sky-400" />
+                  ) : (
+                    <FileCode2 className="h-3.5 w-3.5 text-emerald-400" />
+                  )}
+                  {rowMenu.entry.type === "directory" ? "Open folder" : "Edit file"}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const entry = rowMenu.entry;
+                    setRowMenu(null);
+                    if (entry.type === "directory") void handleDownloadFolder(entry);
+                    else void handleDownloadFile(entry);
+                  }}
+                  disabled={Boolean(zipJob)}
+                  className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs font-medium text-sky-200 hover:bg-sky-500/15 disabled:opacity-50"
+                >
+                  <FolderDown className="h-3.5 w-3.5" />
+                  {rowMenu.entry.type === "directory"
+                    ? "Download folder (.zip)"
+                    : "Download file"}
+                </button>
+                <div className="my-1 h-px bg-white/8" />
+                <button
+                  type="button"
+                  onClick={() => {
+                    void navigator.clipboard
+                      ?.writeText(rowMenu.entry.path)
+                      .then(() => showNotice(true, "Path copied"))
+                      .catch(() => showNotice(false, "Could not copy the path"));
+                    setRowMenu(null);
+                  }}
+                  className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs text-slate-300 hover:bg-white/8"
+                >
+                  <Copy className="h-3.5 w-3.5 text-slate-400" />
+                  Copy path
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const entry = rowMenu.entry;
+                    setRowMenu(null);
+                    setRenameTarget({ entry, nextName: entry.name });
+                  }}
+                  className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs text-slate-300 hover:bg-white/8"
+                >
+                  <Pencil className="h-3.5 w-3.5 text-slate-400" />
+                  Rename
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const entry = rowMenu.entry;
+                    setRowMenu(null);
+                    setChmodTarget({ entry, octal: entry.octal.replace(/^0/, "") });
+                  }}
+                  className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs text-slate-300 hover:bg-white/8"
+                >
+                  <ShieldCheck className="h-3.5 w-3.5 text-slate-400" />
+                  Permissions
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const entry = rowMenu.entry;
+                    setRowMenu(null);
+                    setDeleteTarget(entry);
+                  }}
+                  className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs text-rose-300 hover:bg-rose-500/15"
+                >
+                  <Trash2 className="h-3.5 w-3.5" />
+                  Delete
+                </button>
+              </div>
+            )}
+
             {toast && (
               <span
                 className={`inline-flex items-center gap-1 rounded-md px-2 py-0.5 text-[11px] ${
@@ -899,6 +1045,10 @@ export function SftpBrowserSession({
                         void openRemoteFileEditor(entry);
                       }
                     }}
+                    onContextMenu={(e) => {
+                      e.preventDefault();
+                      setRowMenu({ entry, x: e.clientX, y: e.clientY });
+                    }}
                     className="group transition hover:bg-white/[0.035]"
                   >
                     <td className="py-2 pl-4 pr-3">
@@ -956,10 +1106,11 @@ export function SftpBrowserSession({
                             type="button"
                             onClick={() => void handleDownloadFolder(entry)}
                             disabled={Boolean(zipJob)}
-                            className="rounded-md p-1 text-slate-400 hover:bg-white/8 hover:text-sky-300 disabled:opacity-40"
-                            title="Download folder as .zip"
+                            className="flex items-center gap-1 rounded-md border border-sky-500/25 bg-sky-500/10 px-1.5 py-0.5 text-sky-300 transition hover:bg-sky-500/25 disabled:opacity-40"
+                            title={`Download "${entry.name}" as a .zip archive`}
                           >
                             <FolderDown className="h-3.5 w-3.5" />
+                            <span className="text-[10px] font-semibold tracking-wide">ZIP</span>
                           </button>
                         )}
                         {!isDir && (

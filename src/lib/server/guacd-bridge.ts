@@ -3,6 +3,7 @@ import net from "node:net";
 import type { WebSocket } from "ws";
 import type { ConnectionCredentials } from "@/types/connection";
 import { validateTargetHost } from "./security";
+import { buildRdpParams, normalizeTimezone } from "./rdp-params";
 
 export function getGuacdConfig(): { host: string; port: number } {
   const host = process.env.GUACD_HOST?.trim() || "127.0.0.1";
@@ -165,30 +166,13 @@ export async function bridgeRdpToGuacd(
   await validateTargetHost(creds.host, rdpPort);
 
   const { host: guacdHost, port: guacdPort } = getGuacdConfig();
-  const width = Math.max(640, Math.min(4096, Number(creds.width || 1280)));
-  const height = Math.max(480, Math.min(2160, Number(creds.height || 720)));
-  const dpi = Math.max(72, Math.min(300, Number(creds.dpi || 96)));
+  const rdpParams = buildRdpParams(creds);
+  const width = Number(rdpParams.width);
+  const height = Number(rdpParams.height);
+  const dpi = Number(rdpParams.dpi);
+  const audioEnabled = rdpParams["disable-audio"] !== "true";
+  const timezone = normalizeTimezone(creds.timezone);
   const sessionUuid = crypto.randomUUID();
-
-  const rdpParams: Record<string, string> = {
-    hostname: creds.host.trim(),
-    port: String(rdpPort),
-    username: creds.username?.trim() || "",
-    password: creds.password || "",
-    domain: creds.domain?.trim() || "",
-    security: creds.rdpSecurity || "any",
-    "ignore-cert": creds.ignoreCert !== false ? "true" : "false",
-    width: String(width),
-    height: String(height),
-    dpi: String(dpi),
-    "color-depth": "24",
-    "resize-method": "display-update",
-    "enable-wallpaper": "true",
-    "enable-theming": "true",
-    "enable-font-smoothing": "true",
-    "disable-audio": "false",
-    "client-name": "Sushi Remote Workspace",
-  };
 
   const guacdSocket = new net.Socket();
   guacdSocket.setEncoding("utf8");
@@ -266,16 +250,21 @@ export async function bridgeRdpToGuacd(
           continue;
         }
 
-        // Send client display/media capabilities before connect
+        // Send client display/media capabilities before connect. Only what this
+        // browser actually renders is declared: an unhandled stream makes the client
+        // answer "BAD TYPE" for every frame of it.
         guacdSocket.write(
           encodeGuacForDaemon(["size", String(width), String(height), String(dpi)])
         );
-        guacdSocket.write(encodeGuacForDaemon(["audio", "audio/L16"]));
-        guacdSocket.write(encodeGuacForDaemon(["video"]));
+        if (audioEnabled) {
+          guacdSocket.write(encodeGuacForDaemon(["audio", "audio/L16"]));
+        }
         guacdSocket.write(
           encodeGuacForDaemon(["image", "image/png", "image/jpeg", "image/webp"])
         );
-        guacdSocket.write(encodeGuacForDaemon(["timezone", "UTC"]));
+        if (timezone) {
+          guacdSocket.write(encodeGuacForDaemon(["timezone", timezone]));
+        }
 
         const connectValues = args.map((argName) => {
           if (argName.startsWith("VERSION_")) {

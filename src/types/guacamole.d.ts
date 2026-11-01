@@ -89,6 +89,27 @@ declare module "guacamole-common-js" {
     sendEnd(): void;
   }
 
+  export class GuacamoleObject {
+    index: number;
+    onbody: ((stream: InputStream, mimetype: string, name: string) => void) | null;
+    createOutputStream(mimetype: string, name: string): OutputStream;
+    requestInputStream(name: string, bodyCallback?: (stream: InputStream) => void): void;
+  }
+
+  export class BlobWriter {
+    constructor(stream: OutputStream);
+    onprogress: ((blob: Blob, offset: number) => void) | null;
+    oncomplete: ((blob: Blob) => void) | null;
+    onerror: ((blob: Blob, offset: number, error: unknown) => void) | null;
+    onack: ((status: Status) => void) | null;
+    sendBlob(blob: Blob): void;
+  }
+
+  export const AudioContextFactory: {
+    singleton: AudioContext | null;
+    getAudioContext(): AudioContext | null;
+  };
+
   export class Client {
     constructor(tunnel: Tunnel);
     getDisplay(): Display;
@@ -101,6 +122,7 @@ declare module "guacamole-common-js" {
     onerror: ((status: Status) => void) | null;
     onstatechange: ((state: number) => void) | null;
     onclipboard: ((stream: InputStream, mimetype: string) => void) | null;
+    onfilesystem: ((object: GuacamoleObject, name: string) => void) | null;
     onname: ((name: string) => void) | null;
   }
 
@@ -116,6 +138,9 @@ declare module "guacamole-common-js" {
     StringReader: typeof StringReader;
     StringWriter: typeof StringWriter;
     Client: typeof Client;
+    GuacamoleObject: typeof GuacamoleObject;
+    BlobWriter: typeof BlobWriter;
+    AudioContextFactory: typeof AudioContextFactory;
   };
 
   export default GuacamoleDefault;

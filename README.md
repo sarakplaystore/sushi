@@ -32,7 +32,11 @@ It is designed around a **Hybrid VPS + Serverless Architecture**:
   - **Built-in Remote Code Editor** (`⌘S` / `Ctrl+S` direct save over SFTP)
 - **RDP Remote Desktop (`guacamole-common-js` + `guacd` + X.224 Inspector)**
   - Live in-browser Windows & Linux `xrdp` desktop streaming via `/ws/rdp` -> `guacd` (`NLA / CredSSP`, `TLS`, `Standard RDP`)
-  - Dynamic display scaling, fullscreen mode, clipboard sync, special key combos (`Ctrl+Alt+Del`, `Win`, `Ctrl+Shift+Esc`), and PNG screenshot capture
+  - **Fit-to-window resolution** (the desktop follows the pane instead of being scaled), keyboard capture with a `Ctrl+Alt+Shift` release, and **three picture presets** — Best / Balanced / Fast — that trade wallpaper, themes, font smoothing and colour depth for bandwidth
+  - **Two-way clipboard that just works**: `Ctrl+V` inside the desktop pastes your local clipboard (no dialog), and text copied in the desktop is copied back to your machine
+  - **Drag & drop uploads** into a redirected drive, plus a fullscreen mode, special key combos (`Ctrl+Alt+Del`, `Win`, `Ctrl+Shift+Esc`) and PNG screenshot capture
+  - **Automatic reconnect** when the desktop drops (network blip, `guacd` restart, RDP server reboot) with backoff and a visible countdown; a wrong password is not retried in a loop
+  - **View only** mode for watching someone else's screen without stealing their keyboard, and human error messages for every Guacamole status code
   - Native serverless **MS-RDPBCGR X.224 + TLS certificate inspector** (`/api/rdp/probe`) and one-click `.rdp` profile generator
   - **Open via RDP from anywhere**: a desktop button on every SSH/SFTP host row and host card, plus **Open RDP** in the terminal header and **RDP** in the file manager toolbar — the same host, reached as a desktop on port 3389, no duplicate host needed (see *Open a host's desktop over RDP*).
 - **AES-256-GCM Encrypted Credential Vault**
@@ -138,6 +142,27 @@ ephemeral, or save it — saving creates a separate RDP host and leaves the SSH 
 Live pixels need `guacd` (self-hosted `docker compose`) or an attached VPS gateway; without one the
 tab still gives you the X.224/TLS/NLA probe and a native `.rdp` launcher.
 
+### Getting the most out of the RDP desktop
+
+Once the pixels are flowing, the toolbar and the **settings** (sliders icon) control how the session
+behaves. Everything below except fit/fullscreen/screenshot is sent to `guacd` at connect time, so
+changing it reconnects the stream (a note appears while it does):
+
+| Control | What it does |
+|---|---|
+| **Fit window** (arrows icon) | Asks the RDP server for exactly the pane's size (`resize-method: display-update`), so text is pixel-crisp instead of scaled. Toggling it off keeps the host's fixed resolution and scales it. Resizes smaller than ~12 px are ignored so the desktop cannot oscillate. |
+| **Best / Balanced / Fast** | Picture presets: *Best* = wallpaper + themes + font smoothing + 32-bit + lossless; *Balanced* (default) = themes and smoothing, no wallpaper, 24-bit; *Fast* = 16-bit, no themes, no smoothing — the choice for a slow VPS link or a phone hotspot. |
+| **Desktop audio** | Plays the remote's sounds in the browser (Web Audio is unlocked by your first click). Turn it off on a metered link; no audio stream is then requested at all. |
+| **View only** | Stops sending keyboard and mouse — useful for watching a colleague's screen or for a machine you only need to look at. A `View only` chip appears in the toolbar while it is on. |
+| **File uploads** | Redirects a drive named `Sushi` into the session. Drop files anywhere on the desktop (or use **Upload**) and they are copied to it; the remote sees them on that drive. |
+| **Keyboard capture** | Keys reach the desktop only after you click into it, so typing in the sidebar, the search box or the clipboard panel never leaks into the remote. Press **Ctrl+Alt+Shift** (or click the chip) to hand the keyboard back to the browser — the modifiers are released properly, so the remote never gets stuck with Ctrl held. |
+| **Clipboard** | `Ctrl+V` inside the desktop pastes your local clipboard; text copied in the desktop is copied back to your machine automatically (Chrome/Edge; elsewhere use the Clipboard panel). |
+| **Auto-reconnect** | A dropped session (network blip, `guacd` restart, RDP reboot) is rebuilt with 1 s → 2 s → 4 s … backoff (max 5 attempts) and a countdown; **Retry now** skips the wait. Authentication failures (`the remote refused the login`) are shown once instead of being retried forever. |
+
+Each failure is translated instead of dumped as a number: `guacd could not reach the host on port
+3389`, `the remote refused the login — check the account, domain and NLA`, `this account is already
+using the desktop with different settings`, `your Sushi session is no longer valid — sign in again`.
+
 ### Which Ubuntu (or Debian, Rocky, …) version is this host?
 
 As soon as an SSH session connects, the header shows a badge next to `user@host:port` with the remote
@@ -234,6 +259,12 @@ download.
 | `su` says it needs the root password (Vercel) | `su` wants the *root account's* password. Use `sudo su` instead: Sushi asks for **your** sudo password (on NOPASSWD hosts it switches instantly). |
 | `Download ZIP` / the row **ZIP** button does nothing | If your browser shows a save dialog first, it was dismissed (Esc) — click again and confirm. Right-click the folder row → *Download folder (.zip)* is the same action. |
 | `Download ZIP` fails with "is not a folder" | The path is a file or a symlink to a file — use the single-file download button (or open its folder and archive that). |
+| RDP: `guacd could not reach the host on port 3389` | The desktop service is not listening. On Windows enable *Remote Desktop*; on Linux install and start `xrdp` (`systemctl enable --now xrdp`), then check the port number in the host. |
+| RDP: `the remote refused the login` | The desktop account is not the SSH account. Open **Credentials** in the RDP tab and set the Windows / domain account (or the Linux user `xrdp` logs in as), plus the domain and the security mode the server requires (**NLA** for most Windows hosts). |
+| RDP: picture looks soft / stretched | **Fit window** is off, so the desktop is scaled. Click the arrows icon in the toolbar to have the server match the pane. |
+| RDP: laggy over a slow link | Switch the quality preset to **Fast** (16-bit, no themes) and turn **Desktop audio** off. |
+| RDP: typing goes to the browser instead of the desktop | Click the desktop once (**Click the desktop to type**), or look for the `Keyboard captured` chip. **Ctrl+Alt+Shift** releases the keyboard again. |
+| RDP: the session reconnects by itself | Expected after a network blip or a `guacd` restart — it rebuilds with backoff. If it keeps happening, check the X.224 probe in the diagnostics panel and the `guacd` container logs. |
 | The selection download produces `<folder>-selection.zip` | Expected: several selected items are packed into one archive named after the folder you are in. Each item keeps its own name inside. |
 | `Download` does nothing with several items selected | Same rules as the folder ZIP: a dismissed save dialog downloads nothing, and a selection that is too large / nested too deeply / has too many files is refused before streaming. |
 | A command sits on `Do you want to continue? [Y/n]` / `Password:` (Vercel) | Type the answer in the terminal and press Enter (or click **Yes (y)** / **No (n)**): Sushi re-runs the command with your answer piped in. To avoid the question entirely use `apt install -y docker`, `ssh-keygen -f ~/.ssh/id_ed25519 -N ''`, `DEBIAN_FRONTEND=noninteractive`. |

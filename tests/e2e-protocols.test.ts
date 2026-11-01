@@ -78,6 +78,24 @@ import {
   formatSystemLine,
 } from "../src/lib/client/sysinfo";
 import {
+  buildRdpParams,
+  normalizeClientName,
+  normalizeRdpPerformance,
+  normalizeRdpSecurity,
+  normalizeTimezone,
+} from "../src/lib/server/rdp-params";
+import {
+  DEFAULT_RDP_PREFS,
+  describeRdpStatus,
+  fitRemoteSize,
+  formatRemoteSize,
+  nextRemoteSize,
+  parseRdpPrefs,
+  reconnectDelayMs,
+  shouldResizeRemote,
+  shouldRetryRdpStatus,
+} from "../src/lib/client/rdp-session";
+import {
   MENU_KEY,
   detectFullscreenMenu,
   detectInteractiveProgram,
@@ -1465,11 +1483,44 @@ async function runTests() {
   assert.equal(twoFileImport.hosts.length, termixDb.hosts.length);
 
   console.log("==> [7/8] Testing Protected WebSocket SSH PTY & Guacamole RDP Bridge (/ws/ssh & /ws/rdp)...");
+
+  // The RDP arguments this fake guacd advertises. guacd fills the `connect`
+  // instruction from this list, so it doubles as the contract for what Sushi sends.
+  const MOCK_RDP_ARGS = [
+    "VERSION_1_5_0",
+    "hostname",
+    "port",
+    "username",
+    "password",
+    "domain",
+    "security",
+    "ignore-cert",
+    "width",
+    "height",
+    "dpi",
+    "resize-method",
+    "color-depth",
+    "enable-wallpaper",
+    "enable-theming",
+    "enable-font-smoothing",
+    "force-lossless",
+    "disable-audio",
+    "read-only",
+    "client-name",
+    "enable-drive",
+    "drive-name",
+  ];
+  /** Every `connect` a bridge opened, as name → value. */
+  const rdpConnectCalls: Array<Record<string, string>> = [];
+  /** Instructions the bridge sent before `connect` (size / audio / image / timezone). */
+  const rdpPreConnect: string[][][] = [];
+
   // Start mock guacd daemon
   const guacdMock = net.createServer({ allowHalfOpen: true }, (sock) => {
     sock.setEncoding("utf8");
     let buf = "";
     let step = 0;
+    let preConnect: string[][] = [];
     sock.on("data", (chunk: string) => {
       buf += chunk;
       const parsed = parseGuacDaemonStream(buf);
@@ -1477,24 +1528,24 @@ async function runTests() {
       for (const instr of parsed.instructions) {
         if (step === 0 && instr[0] === "select" && instr[1] === "rdp") {
           step = 1;
-          sock.write(
-            encodeGuacForDaemon([
-              "args",
-              "VERSION_1_5_0",
-              "hostname",
-              "port",
-              "username",
-              "password",
-            ])
-          );
+          preConnect = [];
+          sock.write(encodeGuacForDaemon(["args", ...MOCK_RDP_ARGS]));
         } else if (step === 1 && instr[0] === "connect") {
           assert.equal(instr[1], "VERSION_1_5_0");
           assert.equal(instr[2], "127.0.0.1");
+          const values: Record<string, string> = {};
+          MOCK_RDP_ARGS.forEach((name, index) => {
+            values[name] = instr[index + 1];
+          });
+          rdpConnectCalls.push(values);
+          rdpPreConnect.push(preConnect);
           step = 2;
           sock.write(
             encodeGuacForDaemon(["ready", "$mock-rdp-session"]) +
               encodeGuacForDaemon(["size", "0", "1280", "720"])
           );
+        } else if (step === 1 && instr[0] !== "connect") {
+          preConnect.push(instr);
         }
       }
     });
@@ -1676,6 +1727,146 @@ async function runTests() {
       }
     });
   });
+
+  console.log(
+    "==> [7b] Testing RDP session parameters, live resize and reconnect policy..."
+  );
+
+  // --- what the bridge actually sent guacd ----------------------------------
+  assert.ok(rdpConnectCalls.length >= 2, "the bridge opened the mock RDP sessions");
+  const desktopIndex = rdpConnectCalls.findIndex((call) => call.username === "Administrator");
+  assert.ok(desktopIndex >= 0, "the desktop session reached guacd");
+  const firstRdp = rdpConnectCalls[desktopIndex];
+  // Defaults: balanced picture, audio on, drive redirected for uploads.
+  assert.equal(firstRdp.hostname, "127.0.0.1");
+  assert.equal(firstRdp.username, "Administrator");
+  assert.equal(firstRdp.password, "secret");
+  assert.equal(firstRdp.security, "any");
+  assert.equal(firstRdp["ignore-cert"], "true");
+  assert.equal(firstRdp["resize-method"], "display-update");
+  assert.equal(firstRdp["enable-drive"], "true");
+  assert.equal(firstRdp["drive-name"], "Sushi");
+  assert.equal(firstRdp["read-only"], "false");
+  assert.equal(firstRdp["disable-audio"], "false");
+  assert.equal(firstRdp["enable-wallpaper"], "false");
+  assert.equal(firstRdp["enable-theming"], "true");
+  assert.equal(firstRdp["color-depth"], "24");
+  assert.match(firstRdp["client-name"] ?? "", /^Sushi \(127\.0\.0\.1\)$/);
+
+  // Media capabilities are declared before connect — and only what we render.
+  const declared = rdpPreConnect[desktopIndex].map((instr) => instr[0]);
+  assert.ok(declared.includes("size"), "display size announced");
+  assert.ok(declared.includes("audio"), "audio stream declared when audio is on");
+  assert.ok(declared.includes("image"));
+  assert.ok(!declared.includes("video"), "no video stream is declared (never rendered)");
+
+  // --- RDP parameters -------------------------------------------------------
+  const baseCreds = {
+    host: "rdp.example.com",
+    port: 3389,
+    username: "Administrator",
+    password: "pw",
+  };
+  const params = buildRdpParams(baseCreds);
+  assert.equal(params.hostname, "rdp.example.com");
+  assert.equal(params.width, "1280");
+  assert.equal(params.height, "720");
+  assert.equal(params.dpi, "96");
+
+  // Picture presets: best keeps the eye candy, fast trades it for bandwidth.
+  assert.equal(buildRdpParams({ ...baseCreds, rdpPerformance: "best" })["enable-wallpaper"], "true");
+  assert.equal(buildRdpParams({ ...baseCreds, rdpPerformance: "best" })["color-depth"], "32");
+  assert.equal(buildRdpParams({ ...baseCreds, rdpPerformance: "best" })["force-lossless"], "true");
+  const fastParams = buildRdpParams({ ...baseCreds, rdpPerformance: "fast" });
+  assert.equal(fastParams["enable-wallpaper"], "false");
+  assert.equal(fastParams["enable-theming"], "false");
+  assert.equal(fastParams["enable-font-smoothing"], "false");
+  assert.equal(fastParams["color-depth"], "16");
+  // Unknown values fall back to balanced rather than being forwarded blindly.
+  assert.equal(normalizeRdpPerformance("ultra"), "balanced");
+  assert.equal(buildRdpParams({ ...baseCreds, rdpPerformance: "ultra" as never })["color-depth"], "24");
+
+  // Audio, view-only and drive redirection are connect-time switches.
+  assert.equal(buildRdpParams({ ...baseCreds, rdpAudio: false })["disable-audio"], "true");
+  assert.equal(buildRdpParams({ ...baseCreds, rdpReadOnly: true })["read-only"], "true");
+  const noDrive = buildRdpParams({ ...baseCreds, rdpDrive: false });
+  assert.equal(noDrive["enable-drive"], "false");
+  assert.equal(noDrive["drive-name"], undefined);
+
+  // Security modes are whitelisted, sizes clamped to what RDP accepts.
+  assert.equal(normalizeRdpSecurity("nla"), "nla");
+  assert.equal(normalizeRdpSecurity("bogus"), "any");
+  assert.equal(buildRdpParams({ ...baseCreds, rdpSecurity: "tls" }).security, "tls");
+  assert.equal(buildRdpParams({ ...baseCreds, width: 99999 }).width, "4096");
+  assert.equal(buildRdpParams({ ...baseCreds, height: 10 }).height, "480");
+  assert.equal(buildRdpParams({ ...baseCreds, dpi: 5 }).dpi, "72");
+  // A missing/zero port means "the default RDP port"; out-of-range ports clamp.
+  assert.equal(buildRdpParams({ ...baseCreds, port: 0 }).port, "3389");
+  assert.equal(buildRdpParams({ ...baseCreds, port: 70000 }).port, "65535");
+
+  // Timezone + client name reach the remote, but never as header injection.
+  assert.equal(normalizeTimezone("Asia/Phnom_Penh"), "Asia/Phnom_Penh");
+  assert.equal(normalizeTimezone("America/Argentina/Buenos_Aires"), "America/Argentina/Buenos_Aires");
+  assert.equal(normalizeTimezone("../../etc/passwd"), "");
+  assert.equal(normalizeTimezone(""), "");
+  assert.equal(normalizeClientName("Sushi\u0000Box", "h"), "SushiBox");
+  assert.equal(normalizeClientName(undefined, "box.example.com"), "Sushi (box.example.com)");
+  assert.ok(normalizeClientName("x".repeat(80), "h").length <= 32);
+
+  // --- live resize (fit-to-window) -----------------------------------------
+  assert.deepEqual(fitRemoteSize(1920.6, 1080.2), { width: 1920, height: 1080 });
+  assert.deepEqual(fitRemoteSize(300, 200), { width: 640, height: 480 });
+  assert.deepEqual(fitRemoteSize(5000, 5000), { width: 4096, height: 2160 });
+  assert.deepEqual(fitRemoteSize(1281, 721), { width: 1282, height: 722 });
+  assert.deepEqual(fitRemoteSize(0, 0), { width: 640, height: 480 });
+  // A 1-pixel drag must not resize the desktop, a real one must.
+  assert.equal(shouldResizeRemote(null, { width: 1280, height: 720 }), true);
+  assert.equal(shouldResizeRemote({ width: 1280, height: 720 }, { width: 1286, height: 722 }), false);
+  assert.equal(shouldResizeRemote({ width: 1280, height: 720 }, { width: 1300, height: 720 }), true);
+  // …and the request itself is skipped while the desktop is already close, which is
+  // what stopped the desktop oscillating between two sizes around a scrollbar.
+  assert.deepEqual(nextRemoteSize(null, { width: 1224, height: 850 }), { width: 1224, height: 850 });
+  assert.equal(nextRemoteSize({ width: 1224, height: 850 }, { width: 1224, height: 848 }), null);
+  assert.deepEqual(nextRemoteSize({ width: 1224, height: 850 }, { width: 1000, height: 700 }), {
+    width: 1000,
+    height: 700,
+  });
+  // A resize that only changes by a few pixels never reaches the server.
+  assert.equal(nextRemoteSize({ width: 1224, height: 850 }, { width: 1230, height: 852 }), null);
+  assert.equal(formatRemoteSize(1920, 1080), "1920 × 1080");
+  assert.equal(formatRemoteSize(0, 0), "—");
+
+  // --- reconnect policy -----------------------------------------------------
+  assert.equal(reconnectDelayMs(1), 1000);
+  assert.equal(reconnectDelayMs(2), 2000);
+  assert.equal(reconnectDelayMs(3), 4000);
+  assert.equal(reconnectDelayMs(9), 15000);
+  // Network trouble is retried; a bad password or an expired session is not.
+  assert.equal(shouldRetryRdpStatus(0x0207), true);
+  assert.equal(shouldRetryRdpStatus(0x0202), true);
+  assert.equal(shouldRetryRdpStatus(0x020b), true);
+  assert.equal(shouldRetryRdpStatus(0x0303), false);
+  assert.equal(shouldRetryRdpStatus(0x0301), false);
+  assert.equal(shouldRetryRdpStatus(0x030f), false);
+  assert.match(describeRdpStatus(0x0207), /guacd could not reach/);
+  assert.match(describeRdpStatus(0x0303), /refused the login/);
+  assert.match(describeRdpStatus(0x0301), /sign in again/);
+  assert.match(describeRdpStatus(9999, "Daemon said no"), /Daemon said no/);
+  assert.match(describeRdpStatus(0x0000), /session ended/i);
+
+  // --- saved preferences are validated, not trusted -------------------------
+  assert.deepEqual(parseRdpPrefs(undefined), DEFAULT_RDP_PREFS);
+  assert.deepEqual(parseRdpPrefs("nonsense"), DEFAULT_RDP_PREFS);
+  assert.deepEqual(
+    parseRdpPrefs({ performance: "fast", audio: false, readOnly: true, drive: false, fitWindow: false }),
+    { performance: "fast", audio: false, readOnly: true, drive: false, fitWindow: false }
+  );
+  // A corrupt entry only loses the corrupt field.
+  const partial = parseRdpPrefs({ performance: "wat", audio: false });
+  assert.equal(partial.performance, "balanced");
+  assert.equal(partial.audio, false);
+  assert.equal(partial.readOnly, false);
+  assert.equal(partial.fitWindow, true);
 
   console.log(
     "==> [8/10] Testing serverless exec stdin (live keystrokes + piped answers)..."
@@ -2202,7 +2393,7 @@ async function runTests() {
   rdpMock.close();
   sshServer.close();
   console.log(
-    "ALL AUTH, PASSKEY, KEY WHITELIST, TERMIX, SSH, SFTP, RDP, EXEC STDIN, FOLDER-DOWNLOAD, SELECTION-DOWNLOAD, RDP-COMPANION, MENU-KEYS, AND SYSTEM-INFO E2E TESTS PASSED!"
+    "ALL AUTH, PASSKEY, KEY WHITELIST, TERMIX, SSH, SFTP, RDP, RDP-SESSION, EXEC STDIN, FOLDER-DOWNLOAD, SELECTION-DOWNLOAD, RDP-COMPANION, MENU-KEYS, AND SYSTEM-INFO E2E TESTS PASSED!"
   );
 }
 

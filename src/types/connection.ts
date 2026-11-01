@@ -4,6 +4,14 @@ export type AuthMethod = "password" | "privateKey";
 
 export type RdpSecurityMode = "any" | "nla" | "tls" | "rdp";
 
+/**
+ * How much eye candy the RDP server is allowed to send.
+ *
+ * `best` keeps wallpaper, themes, font smoothing and lossless updates; `fast` drops
+ * all of it and uses 16-bit colour for slow links; `balanced` is the default.
+ */
+export type RdpPerformance = "best" | "balanced" | "fast";
+
 export interface WhitelistedSshKey {
   id: string;
   name: string;
@@ -33,6 +41,12 @@ export interface HostProfile {
   ignoreCert?: boolean;
   rdpWidth?: number;
   rdpHeight?: number;
+  /** Picture preset pinned to this host (unset = the browser's last choice). */
+  rdpPerformance?: RdpPerformance;
+  /** Play the desktop's audio (default on). */
+  rdpAudio?: boolean;
+  /** Redirect a drive so files can be dropped into the session (default on). */
+  rdpDrive?: boolean;
   // SFTP specific options
   initialPath?: string;
   // Organization
@@ -58,6 +72,18 @@ export interface ConnectionCredentials {
   ignoreCert?: boolean;
   width?: number;
   height?: number;
+  /** Display quality preset (see `RdpPerformance`). */
+  rdpPerformance?: RdpPerformance;
+  /** Stream the remote's audio to this browser. */
+  rdpAudio?: boolean;
+  /** View-only session: the remote ignores keyboard and mouse. */
+  rdpReadOnly?: boolean;
+  /** Redirect a drive into the session so files can be uploaded to it. */
+  rdpDrive?: boolean;
+  /** Machine name the remote session shows (Task Manager, drive label, …). */
+  rdpClientName?: string;
+  /** IANA zone for the remote clock, e.g. "Asia/Phnom_Penh". */
+  timezone?: string;
   dpi?: number;
 }
 

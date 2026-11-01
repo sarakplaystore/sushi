@@ -19,6 +19,7 @@ import type {
   AuthMethod,
   HostProfile,
   ProtocolType,
+  RdpPerformance,
   RdpProbeResult,
   RdpSecurityMode,
   SshTestResult,
@@ -85,6 +86,9 @@ export function HostProfileModal({
   const [ignoreCert, setIgnoreCert] = useState(true);
   const [rdpWidth, setRdpWidth] = useState(1280);
   const [rdpHeight, setRdpHeight] = useState(720);
+  // "auto" = keep whatever the browser's last RDP session used.
+  const [rdpQuality, setRdpQuality] = useState<"auto" | RdpPerformance>("auto");
+  const [rdpAudio, setRdpAudio] = useState(true);
   const [initialPath, setInitialPath] = useState("");
   const [group, setGroup] = useState("Production");
   const [accentColor, setAccentColor] = useState("#34d399");
@@ -115,6 +119,8 @@ export function HostProfileModal({
     setIgnoreCert(initialProfile?.ignoreCert !== false);
     setRdpWidth(initialProfile?.rdpWidth || 1280);
     setRdpHeight(initialProfile?.rdpHeight || 720);
+    setRdpQuality(initialProfile?.rdpPerformance || "auto");
+    setRdpAudio(initialProfile?.rdpAudio !== false);
     setInitialPath(initialProfile?.initialPath || "");
     setGroup(initialProfile?.group || "Production");
     setAccentColor(
@@ -224,6 +230,8 @@ export function HostProfileModal({
       ignoreCert: protocol === "rdp" ? ignoreCert : undefined,
       rdpWidth: protocol === "rdp" ? rdpWidth : undefined,
       rdpHeight: protocol === "rdp" ? rdpHeight : undefined,
+      rdpPerformance: protocol === "rdp" && rdpQuality !== "auto" ? rdpQuality : undefined,
+      rdpAudio: protocol === "rdp" ? rdpAudio : undefined,
       initialPath: protocol === "sftp" ? initialPath.trim() : undefined,
       group: group.trim() || "Servers",
       accentColor,
@@ -727,6 +735,37 @@ export function HostProfileModal({
                       className="h-4 w-4 rounded border-white/20 bg-[#0b0e14] accent-[#ff6b57]"
                     />
                     Ignore self-signed TLS cert
+                  </label>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                <div>
+                  <label className="mb-1 block text-xs text-slate-400">
+                    Picture Quality
+                  </label>
+                  <select
+                    value={rdpQuality}
+                    onChange={(e) =>
+                      setRdpQuality(e.target.value as "auto" | RdpPerformance)
+                    }
+                    className="w-full rounded-xl border border-white/10 bg-[#0b0e14] px-3 py-2 text-sm text-white outline-none focus:border-white/25"
+                  >
+                    <option value="auto">Auto (last used in this browser)</option>
+                    <option value="best">Best — wallpaper, themes, 32-bit</option>
+                    <option value="balanced">Balanced — themes + smoothing</option>
+                    <option value="fast">Fast — 16-bit, for slow links</option>
+                  </select>
+                </div>
+                <div className="flex items-end pb-1.5">
+                  <label className="flex cursor-pointer items-center gap-2 text-xs text-slate-300">
+                    <input
+                      type="checkbox"
+                      checked={rdpAudio}
+                      onChange={(e) => setRdpAudio(e.target.checked)}
+                      className="h-4 w-4 rounded border-white/20 bg-[#0b0e14] accent-[#ff6b57]"
+                    />
+                    Play the desktop&apos;s audio in the browser
                   </label>
                 </div>
               </div>

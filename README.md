@@ -242,6 +242,42 @@ download.
 
 ---
 
+## Command speed (`SUSHI_SSH_POOL`)
+
+On Vercel every keystroke runs as its own request, and a request used to open a brand-new SSH
+connection: TCP, key exchange, authentication — five or six round trips to the host *before*
+the command started. Measured against a host 60 ms away, one command took **~505 ms**; the
+command itself was a few milliseconds.
+
+Sushi now keeps the connection open for the next command:
+
+- the terminal's first probe opens the connection, and every command after it opens only a new
+  channel on that connection (no handshake, no new TCP connection);
+- key presses reach the running command over the same connection, so typing into a
+  whiptail/debconf menu is no longer one SSH handshake per key;
+- the distro badge (`Ubuntu 24.04.1 LTS · Oracle Cloud`) rides on it too, so the header no longer
+  opens a second connection while the shell is starting;
+- connections are per host + user + credentials (never shared between different logins), closed
+  after 90 s idle, recycled after 10 minutes, capped at 8 per instance, and kept alive with SSH
+  keepalives. A connection that died is dropped, and the command is retried once on a fresh one
+  (the command never started, so nothing runs twice);
+- the SSH socket is put in `TCP_NODELAY` mode: with Nagle enabled, each small write waited for the
+  previous one to be acknowledged, adding a delayed-ACK stall to every round trip.
+
+Same test after the change: **~195 ms** per command (2.6× faster; on a host 150 ms away the saving
+is proportionally larger, since a handshake is RTT-bound).
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `SUSHI_SSH_POOL` | on | `off` disables reuse — every request opens and closes its own connection. |
+| `SUSHI_SSH_POOL_IDLE_MS` | `90000` | How long an idle connection is kept for the next command. |
+| `SUSHI_SSH_POOL_MAX` | `8` | Idle connections kept per server instance. |
+| `SUSHI_SSH_POOL_MAX_AGE_MS` | `600000` | Hard limit on a connection's lifetime. |
+
+Running on Vercel: each warm function instance keeps its own pool, so the first command of an
+instance still pays for the handshake and the rest reuse it. A self-hosted instance (or a VPS
+gateway) keeps the connection warm for the whole session.
+
 ## SSH Troubleshooting
 
 | What you see | What it means / fix |

@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import React from "react";
+import { renderToStaticMarkup } from "react-dom/server";
 import { execFileSync, spawnSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
@@ -10,6 +12,8 @@ import path from "node:path";
 import { Server as SshServer, utils as sshUtils } from "ssh2";
 import { WebSocket } from "ws";
 import {
+  connectSsh,
+  describeSshError,
   sftpChmodItem,
   sftpDeleteItem,
   sftpListDirectory,
@@ -53,6 +57,17 @@ import {
   canSaveStreamToDisk,
   openArchiveSink,
 } from "../src/lib/client/zip-sink";
+import {
+  SSH_RETRY_DELAY_SECONDS,
+  cleanSshFailureMessage,
+  connectFailureFromExec,
+  describeSshConnectFailure,
+  formatRetryCountdown,
+  isRetryableSshFailure,
+  retryCountdownFraction,
+  tickRetryCountdown,
+} from "../src/lib/client/ssh-retry";
+import { SshConnectErrorCard } from "../src/components/SshConnectErrorCard";
 import {
   DEFAULT_RDP_PORT,
   buildRdpCompanionDraft,
@@ -592,6 +607,168 @@ async function runTests() {
     await sshErr({ port: closedPort, authMethod: "password", password: "x" }),
     new RegExp(`Connection refused by 127\\.0\\.0\\.1:${closedPort}`)
   );
+
+  // A connection that never finishes: a port that accepts TCP but never speaks SSH.
+  // This is what a firewalled host looks like, and it must produce one sentence.
+  {
+    const silent = net.createServer(() => {
+      /* accept the socket and stay silent */
+    });
+    await new Promise<void>((resolve) => silent.listen(0, "127.0.0.1", () => resolve()));
+    const silentPort = (silent.address() as net.AddressInfo).port;
+    const timeoutError = await connectSsh(
+      {
+        host: "127.0.0.1",
+        port: silentPort,
+        username: "ubuntu",
+        authMethod: "password",
+        password: "x",
+      },
+      600
+    ).then(
+      () => "",
+      (err: Error) => err.message
+    );
+    assert.equal(
+      timeoutError,
+      `Could not reach 127.0.0.1:${silentPort} (connection timed out). Check the IP and port, and any firewall between this Sushi server and the host.`
+    );
+    // Not awaited: a socket the SSH client abandoned can keep `close`'s callback
+    // pending, and the check above already proved what it needed to.
+    silent.close();
+  }
+
+  // Item 12: an unreachable host shows exactly the server's sentence — never a shell
+  // prompt and never the echoed command (`ubuntu@indo.rakvpn.eu.org:~$ sudo su`).
+  {
+    const target = { host: "indo.rakvpn.eu.org", port: 22, username: "ubuntu" };
+    const VERCEL_SENTENCE =
+      "Could not reach indo.rakvpn.eu.org:22 (connection timed out). Check the IP and port, and that the server's firewall allows SSH from the internet (Vercel connects from changing AWS IP addresses).";
+    const timedOut = Object.assign(new Error("connect ETIMEDOUT 203.0.113.9:22"), {
+      code: "ETIMEDOUT",
+    });
+
+    // What the server says on Vercel / on a VPS.
+    assert.equal(describeSshError(timedOut, target, { onVercel: true }), VERCEL_SENTENCE);
+    assert.equal(
+      describeSshError(timedOut, target, { onVercel: false }),
+      "Could not reach indo.rakvpn.eu.org:22 (connection timed out). Check the IP and port, and any firewall between this Sushi server and the host."
+    );
+    // A private address on Vercel explains why it can never work there.
+    assert.equal(
+      describeSshError(timedOut, { host: "192.168.1.9", port: 22 }, { onVercel: true }),
+      "Could not reach 192.168.1.9:22 (connection timed out). 192.168.1.9 is a private / LAN / Tailscale address, which Sushi on Vercel cannot reach. Run Sushi on that network (VPS / Docker install) or attach a VPS gateway that can reach it."
+    );
+
+    // What the browser keeps, given everything a dead session used to print.
+    const noisy = `\r\n\u001b[31mSSH Error: ${VERCEL_SENTENCE}\u001b[0m\r\nubuntu@indo.rakvpn.eu.org:~$ sudo su`;
+    assert.equal(cleanSshFailureMessage(noisy), VERCEL_SENTENCE);
+    const failure = describeSshConnectFailure(noisy, {
+      host: target.host,
+      port: target.port,
+    });
+    assert.equal(failure.message, VERCEL_SENTENCE);
+    assert.equal(failure.retryable, true);
+    // A prompt alone is never an error message.
+    assert.equal(cleanSshFailureMessage("ubuntu@indo.rakvpn.eu.org:~$ sudo su"), "");
+    assert.equal(
+      cleanSshFailureMessage(`\u001b[90mConnecting to ubuntu@host:22…\u001b[0m`),
+      "Connecting to ubuntu@host:22…"
+    );
+
+    // Credentials are not fixed by waiting; network problems are.
+    assert.equal(isRetryableSshFailure(VERCEL_SENTENCE), true);
+    assert.equal(
+      isRetryableSshFailure(
+        "Connection refused by host:22 — nothing is accepting SSH connections on that port. Check the port number and that the SSH server (sshd) is running."
+      ),
+      true
+    );
+    assert.equal(
+      isRetryableSshFailure(
+        "Authentication failed for ubuntu@host: wrong username or password, or the server has password logins disabled (PasswordAuthentication no) — use SSH key authentication instead."
+      ),
+      false
+    );
+    assert.equal(
+      isRetryableSshFailure(
+        "Unsupported private key format — paste an OpenSSH, PEM or PKCS#8 private key."
+      ),
+      false
+    );
+
+    // Which exec results mean "nothing ran": the streaming `error` event before the
+    // session opened, or a non-2xx answer with no output. A command that ran and
+    // failed keeps its output and must NOT show the reconnect card.
+    assert.equal(
+      connectFailureFromExec({ output: "", connectError: VERCEL_SENTENCE }),
+      VERCEL_SENTENCE
+    );
+    assert.equal(
+      connectFailureFromExec({ output: "", httpError: "Your session expired." }),
+      "Your session expired."
+    );
+    assert.equal(
+      connectFailureFromExec({
+        output: "bash: foo: command not found\n",
+        httpError: undefined,
+        connectError: undefined,
+      }),
+      undefined
+    );
+    assert.equal(
+      connectFailureFromExec({ output: "partial", connectError: VERCEL_SENTENCE }),
+      VERCEL_SENTENCE
+    );
+
+    // The countdown: 10 → 9 → … → 0 (retry now).
+    assert.equal(SSH_RETRY_DELAY_SECONDS, 10);
+    assert.equal(formatRetryCountdown(SSH_RETRY_DELAY_SECONDS), "Retrying in 10s…");
+    assert.equal(formatRetryCountdown(1), "Retrying in 1s…");
+    assert.equal(formatRetryCountdown(0), "Reconnecting now…");
+    assert.equal(tickRetryCountdown(10), 9);
+    assert.equal(tickRetryCountdown(2), 1);
+    assert.equal(tickRetryCountdown(1), 0);
+    assert.equal(retryCountdownFraction(10), 1);
+    assert.equal(retryCountdownFraction(5), 0.5);
+    assert.equal(retryCountdownFraction(0), 0);
+
+    // The card shows the sentence, the countdown and the two actions — and no trace
+    // of the old fake prompt or the echoed command.
+    const card = renderToStaticMarkup(
+      React.createElement(SshConnectErrorCard, {
+        failure,
+        retryIn: SSH_RETRY_DELAY_SECONDS,
+        onReconnect: () => {},
+        onCancelRetry: () => {},
+      })
+    );
+    // React escapes the apostrophe in "server's" for HTML.
+    const asHtml = (text: string) =>
+      text
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#x27;");
+    assert.ok(card.includes(asHtml(VERCEL_SENTENCE)), "the card shows the server sentence");
+    assert.ok(card.includes("Retrying in 10s…"), "the card shows the retry countdown");
+    assert.ok(card.includes("Reconnect"), "the card offers a reconnect button");
+    assert.ok(!/ubuntu@[^\s<]*:~\$|sudo su/.test(card), "no prompt or echoed command");
+    assert.ok(!card.includes("Sushi Serverless SSH Stream"), "no transport banner");
+
+    // With the automatic retry stopped, the card says so instead of counting down.
+    const stopped = renderToStaticMarkup(
+      React.createElement(SshConnectErrorCard, {
+        failure,
+        retryIn: null,
+        onReconnect: () => {},
+        onCancelRetry: () => {},
+      })
+    );
+    assert.ok(!stopped.includes("Retrying in"));
+    assert.ok(stopped.includes("Automatic retry is off"));
+  }
 
   // Serverless shell builtins: `sudo su`, `sudo -i`, `sudo <cmd>`, exit, bare su
   {
@@ -2393,7 +2570,7 @@ async function runTests() {
   rdpMock.close();
   sshServer.close();
   console.log(
-    "ALL AUTH, PASSKEY, KEY WHITELIST, TERMIX, SSH, SFTP, RDP, RDP-SESSION, EXEC STDIN, FOLDER-DOWNLOAD, SELECTION-DOWNLOAD, RDP-COMPANION, MENU-KEYS, AND SYSTEM-INFO E2E TESTS PASSED!"
+    "ALL AUTH, PASSKEY, KEY WHITELIST, TERMIX, SSH, SFTP, RDP, RDP-SESSION, EXEC STDIN, FOLDER-DOWNLOAD, SELECTION-DOWNLOAD, RDP-COMPANION, MENU-KEYS, SYSTEM-INFO, AND SSH-CONNECT-ERROR E2E TESTS PASSED!"
   );
 }
 

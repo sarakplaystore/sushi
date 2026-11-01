@@ -270,6 +270,11 @@ export async function connectSsh(
 
     try {
       client.connect(config);
+      // SSH traffic is small and latency-sensitive (a keystroke, a channel request).
+      // With Nagle on, each write waits for the previous one to be acknowledged and
+      // every round trip grows by a delayed-ACK stall (~40 ms) — on a LAN that is
+      // most of the time a command takes.
+      client.setNoDelay(true);
     } catch (err) {
       clearTimeout(timer);
       settled = true;

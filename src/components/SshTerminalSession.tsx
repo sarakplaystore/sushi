@@ -1388,6 +1388,10 @@ export function SshTerminalSession({
               `\x1b[90mConnecting to ${profile.username}@${profile.host}:${profile.port}…\x1b[0m`
             );
           }, 600);
+          // The machine-info probe starts with the shell probe instead of after it.
+          // Both ride on the same SSH connection, so naming the distro adds nothing
+          // to the wait, and the prompt no longer sits behind a separate handshake.
+          const sysinfo = ensureSystemInfo();
           const probe = await execServerless("pwd");
           clearTimeout(progress);
           if (disposed || connectFailureRef.current) return;
@@ -1412,11 +1416,11 @@ export function SshTerminalSession({
             setCurrentCwd(reportedCwd);
           }
 
-          // Name the machine under the banner. The probe never holds the shell up
-          // for more than a couple of seconds.
+          // Name the machine under the banner. It is already in flight (and usually
+          // finished); a slow or restricted host must not hold the prompt up.
           const info = await Promise.race([
-            ensureSystemInfo(),
-            new Promise<null>((resolve) => setTimeout(() => resolve(null), 2500)),
+            sysinfo,
+            new Promise<null>((resolve) => setTimeout(() => resolve(null), 700)),
           ]);
           if (disposed || connectFailureRef.current) return;
           const line = formatTerminalSystemLine(info);

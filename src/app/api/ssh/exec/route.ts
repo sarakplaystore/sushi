@@ -1,12 +1,15 @@
 import { StringDecoder } from "node:string_decoder";
+import type { ClientChannel } from "ssh2";
 import { NextRequest, NextResponse } from "next/server";
 import type { ConnectionCredentials } from "@/types/connection";
-import { connectSsh, shellQuote } from "@/lib/server/ssh-client";
+import { shellQuote } from "@/lib/server/ssh-client";
+import { acquireSsh, openExecChannel, type SshLease } from "@/lib/server/ssh-pool";
 import { getCorsHeaders, verifyRequestAccess } from "@/lib/server/security";
 import { META_REGEX, PROMPT_HINT_RE, splitEmittable } from "@/lib/server/exec-stream";
 import { pumpExecInput, readExecStart } from "@/lib/server/exec-input";
 import {
   buildExecScript,
+  buildKeyDeliveryScript,
   createKeyChannelPath,
   createSudoAnswerer,
   type ExecElevation,
@@ -141,21 +144,58 @@ export async function POST(req: NextRequest) {
         }
       };
 
-      let session: Awaited<ReturnType<typeof connectSsh>> | null = null;
+      // A connection handed over by the pool (no handshake) or a fresh one.
+      let lease: SshLease | null = null;
+      let activeChannel: ClientChannel | null = null;
+      /** Keystroke FIFO of this command, so Ctrl+C can reach it (see below). */
+      let keyChannelPath: string | null = null;
 
+      /**
+       * Cancels the running command without killing the connection: the next command
+       * reuses it. `^C` goes to the command's terminal, or into its keystroke FIFO
+       * when the command owns one, so the process stops instead of hanging around.
+       */
       const onAbort = () => {
         closed = true;
-        session?.client.destroy();
+        try {
+          activeChannel?.write("\x03");
+        } catch {
+          // channel already gone
+        }
+        if (keyChannelPath && lease) {
+          try {
+            lease.session.client.exec(
+              buildKeyDeliveryScript(keyChannelPath, "\x03"),
+              () => {
+                // fire and forget: this request is already cancelled
+              }
+            );
+          } catch {
+            // connection already gone
+          }
+        }
+        try {
+          activeChannel?.close();
+        } catch {
+          // already closed
+        }
       };
       req.signal.addEventListener("abort", onAbort, { once: true });
 
       try {
-        session = await connectSsh(creds, 14000);
+        // A warm connection costs no handshake at all; the first command in a
+        // session opens one, every command after it reuses it.
+        lease = await acquireSsh(creds, { timeoutMs: 14000, exclusive: true });
+
         const keyChannel = body.keyChannel ? createKeyChannelPath() : null;
+        keyChannelPath = keyChannel;
         sendEvent({
           type: "ready",
-          fingerprint: session.fingerprint,
-          banner: session.serverBanner,
+          fingerprint: lease.session.fingerprint,
+          banner: lease.session.serverBanner,
+          // How this command reached the host: reused = no SSH handshake.
+          reused: lease.reused,
+          connectMs: lease.connectMs,
           ...(keyChannel ? { keyChannel } : {}),
         });
 
@@ -170,23 +210,22 @@ export async function POST(req: NextRequest) {
           pipedInput: keyChannel ? body.stdin ?? null : null,
         });
 
-        await new Promise<void>((resolve) => {
-          const ptyOptions = {
-            term: "xterm-256color",
-            cols,
-            rows,
-            ...(ptyModes ? { modes: ptyModes } : {}),
-          };
+        const ptyOptions = {
+          term: "xterm-256color",
+          cols,
+          rows,
+          ...(ptyModes ? { modes: ptyModes } : {}),
+        };
 
-          session!.client.exec(
+        await new Promise<void>((resolve) => {
+          openExecChannel(lease!, creds, {
             script,
-            { pty: ptyOptions },
-            (err, ch) => {
-              if (err) {
-                sendEvent({ type: "error", message: err.message });
-                resolve();
-                return;
-              }
+            pty: ptyOptions,
+            timeoutMs: 14000,
+          }).then(
+            ({ channel: ch, lease: activeLease }) => {
+              lease = activeLease;
+              activeChannel = ch;
 
               let carry = "";
               let parsedMeta = false;
@@ -388,6 +427,14 @@ export async function POST(req: NextRequest) {
                 }
                 resolve();
               });
+            },
+            (err: Error) => {
+              // The channel could not be opened on a fresh connection either.
+              sendEvent({
+                type: "error",
+                message: err?.message || "SSH execution failed.",
+              });
+              resolve();
             }
           );
         });
@@ -398,7 +445,9 @@ export async function POST(req: NextRequest) {
         });
       } finally {
         req.signal.removeEventListener("abort", onAbort);
-        session?.client.end();
+        // Give the connection back instead of closing it: the next command in this
+        // session (and the next keystroke) runs without a new SSH handshake.
+        lease?.release();
         if (!closed) {
           closed = true;
           try {

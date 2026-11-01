@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import type { ConnectionCredentials } from "@/types/connection";
-import { fetchSshSystemInfo } from "@/lib/server/ssh-client";
+import { fetchSshSystemInfoPooled } from "@/lib/server/ssh-pool";
 import { getCorsHeaders, verifyRequestAccess } from "@/lib/server/security";
 
 export const runtime = "nodejs";
@@ -47,7 +47,8 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  const info = await fetchSshSystemInfo(creds);
+  // Rides on the connection the terminal is already using: no second handshake.
+  const info = await fetchSshSystemInfoPooled(creds);
   if (!info) {
     return NextResponse.json(
       { ok: false, error: "Could not read the remote system information." },

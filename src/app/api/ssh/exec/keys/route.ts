@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import type { ConnectionCredentials } from "@/types/connection";
-import { connectSsh } from "@/lib/server/ssh-client";
+import { runSshCommand } from "@/lib/server/ssh-pool";
 import { getCorsHeaders, verifyRequestAccess } from "@/lib/server/security";
 import {
   buildKeyDeliveryScript,
@@ -20,8 +20,11 @@ export const maxDuration = 30;
  * their own terminal. In serverless mode Sushi runs such a command inside `script(1)`
  * with a keystroke FIFO as its input, so a key press can arrive as its own small
  * request — it does not need a live request stream, HTTP/2, or the same server
- * instance. Every call is a fresh SSH connection that only writes bytes into the
- * FIFO, so it works for elevated commands too (the FIFO belongs to the login user).
+ * instance.
+ *
+ * Each press writes a few bytes into the FIFO, so it rides on the connection the
+ * running command already uses (`runSshCommand` shares it instead of handshaking
+ * per key). It works for elevated commands too: the FIFO belongs to the login user.
  */
 export async function OPTIONS(req: NextRequest) {
   return new NextResponse(null, {
@@ -77,46 +80,13 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  let session: Awaited<ReturnType<typeof connectSsh>>;
   try {
-    session = await connectSsh(
-      { ...creds, password: creds.password, privateKey: creds.privateKey },
-      12000
-    );
-  } catch (err) {
-    return NextResponse.json(
-      {
-        ok: false,
-        error: err instanceof Error ? err.message : "SSH connection failed.",
-      },
-      { status: 502, headers: cors }
-    );
-  }
-
-  try {
-    const output = await new Promise<string>((resolve, reject) => {
-      const timer = setTimeout(
-        () => reject(new Error("The remote host did not answer in time.")),
-        12000
-      );
-      session.client.exec(buildKeyDeliveryScript(path, keys), (err, ch) => {
-        if (err) {
-          clearTimeout(timer);
-          reject(err);
-          return;
-        }
-        let text = "";
-        ch.on("data", (chunk: Buffer) => {
-          text += chunk.toString("utf8");
-        });
-        ch.stderr.on("data", (chunk: Buffer) => {
-          text += chunk.toString("utf8");
-        });
-        ch.on("close", () => {
-          clearTimeout(timer);
-          resolve(text);
-        });
-      });
+    // Shared on purpose: the connection running the command carries this too, so a
+    // key press is one round trip instead of a whole SSH handshake.
+    const { output } = await runSshCommand(creds, {
+      script: buildKeyDeliveryScript(path, keys),
+      timeoutMs: 12000,
+      maxWaitMs: 8000,
     });
 
     const result = parseKeyDeliveryResult(output);
@@ -142,7 +112,5 @@ export async function POST(req: NextRequest) {
       },
       { status: 502, headers: cors }
     );
-  } finally {
-    session.client.end();
   }
 }

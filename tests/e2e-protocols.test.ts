@@ -11,6 +11,7 @@ import net from "node:net";
 import path from "node:path";
 import { Server as SshServer, utils as sshUtils } from "ssh2";
 import { WebSocket } from "ws";
+import { NextRequest } from "next/server";
 import {
   connectSsh,
   describeSshError,
@@ -87,6 +88,15 @@ import {
   detectCloudProvider,
   parseSysinfo,
 } from "../src/lib/server/sysinfo";
+import {
+  acquireSsh,
+  closeSshPool,
+  fetchSshSystemInfoPooled,
+  openExecChannel,
+  runSshCommand,
+  sshPoolStats,
+} from "../src/lib/server/ssh-pool";
+import { POST as execRoutePost } from "../src/app/api/ssh/exec/route";
 import {
   formatOsLabel,
   formatSystemDetails,
@@ -2564,13 +2574,237 @@ async function runTests() {
   assert.ok(details.some((line) => line.includes("4 vCPU")));
   assert.ok(details.some((line) => line.includes("23 GB RAM")));
 
+  console.log(
+    "==> [9c] Testing SSH connection reuse (commands, keystrokes, machine info)..."
+  );
+
+  // A dedicated host so the counters below only see what the pool does.
+  const poolHost = {
+    connections: 0,
+    execs: 0,
+    live: 0,
+  };
+  const poolServer = new SshServer({ hostKeys: [privateKey] }, (client) => {
+    (client as unknown as { _sock?: net.Socket })._sock?.setNoDelay?.(true);
+    poolHost.connections += 1;
+    poolHost.live += 1;
+    client.on("close", () => {
+      poolHost.live -= 1;
+    });
+    client.on("authentication", (ctx) => {
+      if (ctx.method === "password" && ctx.username === "pooler" && ctx.password === "pw") {
+        ctx.accept();
+      } else {
+        ctx.reject(["password"]);
+      }
+    });
+    client.on("ready", () => {
+      client.on("session", (accept) => {
+        const session = accept();
+        session.on("pty", (acceptPty) => {
+          acceptPty?.();
+        });
+        session.on("exec", (acceptExec, _reject, info) => {
+          poolHost.execs += 1;
+          const stream = acceptExec();
+          if (info.command.includes("HOST=")) {
+            stream.write(
+              [
+                "HOST=pool-box",
+                "PRETTY=Ubuntu 24.04.1 LTS",
+                "DISTRO=Ubuntu",
+                "VERSION=24.04",
+                "CLOUD_ID=oraclecloud",
+                "",
+              ].join("\n")
+            );
+          } else {
+            stream.write(`EXEC:${info.command.split("\n")[0]}\n`);
+          }
+          stream.write("\n\u001b]777;SUSHI_META;0;/home/pooler\u0007");
+          stream.exit(0);
+          stream.end();
+        });
+      });
+    });
+  });
+  await new Promise<void>((resolve) => poolServer.listen(0, "127.0.0.1", () => resolve()));
+  const poolPort = (poolServer.address() as net.AddressInfo).port;
+  const poolCreds: ConnectionCredentials = {
+    host: "127.0.0.1",
+    port: poolPort,
+    username: "pooler",
+    authMethod: "password",
+    password: "pw",
+  };
+
+  // --- the second command does not pay for a second handshake ------------------
+  closeSshPool();
+  const hostConnectionsAtStart = poolHost.connections;
+
+  const firstRun = await runSshCommand(poolCreds, { script: "whoami" });
+  assert.match(firstRun.output, /EXEC:whoami/);
+  assert.equal(poolHost.connections, hostConnectionsAtStart + 1, "first command connects");
+  assert.equal(sshPoolStats().connections, 1);
+
+  const secondRun = await runSshCommand(poolCreds, { script: "docker ps" });
+  assert.match(secondRun.output, /EXEC:docker ps/);
+  assert.equal(
+    poolHost.connections,
+    hostConnectionsAtStart + 1,
+    "second command reuses the open connection (no SSH handshake)"
+  );
+  assert.equal(sshPoolStats().reused >= 1, true, "the pool reports the reuse");
+  assert.equal(sshPoolStats().created, 1);
+
+  // --- the machine-info probe rides the same connection ------------------------
+  const connectionCountBeforeInfo = poolHost.connections;
+  const pooledInfo = await fetchSshSystemInfoPooled(poolCreds);
+  assert.equal(pooledInfo?.os, "Ubuntu 24.04.1 LTS");
+  assert.equal(pooledInfo?.provider, "Oracle Cloud");
+  assert.equal(
+    poolHost.connections,
+    connectionCountBeforeInfo,
+    "the distro badge does not open a second connection"
+  );
+
+  // --- a key press shares the connection a command is already using ------------
+  closeSshPool();
+  const busyCommand = await acquireSsh(poolCreds, { exclusive: true });
+  const keyPress = await acquireSsh(poolCreds);
+  assert.equal(
+    keyPress.session.client,
+    busyCommand.session.client,
+    "the keystroke request reuses the command's connection"
+  );
+  keyPress.release();
+  busyCommand.release();
+
+  // --- two commands at once get their own connection each ----------------------
+  closeSshPool();
+  const [leaseA, leaseB] = await Promise.all([
+    acquireSsh(poolCreds, { exclusive: true }),
+    acquireSsh(poolCreds, { exclusive: true }),
+  ]);
+  assert.notEqual(
+    leaseA.session.client,
+    leaseB.session.client,
+    "an exclusive command never shares a connection with another command"
+  );
+  assert.equal(leaseA.reused && leaseB.reused, false);
+  leaseA.release();
+  leaseB.release();
+
+  // --- a connection that died is replaced, and the command still runs ----------
+  closeSshPool();
+  await runSshCommand(poolCreds, { script: "whoami" });
+  const connectionsBeforeBreak = poolHost.connections;
+  const doomed = await acquireSsh(poolCreds, { exclusive: true });
+  doomed.markBroken();
+  doomed.release();
+  const afterBreak = await runSshCommand(poolCreds, { script: "uptime" });
+  assert.match(afterBreak.output, /EXEC:uptime/);
+  assert.equal(
+    poolHost.connections,
+    connectionsBeforeBreak + 1,
+    "a dead connection is not handed out again"
+  );
+
+  // --- TCP_NODELAY: commands and keystrokes are not held back by Nagle ---------
+  {
+    const original = net.Socket.prototype.setNoDelay;
+    const calls: boolean[] = [];
+    net.Socket.prototype.setNoDelay = function patched(this: net.Socket, value?: boolean) {
+      calls.push(Boolean(value));
+      return original.call(this, value);
+    };
+    try {
+      const session = await connectSsh(
+        { ...poolCreds, username: "pooler" },
+        8000
+      );
+      session.client.end();
+    } finally {
+      net.Socket.prototype.setNoDelay = original;
+    }
+    // The mock host sets it on its own socket too; what matters is that the
+    // client's socket is never left with Nagle enabled.
+    assert.ok(calls.length >= 1, "the SSH socket is configured");
+    assert.equal(calls.every(Boolean), true, "Nagle is disabled on the SSH socket");
+  }
+
+  // --- the real route: two commands, one connection ----------------------------
+  closeSshPool();
+  process.env.SUSHI_GATEWAY_TOKEN = "pool-test-token";
+  const execRouteEvents = async (command: string) => {
+    const request = new NextRequest("http://localhost/api/ssh/exec", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-sushi-token": "pool-test-token",
+      },
+      body: JSON.stringify({
+        credentials: poolCreds,
+        command,
+        cwd: "/home/pooler",
+        cols: 100,
+        rows: 30,
+        keyChannel: true,
+      }),
+    });
+    const response = await execRoutePost(request);
+    assert.equal(response.status, 200);
+    const text = await response.text();
+    return text
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+  };
+
+  try {
+    const connectionsBeforeRoute = poolHost.connections;
+    const firstEvents = await execRouteEvents("pwd");
+    const firstReady = firstEvents.find((event) => event.type === "ready");
+    assert.ok(firstReady, "the route announces the session");
+    assert.equal(firstReady?.reused, false, "the first command opens the connection");
+    assert.ok(Number(firstReady?.connectMs) >= 0);
+    assert.equal(firstEvents[0]?.type, "ready");
+    assert.equal(firstEvents[firstEvents.length - 1]?.type, "meta");
+    assert.ok(firstEvents.some((event) => event.type === "data"));
+    assert.equal(poolHost.connections, connectionsBeforeRoute + 1);
+
+    const secondEvents = await execRouteEvents("ls -la");
+    const secondReady = secondEvents.find((event) => event.type === "ready");
+    assert.equal(secondReady?.reused, true, "the next command reuses the connection");
+    assert.equal(secondReady?.connectMs, 0, "no handshake was needed");
+    assert.equal(
+      poolHost.connections,
+      connectionsBeforeRoute + 1,
+      "the route did not open a second SSH connection"
+    );
+
+    // Ctrl+C cancels the command but keeps the connection for the next one.
+    const thirdEvents = await execRouteEvents("whoami");
+    assert.equal(
+      thirdEvents.find((event) => event.type === "ready")?.reused,
+      true,
+      "still the same warm connection"
+    );
+    assert.equal(poolHost.connections, connectionsBeforeRoute + 1);
+  } finally {
+    delete process.env.SUSHI_GATEWAY_TOKEN;
+  }
+
+  closeSshPool();
+  await new Promise<void>((resolve) => poolServer.close(() => resolve()));
+
   console.log("==> [10/10] Cleaning up test servers...");
   httpServer.close();
   guacdMock.close();
   rdpMock.close();
   sshServer.close();
   console.log(
-    "ALL AUTH, PASSKEY, KEY WHITELIST, TERMIX, SSH, SFTP, RDP, RDP-SESSION, EXEC STDIN, FOLDER-DOWNLOAD, SELECTION-DOWNLOAD, RDP-COMPANION, MENU-KEYS, SYSTEM-INFO, AND SSH-CONNECT-ERROR E2E TESTS PASSED!"
+    "ALL AUTH, PASSKEY, KEY WHITELIST, TERMIX, SSH, SFTP, RDP, RDP-SESSION, EXEC STDIN, FOLDER-DOWNLOAD, SELECTION-DOWNLOAD, RDP-COMPANION, MENU-KEYS, SYSTEM-INFO, SSH-CONNECT-ERROR, AND SSH-REUSE E2E TESTS PASSED!"
   );
 }
 

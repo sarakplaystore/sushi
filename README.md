@@ -247,6 +247,7 @@ download.
 | What you see | What it means / fix |
 |---|---|
 | `Could not reach host:22 (connection timed out)` | Wrong IP/port or a firewall. **Vercel cannot reach private / LAN / Tailscale addresses** (`192.168.x.x`, `10.x`, `100.64.x.x`): self-host Sushi on that network or attach a VPS gateway. |
+| The terminal shows only `Could not reach …` with a **Reconnect** button — no shell prompt | Expected. The SSH handshake never completed, so nothing ran and there is no shell to type into: Sushi shows the one sentence, offers **Reconnect**, and retries on its own every **10 s** (a countdown runs under the message; **Stop retrying** keeps it manual). Fix the port / firewall / credentials, then reconnect — no reload needed. |
 | `Connection refused by host:port` | Nothing listens for SSH on that port. Check the port and that `sshd` is running. |
 | `The connection … was reset before SSH finished connecting` | Firewall / network blocking outbound SSH, a fail2ban IP ban, or a non-SSH service on that port. |
 | `Authentication failed … wrong username or password` | Or the server has `PasswordAuthentication no`. Use SSH key authentication. |

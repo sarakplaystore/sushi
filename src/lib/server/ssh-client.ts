@@ -80,14 +80,22 @@ function isNonPublicHost(host: string): boolean {
   return false;
 }
 
-function reachabilityHint(host: string): string {
-  if (RUNNING_ON_VERCEL && isNonPublicHost(host)) {
+function reachabilityHint(host: string, onVercel: boolean): string {
+  if (onVercel && isNonPublicHost(host)) {
     return ` ${host} is a private / LAN / Tailscale address, which Sushi on Vercel cannot reach. Run Sushi on that network (VPS / Docker install) or attach a VPS gateway that can reach it.`;
   }
-  if (RUNNING_ON_VERCEL) {
+  if (onVercel) {
     return " Check the IP and port, and that the server's firewall allows SSH from the internet (Vercel connects from changing AWS IP addresses).";
   }
   return " Check the IP and port, and any firewall between this Sushi server and the host.";
+}
+
+/**
+ * Overrides the hosting situation the hint text is written for. Production code
+ * never passes it: the default is whether this process runs on Vercel.
+ */
+export interface DescribeSshErrorOptions {
+  onVercel?: boolean;
 }
 
 /**
@@ -95,8 +103,10 @@ function reachabilityHint(host: string): string {
  */
 export function describeSshError(
   err: unknown,
-  target: { host: string; port: number; username?: string; authMethod?: string }
+  target: { host: string; port: number; username?: string; authMethod?: string },
+  options: DescribeSshErrorOptions = {}
 ): string {
+  const onVercel = options.onVercel ?? RUNNING_ON_VERCEL;
   const raw = err instanceof Error ? err.message : String(err ?? "");
   const code = String((err as NodeJS.ErrnoException | undefined)?.code ?? "");
   const probe = `${code} ${raw}`;
@@ -107,13 +117,16 @@ export function describeSshError(
   }
   if (/ENOTFOUND|EAI_AGAIN|EAI_NODATA|EAI_NONAME/.test(probe)) {
     return `Could not resolve the hostname "${target.host}" (DNS lookup failed).${
-      RUNNING_ON_VERCEL && isNonPublicHost(target.host)
+      onVercel && isNonPublicHost(target.host)
         ? " Local network hostnames can't be resolved from Vercel."
         : ""
     }`;
   }
   if (/ETIMEDOUT|EHOSTUNREACH|ENETUNREACH|timed out|waiting for handshake/i.test(probe)) {
-    return `Could not reach ${where} (connection timed out).${reachabilityHint(target.host)}`;
+    return `Could not reach ${where} (connection timed out).${reachabilityHint(
+      target.host,
+      onVercel
+    )}`;
   }
   if (/ECONNRESET|EPIPE|socket hang up/i.test(probe)) {
     return `The connection to ${where} was reset before SSH finished connecting. Usual causes: a firewall or network that blocks outbound SSH, a fail2ban / IP ban, or a service on that port that isn't SSH.`;

@@ -68,6 +68,15 @@ import {
   formatTerminalSystemLine,
   loadSshSystemInfo,
 } from "@/lib/client/sysinfo";
+import {
+  SSH_RETRY_DELAY_SECONDS,
+  cleanSshFailureMessage,
+  connectFailureFromExec,
+  describeSshConnectFailure,
+  tickRetryCountdown,
+  type SshConnectFailure,
+} from "@/lib/client/ssh-retry";
+import { SshConnectErrorCard } from "@/components/SshConnectErrorCard";
 
 interface SshTerminalSessionProps {
   profile: HostProfile;
@@ -131,7 +140,13 @@ function decodeBase64Bytes(b64: string): Uint8Array {
 }
 
 /** Result of an elevation (sudo) probe. */
-type ElevationProbe = { ok: boolean; needsPassword: boolean; message: string };
+type ElevationProbe = {
+  ok: boolean;
+  needsPassword: boolean;
+  message: string;
+  /** Set when the probe could not even connect: the session is gone. */
+  connectError?: string;
+};
 
 /** While a sudo password is being typed, keystrokes are captured here instead. */
 type SecretPrompt =
@@ -203,6 +218,12 @@ export function SshTerminalSession({
   const [showSnippets, setShowSnippets] = useState(false);
   const [showThemes, setShowThemes] = useState(false);
   const [connectSeq, setConnectSeq] = useState(0);
+  /** The failure that ended the session; null while the session is healthy. */
+  const [connectFailure, setConnectFailure] = useState<SshConnectFailure | null>(
+    null
+  );
+  /** Seconds until the automatic reconnect; null means none is scheduled. */
+  const [retryIn, setRetryIn] = useState<number | null>(null);
   /** A serverless command is currently running (drives the input bar). */
   const [running, setRunning] = useState(false);
   /** The running command printed something that looks like a question. */
@@ -232,6 +253,10 @@ export function SshTerminalSession({
 
   // Refs used inside xterm.onData closure for Serverless Streaming Shell mode
   const modeRef = useRef<"ws" | "serverless">(wsAvailable ? "ws" : "serverless");
+  /** Mirrors `connectFailure` for the xterm / socket callbacks. */
+  const connectFailureRef = useRef<SshConnectFailure | null>(null);
+  /** True while the shell is still opening: typing has nowhere to go yet. */
+  const connectingRef = useRef(false);
   const cwdRef = useRef<string>(initialPath || profile.initialPath || "~");
   const lineBufferRef = useRef<string>("");
   const historyRef = useRef<string[]>([]);
@@ -293,8 +318,47 @@ export function SshTerminalSession({
     if (!value) setLivePrompt(null);
   }, []);
 
+  /**
+   * Ends the session with exactly one sentence.
+   *
+   * A failed connection must never leave a shell on screen: the terminal is wiped
+   * (so a prompt, a half-typed line or an echoed command cannot survive) and the
+   * error card takes over with Reconnect plus an automatic retry. Retryable
+   * failures are retried after `SSH_RETRY_DELAY_SECONDS`; credential problems are
+   * not, because waiting cannot fix them.
+   */
+  const failConnect = useCallback(
+    (raw: string | null | undefined) => {
+      const failure = describeSshConnectFailure(raw, {
+        host: profile.host,
+        port: profile.port,
+      });
+      connectFailureRef.current = failure;
+      setConnectFailure(failure);
+      setRetryIn(failure.retryable ? SSH_RETRY_DELAY_SECONDS : null);
+      setStatus("error");
+      lineBufferRef.current = "";
+      busyInputRef.current = "";
+      secretPromptRef.current = null;
+      secretBufferRef.current = "";
+      setExecBusy(false);
+      termRef.current?.reset();
+      termRef.current?.blur();
+    },
+    [profile.host, profile.port, setExecBusy]
+  );
+
+  /** Latest `failConnect`, for the transport callbacks installed per connection. */
+  const failConnectRef = useRef(failConnect);
+  useEffect(() => {
+    failConnectRef.current = failConnect;
+  }, [failConnect]);
+
   const writePrompt = useCallback(
     (term: import("@xterm/xterm").Terminal, cwdVal?: string) => {
+      // A dead connection has no prompt. Printing one is what used to make a failed
+      // session look alive (`ubuntu@host:~$ sudo su` under the timeout message).
+      if (connectFailureRef.current) return;
       const displayPath = cwdVal ?? cwdRef.current ?? "~";
       const asRoot = elevatedUserRef.current !== null;
       const user = elevatedUserRef.current ?? profile.username;
@@ -330,7 +394,14 @@ export function SshTerminalSession({
         /** Told whether keystrokes can reach this command's stdin. */
         onInputReady?: (canSendInput: boolean) => void;
       } = {}
-    ): Promise<{ exitCode: number; output: string; httpError?: string }> => {
+    ): Promise<{
+      exitCode: number;
+      output: string;
+      /** The HTTP request itself failed (auth, bad body, gateway…). */
+      httpError?: string;
+      /** The SSH session never opened, so nothing ran at all. */
+      connectError?: string;
+    }> => {
       const term = termRef.current;
       const utf8Decoder = new TextDecoder("utf-8");
 
@@ -371,6 +442,7 @@ export function SshTerminalSession({
         exitCode: number;
         output: string;
         httpError?: string;
+        connectError?: string;
         retryWithoutStreaming?: boolean;
       };
 
@@ -381,6 +453,7 @@ export function SshTerminalSession({
         let exitCode = 0;
         let gotReady = false;
         let settled = false;
+        let connectError: string | undefined;
 
         const streaming = allowStreaming && canStreamExecStdin();
         const payload = buildPayload(!streaming);
@@ -468,10 +541,17 @@ export function SshTerminalSession({
                   setCurrentCwd(evt.cwd);
                 }
               } else if (evt.type === "error") {
-                if (!gotReady) setStatus("error");
                 const message = String(evt.message || "SSH error");
                 output += `\n${message}`;
-                options.stream?.(`\r\n\x1b[31m${message}\x1b[0m`);
+                if (!gotReady) {
+                  // The session never opened: the caller shows this as the
+                  // one-sentence failure card (and retries it), so it is not
+                  // printed into the terminal and no prompt is drawn after it.
+                  connectError = message;
+                  setStatus("error");
+                } else {
+                  options.stream?.(`\r\n\x1b[31m${message}\x1b[0m`);
+                }
               }
             }
           }
@@ -507,7 +587,7 @@ export function SshTerminalSession({
           channel?.channel.close();
         }
 
-        return { exitCode, output };
+        return { exitCode, output, connectError };
       };
 
       const wantsStreaming = !streamingBlockedRef.current && canStreamExecStdin();
@@ -539,6 +619,17 @@ export function SshTerminalSession({
       const probe = await execServerless("true", { elevateUser: user, password });
       if (probe.exitCode === 0) {
         return { ok: true, needsPassword: false, message: "" };
+      }
+      // Nothing ran at all: the host is unreachable or the session ended. Reporting
+      // that as "sudo is not installed" would send the user after the wrong problem.
+      const lost = connectFailureFromExec(probe);
+      if (lost) {
+        return {
+          ok: false,
+          needsPassword: false,
+          message: cleanSshFailureMessage(lost),
+          connectError: lost,
+        };
       }
       const text = probe.output || probe.httpError || "";
       if (SUDO_WRONG_PASSWORD_RE.test(text)) {
@@ -692,6 +783,10 @@ export function SshTerminalSession({
 
       term.writeln("\r\n\x1b[90mChecking sudo…\x1b[0m");
       const probe = await probeElevation("root", known);
+      if (probe.connectError) {
+        failConnectRef.current(probe.connectError);
+        return "done";
+      }
       if (probe.ok) {
         if (known) sudoPasswordRef.current = known;
         else sudoNoPasswordRef.current = true;
@@ -802,6 +897,8 @@ export function SshTerminalSession({
 
       // Elevation needs credentials first: remember NOPASSWD, otherwise ask once.
       const password = options.password ?? sudoPasswordRef.current ?? undefined;
+      /** The command never ran because the session itself failed. */
+      let sessionLost = false;
       setExecBusy(true);
       try {
         if (elevateUser && !password && !sudoNoPasswordRef.current) {
@@ -810,6 +907,9 @@ export function SshTerminalSession({
             sudoNoPasswordRef.current = true;
           } else if (probe.needsPassword) {
             askSudoPassword(term, { action: "run", command: rawCmd, elevateUser });
+            return;
+          } else if (probe.connectError) {
+            failConnectRef.current(probe.connectError);
             return;
           } else {
             term.writeln(`\r\n\x1b[31m${probe.message}\x1b[0m`);
@@ -881,6 +981,16 @@ export function SshTerminalSession({
           },
         });
 
+        // Nothing ran at all: the connection failed (dead host, firewall, expired
+        // session). Show the one-sentence card instead of a prompt that can never
+        // execute anything.
+        const lost = connectFailureFromExec(result);
+        if (lost) {
+          sessionLost = true;
+          failConnectRef.current(lost);
+          return;
+        }
+
         // sudo accepted / rejected the password we used
         if (elevateUser && options.password) {
           if (SUDO_WRONG_PASSWORD_RE.test(result.output)) {
@@ -899,8 +1009,9 @@ export function SshTerminalSession({
         menuSignatureRef.current = "";
         setMenu(null);
         setExecBusy(false);
-        // When a password prompt was started, the prompt itself is the cursor
-        if (!secretPromptRef.current) writePrompt(term);
+        // When a password prompt was started, the prompt itself is the cursor.
+        // A lost session keeps the error card instead of a prompt.
+        if (!secretPromptRef.current && !sessionLost) writePrompt(term);
       }
     },
     [askSudoPassword, enterRootMode, execServerless, profile.username, probeElevation, writePrompt]
@@ -973,6 +1084,12 @@ export function SshTerminalSession({
 
     async function initSession() {
       if (!containerRef.current) return;
+      // Every session starts clean: the previous failure (and its countdown) is
+      // gone before a byte of the new connection is attempted.
+      connectFailureRef.current = null;
+      connectingRef.current = false;
+      setConnectFailure(null);
+      setRetryIn(null);
 
       const [{ Terminal }, { FitAddon }, { WebLinksAddon }, { SearchAddon }] =
         await Promise.all([
@@ -1040,6 +1157,10 @@ export function SshTerminalSession({
 
       // Handle user keystrokes across both WS and Serverless modes
       term.onData((data) => {
+        // A failed connection is not a shell: keys are dropped, so nothing gets
+        // echoed under the error message (`ubuntu@host:~$ sudo su`). While the shell
+        // is still opening there is nothing to type into either.
+        if (connectFailureRef.current || connectingRef.current) return;
         if (modeRef.current === "ws") {
           const ws = wsRef.current;
           if (ws && ws.readyState === WebSocket.OPEN) {
@@ -1252,19 +1373,58 @@ export function SshTerminalSession({
         if (notice) {
           term.writeln(`\x1b[90m${notice}\x1b[0m`);
         }
-        term.writeln(
-          `\x1b[38;2;255;107;87m● Sushi Serverless SSH Stream\x1b[0m \x1b[90m(${profile.username}@${profile.host}:${profile.port})\x1b[0m`
-        );
-        // Name the machine under the banner, then resolve the working directory. The
-        // probe never holds the shell up for more than a couple of seconds.
         void (async () => {
+          // The first command is both the reachability check and the working
+          // directory read: the SSH handshake really has to happen before anything
+          // is drawn. A host that cannot be reached then shows one sentence and a
+          // Reconnect card — never a banner plus a prompt that can execute nothing.
+          setStatus("connecting");
+          connectingRef.current = true;
+          // Only mention the wait when there actually is one: a fast handshake goes
+          // straight to the banner. A failed one is replaced by the error card.
+          const progress = setTimeout(() => {
+            if (disposed || !connectingRef.current || connectFailureRef.current) return;
+            term.writeln(
+              `\x1b[90mConnecting to ${profile.username}@${profile.host}:${profile.port}…\x1b[0m`
+            );
+          }, 600);
+          const probe = await execServerless("pwd");
+          clearTimeout(progress);
+          if (disposed || connectFailureRef.current) return;
+
+          const lost = connectFailureFromExec(probe);
+          if (lost) {
+            connectingRef.current = false;
+            failConnectRef.current(lost);
+            return;
+          }
+
+          term.writeln(
+            `\x1b[38;2;255;107;87m● Sushi Serverless SSH Stream\x1b[0m \x1b[90m(${profile.username}@${profile.host}:${profile.port})\x1b[0m`
+          );
+          const reportedCwd = (probe.output || "")
+            .trim()
+            .split(/\r?\n/)
+            .pop()
+            ?.trim();
+          if (reportedCwd && reportedCwd.startsWith("/")) {
+            cwdRef.current = reportedCwd;
+            setCurrentCwd(reportedCwd);
+          }
+
+          // Name the machine under the banner. The probe never holds the shell up
+          // for more than a couple of seconds.
           const info = await Promise.race([
             ensureSystemInfo(),
             new Promise<null>((resolve) => setTimeout(() => resolve(null), 2500)),
           ]);
+          if (disposed || connectFailureRef.current) return;
           const line = formatTerminalSystemLine(info);
           if (line) term.writeln(`\x1b[90m\u21b3 ${line}\x1b[0m`);
-          void runServerlessCommand("pwd");
+          // Only now can anything be typed: a prompt exists from here on.
+          connectingRef.current = false;
+          writePrompt(term);
+          term.focus();
         })();
       };
 
@@ -1337,8 +1497,14 @@ export function SshTerminalSession({
               // A remote gateway that refuses our tokens closes with 1008 next;
               // onclose falls back to serverless SSH instead of showing a dead end.
               if (!(usingRemoteGateway && !openedReady)) {
-                setStatus("error");
-                term.writeln(`\r\n\x1b[31mSSH Error: ${msg.message}\x1b[0m`);
+                if (!openedReady) {
+                  // The PTY never opened: one sentence and the retry card, exactly
+                  // like the serverless transport.
+                  failConnectRef.current(lastServerError);
+                } else {
+                  setStatus("error");
+                  term.writeln(`\r\n\x1b[31mSSH Error: ${msg.message}\x1b[0m`);
+                }
               }
             } else if (msg.type === "exit") {
               setStatus("disconnected");
@@ -1379,8 +1545,7 @@ export function SshTerminalSession({
             return;
           }
           if (usingRemoteGateway && lastServerError) {
-            setStatus("error");
-            term.writeln(`\r\n\x1b[31mSSH Error: ${lastServerError}\x1b[0m`);
+            failConnectRef.current(lastServerError);
             return;
           }
           if (!gotServerMessage) {
@@ -1430,6 +1595,30 @@ export function SshTerminalSession({
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [connectSeq]);
+
+  /**
+   * Automatic retry: a failure that looks like a network problem is tried again
+   * after `SSH_RETRY_DELAY_SECONDS`. Reconnecting starts a whole new session, so it
+   * also clears the card, the terminal and any half-typed line.
+   */
+  useEffect(() => {
+    if (retryIn === null) return;
+    if (retryIn <= 0) {
+      setRetryIn(null);
+      setConnectSeq((n) => n + 1);
+      return;
+    }
+    const timer = setTimeout(() => {
+      setRetryIn((value) => (value === null ? null : tickRetryCountdown(value)));
+    }, 1000);
+    return () => clearTimeout(timer);
+  }, [retryIn]);
+
+  /** Reconnect button: retry now and push the countdown back. */
+  const reconnectNow = useCallback(() => {
+    setRetryIn(null);
+    setConnectSeq((n) => n + 1);
+  }, []);
 
   // Update theme & font size dynamically without dropping SSH session!
   useEffect(() => {
@@ -1979,7 +2168,17 @@ export function SshTerminalSession({
       )}
 
       {/* Terminal Canvas */}
-      <div ref={containerRef} className="min-h-0 flex-1 overflow-hidden" />
+      <div className="relative min-h-0 flex-1 overflow-hidden">
+        <div ref={containerRef} className="h-full w-full overflow-hidden" />
+        {connectFailure && (
+          <SshConnectErrorCard
+            failure={connectFailure}
+            retryIn={retryIn}
+            onReconnect={reconnectNow}
+            onCancelRetry={() => setRetryIn(null)}
+          />
+        )}
+      </div>
     </div>
   );
 }

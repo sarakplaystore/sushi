@@ -26,6 +26,7 @@ import {
   ArrowDownToLine,
   Unlink,
   Maximize,
+  Languages,
 } from "lucide-react";
 import type { HostProfile, RdpPerformance, RdpProbeResult } from "@/types/connection";
 import {
@@ -46,6 +47,7 @@ import {
   saveRdpPrefs,
   shouldRetryRdpStatus,
 } from "@/lib/client/rdp-session";
+import { TranslatePanel } from "@/components/TranslatePanel";
 
 interface RdpDesktopSessionProps {
   profile: HostProfile;
@@ -174,6 +176,8 @@ export function RdpDesktopSession({
   const [showClipboard, setShowClipboard] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [clipboardText, setClipboardText] = useState("");
+  /** Translation of the clipboard text shown inside the clipboard popover. */
+  const [clipboardTranslateOpen, setClipboardTranslateOpen] = useState(false);
 
   // Live RDP X.224 / TLS / NLA Probe state
   const [probing, setProbing] = useState(false);
@@ -966,6 +970,7 @@ export function RdpDesktopSession({
                     setShowClipboard((v) => !v);
                     setShowSpecialKeys(false);
                     setShowSettings(false);
+                    setClipboardTranslateOpen(false);
                   }}
                   className="flex items-center gap-1 rounded-lg border border-white/10 bg-white/5 px-2.5 py-1 text-xs text-slate-200 hover:bg-white/10"
                   title="Clipboard: Ctrl+V in the desktop pastes your local clipboard"
@@ -1019,7 +1024,24 @@ export function RdpDesktopSession({
                       >
                         Copy
                       </button>
+                      <button
+                        type="button"
+                        disabled={!clipboardText.trim()}
+                        onClick={() => setClipboardTranslateOpen((v) => !v)}
+                        className="inline-flex items-center gap-1 rounded-lg border border-white/12 px-2.5 py-1.5 text-xs text-slate-200 transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-40"
+                        title="Translate the clipboard text"
+                      >
+                        <Languages className="h-3.5 w-3.5 text-sky-400" />
+                        Translate
+                      </button>
                     </div>
+                    {clipboardTranslateOpen && clipboardText.trim() && (
+                      <TranslatePanel
+                        text={clipboardText}
+                        onClose={() => setClipboardTranslateOpen(false)}
+                        className="rounded-lg border border-white/10 bg-[#090b10] p-2"
+                      />
+                    )}
                   </div>
                 )}
               </div>

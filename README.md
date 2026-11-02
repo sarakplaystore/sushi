@@ -24,6 +24,7 @@ It is designed around a **Hybrid VPS + Serverless Architecture**:
   - Password, keyboard-interactive (PAM), and PEM/OpenSSH Private Key (`Ed25519`, `RSA`, `ECDSA` + passphrase) authentication
   - **Distro & cloud badge on connect**: the header names the machine you are on — `Ubuntu 24.04.1 LTS · Oracle Cloud`, `Debian 12 · KVM VPS`, `Rocky Linux 9.4 · AWS EC2` — read in one non-root exec (`/etc/os-release`, cloud-init's `cloud-id`, DMI strings) and cached for five minutes; the **Test SSH Auth** card in *New Connection* shows the same OS, hosting platform and vCPU/RAM before you connect
   - SHA-256 host key fingerprint verification, quick command snippets, scrollback search, and terminal themes
+  - **Translate selected text**: highlight any text in the terminal and hit the **Translate** button — the translation appears in a panel above the terminal (Chinese by default, 14 target languages, remembered per browser). Translates through Sushi's own `/api/translate` (see *Translating text* below)
 - **SFTP File Manager (`/api/sftp/*`)**
   - Works identically on **Vercel Serverless** and **VPS**
   - Interactive breadcrumb navigation, drag-and-drop multi-file uploads, binary downloads, `mkdir`, rename, recursive delete, and an interactive Unix `chmod` permissions matrix
@@ -33,7 +34,7 @@ It is designed around a **Hybrid VPS + Serverless Architecture**:
 - **RDP Remote Desktop (`guacamole-common-js` + `guacd` + X.224 Inspector)**
   - Live in-browser Windows & Linux `xrdp` desktop streaming via `/ws/rdp` -> `guacd` (`NLA / CredSSP`, `TLS`, `Standard RDP`)
   - **Fit-to-window resolution** (the desktop follows the pane instead of being scaled), keyboard capture with a `Ctrl+Alt+Shift` release, and **three picture presets** — Best / Balanced / Fast — that trade wallpaper, themes, font smoothing and colour depth for bandwidth
-  - **Two-way clipboard that just works**: `Ctrl+V` inside the desktop pastes your local clipboard (no dialog), and text copied in the desktop is copied back to your machine
+  - **Two-way clipboard that just works**: `Ctrl+V` inside the desktop pastes your local clipboard (no dialog), and text copied in the desktop is copied back to your machine — the clipboard panel also has a **Translate** button for the remote clipboard text
   - **Drag & drop uploads** into a redirected drive, plus a fullscreen mode, special key combos (`Ctrl+Alt+Del`, `Win`, `Ctrl+Shift+Esc`) and PNG screenshot capture
   - **Automatic reconnect** when the desktop drops (network blip, `guacd` restart, RDP server reboot) with backoff and a visible countdown; a wrong password is not retried in a loop
   - **View only** mode for watching someone else's screen without stealing their keyboard, and human error messages for every Guacamole status code
@@ -361,6 +362,29 @@ Supported private keys: OpenSSH (`BEGIN OPENSSH PRIVATE KEY`, incl. passphrase-p
 `BEGIN ENCRYPTED PRIVATE KEY`, converted automatically for RSA, ECDSA and Ed25519) and PuTTY `.ppk` v2 RSA keys
 (for other `.ppk` keys use PuTTYgen → *Conversions → Export OpenSSH key*).
 Keys mangled by copy & paste (CRLF, indentation, one-line keys, literal `\n`) are repaired automatically.
+
+---
+
+### Translating text (terminal selection & clipboard)
+
+Select any text in the SSH terminal and click the **Translate** button in the terminal header (or
+**Translate** in the RDP clipboard panel). The translation opens in a small panel with a target
+language picker — **Chinese (Simplified) is the default**, with Chinese (Traditional), English,
+Khmer, Japanese, Korean, Vietnamese, Thai, French, German, Spanish, Portuguese, Russian and Arabic
+available; your choice is remembered in `localStorage`.
+
+Translation runs server-side through `POST /api/translate` (authenticated like every other Sushi
+API, max 4000 characters per call), so no translation API keys live in the browser:
+
+- Set **`SUSHI_TRANSLATE_URL`** (and optionally **`SUSHI_TRANSLATE_API_KEY`**) to a self-hosted
+  [LibreTranslate](https://libretranslate.com/) endpoint to keep text on your own infrastructure —
+  recommended for self-hosted Sushi.
+- Without it, Sushi uses the keyless Google Translate `gtx` endpoint, which works from any VPS with
+  outbound HTTPS and needs no key.
+
+The provider, request timeout (12 s) and response parsing live in `src/lib/server/translate.ts` and
+are covered by `npm test` (both response shapes are exercised with an injected `fetch`, and the
+route is tested against a mock translator server).
 
 ---
 

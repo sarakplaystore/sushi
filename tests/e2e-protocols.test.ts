@@ -97,6 +97,17 @@ import {
   sshPoolStats,
 } from "../src/lib/server/ssh-pool";
 import { POST as execRoutePost } from "../src/app/api/ssh/exec/route";
+import { POST as translateRoutePost } from "../src/app/api/translate/route";
+import {
+  MAX_TRANSLATE_TEXT,
+  isValidTargetTag,
+  translateTextServer,
+} from "../src/lib/server/translate";
+import {
+  DEFAULT_TRANSLATE_TARGET,
+  TRANSLATE_TARGETS,
+  getStoredTranslateTarget,
+} from "../src/lib/client/translate";
 import {
   formatOsLabel,
   formatSystemDetails,
@@ -2853,13 +2864,151 @@ async function runTests() {
   closeSshPool();
   await new Promise<void>((resolve) => poolServer.close(() => resolve()));
 
+  console.log("==> [9d] Testing /api/translate (auth, validation, providers)...");
+  {
+    // --- provider unit tests with an injected fetch (no network) ------------
+    const libre = await translateTextServer("hello world", "zh-CN", "auto", {
+      url: "http://127.0.0.1:9/translate",
+      fetchImpl: (async (input: RequestInfo | URL, init?: RequestInit) => {
+        assert.equal(String(input), "http://127.0.0.1:9/translate");
+        const sent = JSON.parse(String(init?.body)) as Record<string, unknown>;
+        assert.deepEqual(sent, {
+          q: "hello world",
+          source: "auto",
+          target: "zh-CN",
+          format: "text",
+        });
+        return new Response(JSON.stringify({ translatedText: "你好，世界" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }) as unknown as typeof fetch,
+    });
+    assert.equal(libre.translated, "你好，世界");
+    assert.equal(libre.provider, "libretranslate");
+
+    // Google gtx response shape: [[["translated","original",…],…], null, "detected"]
+    const gtx = await translateTextServer("hello", "zh-CN", "auto", {
+      url: "",
+      fetchImpl: (async (input: RequestInfo | URL) => {
+        const url = String(input);
+        assert.ok(url.startsWith("https://translate.googleapis.com/translate_a/single?"));
+        assert.ok(url.includes("tl=zh-CN"));
+        assert.ok(url.includes("sl=auto"));
+        return new Response(JSON.stringify([[["你好", "hello", null, null, 1]], null, "en"]), {
+          status: 200,
+        });
+      }) as unknown as typeof fetch,
+    });
+    assert.equal(gtx.translated, "你好");
+    assert.equal(gtx.detectedSource, "en");
+    assert.equal(gtx.provider, "google-gtx");
+
+    // multi-segment gtx responses are joined back together
+    const gtxMulti = await translateTextServer("hello world", "zh-CN", "auto", {
+      url: "",
+      fetchImpl: (async () =>
+        new Response(JSON.stringify([[["你好", "hello"], ["世界", " world"]], null, "en"]), {
+          status: 200,
+        })) as unknown as typeof fetch,
+    });
+    assert.equal(gtxMulti.translated, "你好世界");
+
+    // provider failures become friendly errors
+    await assert.rejects(
+      translateTextServer("x", "en", "auto", {
+        url: "",
+        fetchImpl: (async () => {
+          throw new Error("socket hang up");
+        }) as unknown as typeof fetch,
+      }),
+      /Translation failed: socket hang up/
+    );
+    await assert.rejects(
+      translateTextServer("x", "en", "auto", {
+        url: "",
+        fetchImpl: (async () => new Response("nope", { status: 503 })) as unknown as typeof fetch,
+      }),
+      /HTTP 503/
+    );
+
+    // --- language-tag validation ---------------------------------------------
+    assert.equal(isValidTargetTag("zh-CN"), true);
+    assert.equal(isValidTargetTag("en"), true);
+    assert.equal(isValidTargetTag("pt-BR"), true);
+    assert.equal(isValidTargetTag("zh_CN"), false);
+    assert.equal(isValidTargetTag("zh-CN'; rm -rf /"), false);
+    assert.equal(isValidTargetTag(""), false);
+
+    // --- route: auth, validation, and a mock LibreTranslate server ------------
+    const mockTranslator = http.createServer((req, res) => {
+      let raw = "";
+      req.on("data", (c) => (raw += c));
+      req.on("end", () => {
+        const parsed = JSON.parse(raw || "{}") as { q?: string; target?: string };
+        res.setHeader("Content-Type", "application/json");
+        res.end(JSON.stringify({ translatedText: `ZH(${parsed.target}):${parsed.q}` }));
+      });
+    });
+    await new Promise<void>((resolve) => mockTranslator.listen(0, "127.0.0.1", () => resolve()));
+    const translatorPort = (mockTranslator.address() as net.AddressInfo).port;
+    process.env.SUSHI_TRANSLATE_URL = `http://127.0.0.1:${translatorPort}/translate`;
+    try {
+      const post = (body: unknown, headers?: Headers) =>
+        translateRoutePost(
+          new NextRequest("http://localhost/api/translate", {
+            method: "POST",
+            headers: headers ?? new Headers({ "content-type": "application/json" }),
+            body: JSON.stringify(body),
+          })
+        );
+
+      // unauthenticated → 401
+      assert.equal((await post({ text: "hello", target: "zh-CN" })).status, 401);
+
+      const authed = new Headers({
+        "content-type": "application/json",
+        "x-sushi-session": validSessionToken,
+      });
+      // missing / blank text → 400
+      assert.equal((await post({ target: "zh-CN" }, authed)).status, 400);
+      assert.equal((await post({ text: "   ", target: "zh-CN" }, authed)).status, 400);
+      // bad target tag → 400
+      assert.equal((await post({ text: "hi", target: "zh_CN!" }, authed)).status, 400);
+      // too long → 400
+      assert.equal(
+        (await post({ text: "x".repeat(MAX_TRANSLATE_TEXT + 1), target: "zh-CN" }, authed)).status,
+        400
+      );
+      // ok → 200 with the mock translation
+      const okRes = await post({ text: "hello", target: "zh-CN" }, authed);
+      assert.equal(okRes.status, 200);
+      const okJson = (await okRes.json()) as {
+        ok: boolean;
+        translated: string;
+        provider: string;
+      };
+      assert.equal(okJson.ok, true);
+      assert.equal(okJson.translated, "ZH(zh-CN):hello");
+      assert.equal(okJson.provider, "libretranslate");
+    } finally {
+      delete process.env.SUSHI_TRANSLATE_URL;
+      await new Promise<void>((resolve) => mockTranslator.close(() => resolve()));
+    }
+
+    // --- client helpers (node has no localStorage → default target) ----------
+    assert.equal(DEFAULT_TRANSLATE_TARGET, "zh-CN");
+    assert.equal(getStoredTranslateTarget(), "zh-CN");
+    assert.ok(TRANSLATE_TARGETS.some((t) => t.code === "zh-CN"));
+  }
+
   console.log("==> [10/10] Cleaning up test servers...");
   httpServer.close();
   guacdMock.close();
   rdpMock.close();
   sshServer.close();
   console.log(
-    "ALL AUTH, PASSKEY, KEY WHITELIST, TERMIX, SSH, SFTP, RDP, RDP-SESSION, EXEC STDIN, FOLDER-DOWNLOAD, SELECTION-DOWNLOAD, RDP-COMPANION, MENU-KEYS, SYSTEM-INFO, SSH-CONNECT-ERROR, AND SSH-REUSE E2E TESTS PASSED!"
+    "ALL AUTH, PASSKEY, KEY WHITELIST, TERMIX, SSH, SFTP, RDP, RDP-SESSION, EXEC STDIN, FOLDER-DOWNLOAD, SELECTION-DOWNLOAD, RDP-COMPANION, MENU-KEYS, SYSTEM-INFO, SSH-CONNECT-ERROR, SSH-REUSE, AND TRANSLATE E2E TESTS PASSED!"
   );
 }
 

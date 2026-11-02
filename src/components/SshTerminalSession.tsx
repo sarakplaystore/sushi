@@ -23,6 +23,7 @@ import {
   ChevronRight,
   CornerDownLeft,
   Cpu,
+  Languages,
 } from "lucide-react";
 import type {
   CommandSnippet,
@@ -77,6 +78,7 @@ import {
   type SshConnectFailure,
 } from "@/lib/client/ssh-retry";
 import { SshConnectErrorCard } from "@/components/SshConnectErrorCard";
+import { TranslatePanel } from "@/components/TranslatePanel";
 
 interface SshTerminalSessionProps {
   profile: HostProfile;
@@ -217,6 +219,10 @@ export function SshTerminalSession({
   const [searchQuery, setSearchQuery] = useState("");
   const [showSnippets, setShowSnippets] = useState(false);
   const [showThemes, setShowThemes] = useState(false);
+  /** xterm currently has a text selection (enables the Translate button). */
+  const [hasSelection, setHasSelection] = useState(false);
+  /** Selected text open in the translate panel (null = panel closed). */
+  const [translateSource, setTranslateSource] = useState<string | null>(null);
   const [connectSeq, setConnectSeq] = useState(0);
   /** The failure that ended the session; null while the session is healthy. */
   const [connectFailure, setConnectFailure] = useState<SshConnectFailure | null>(
@@ -1134,6 +1140,8 @@ export function SshTerminalSession({
 
       containerRef.current.innerHTML = "";
       term.open(containerRef.current);
+      // Drives the "Translate" toolbar button while text is selected.
+      term.onSelectionChange(() => setHasSelection(term.hasSelection()));
       try {
         fitAddon.fit();
       } catch {
@@ -1145,6 +1153,8 @@ export function SshTerminalSession({
       searchAddonRef.current = searchAddon;
 
       setElevatedUser(null);
+      setHasSelection(false);
+      setTranslateSource(null);
       sudoPasswordRef.current = null;
       sudoNoPasswordRef.current = false;
       secretPromptRef.current = null;
@@ -1849,6 +1859,20 @@ export function SshTerminalSession({
             <Search className="h-3.5 w-3.5" />
           </button>
 
+          {/* Translate the current selection */}
+          <button
+            type="button"
+            disabled={!hasSelection}
+            onClick={() => {
+              const selected = termRef.current?.getSelection()?.trim() ?? "";
+              if (selected) setTranslateSource(selected);
+            }}
+            className="rounded-lg border border-white/10 bg-white/5 p-1.5 text-slate-300 transition hover:bg-white/10 hover:text-white disabled:cursor-not-allowed disabled:opacity-35"
+            title="Translate selected text"
+          >
+            <Languages className="h-3.5 w-3.5" />
+          </button>
+
           {/* Theme Picker */}
           <div className="relative">
             <button
@@ -2168,6 +2192,13 @@ export function SshTerminalSession({
           >
             <X className="h-3.5 w-3.5" />
           </button>
+        </div>
+      )}
+
+      {/* Translate panel for the current selection */}
+      {translateSource !== null && (
+        <div className="border-b border-white/8 bg-[#131823] px-4 py-2">
+          <TranslatePanel text={translateSource} onClose={() => setTranslateSource(null)} />
         </div>
       )}
 

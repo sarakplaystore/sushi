@@ -825,14 +825,20 @@ async function runTests() {
     const plain = buildExecScript({ command: "whoami", cwd: "/srv/app" });
     assert.equal(plain.feedPassword, null);
     assert.equal(plain.ptyModes, null);
-    assert.match(plain.script, /cd -- '\/srv\/app'/);
+    // The command is re-exec'd into the shell picked at runtime (bash when present),
+    // never hardcoded to /bin/sh — dash rejects bashisms like `<( ... )`.
+    assert.match(plain.script, /^__sushi_shell=\$\(command -v bash/);
+    assert.match(plain.script, /exec "\$__sushi_shell" -c '/);
+    assert.ok(!plain.script.includes("/bin/sh -c"), "plain path must not force /bin/sh");
+    assert.match(plain.script, /cd -- .*\/srv\/app/); // path survives shellQuote
     assert.match(plain.script, /whoami\n__sushi_ec=\$\?/);
     assert.match(plain.script, /SUSHI_META/);
 
     const nopass = buildExecScript({ command: "whoami", elevate: { user: "root" } });
     assert.equal(nopass.feedPassword, null);
     assert.equal(nopass.ptyModes, null);
-    assert.match(nopass.script, /^sudo -n -- \/bin\/sh -c '/);
+    assert.match(nopass.script, /^__sushi_shell=\$\(command -v bash/);
+    assert.match(nopass.script, /sudo -n -- "\$__sushi_shell" -c '/);
     assert.equal(nopass.script.includes("SushiPass"), false);
 
     const withPass = buildExecScript({
@@ -841,24 +847,44 @@ async function runTests() {
     });
     assert.equal(withPass.feedPassword, "hunter2");
     assert.deepEqual(withPass.ptyModes, { ECHO: 0 }); // password never echoed
-    assert.match(withPass.script, /^sudo -S -- \/bin\/sh -c '/);
+    assert.match(withPass.script, /sudo -S -- "\$__sushi_shell" -c '/);
     assert.equal(withPass.script.includes("hunter2"), false, "password is not part of the script");
 
     const otherUser = buildExecScript({ command: "id", elevate: { user: "www-data" } });
-    assert.match(otherUser.script, /^sudo -n -u 'www-data' -- \/bin\/sh -c '/);
+    assert.match(otherUser.script, /sudo -n -u 'www-data' -- "\$__sushi_shell" -c '/);
 
     // Quoting: the sudo shell receives exactly the wrapper body we built (round-trip
     // through a real POSIX shell instead of eyeballing the escapes).
     const tricky = "echo \"it's $HOME `pwd`\" && printf '%s\\n' 'x y'";
-    const bodyScript = buildExecScript({ command: tricky, cwd: "/srv/app" }).script;
+    const plainScript = buildExecScript({ command: tricky, cwd: "/srv/app" }).script;
     const elevatedScript = buildExecScript({
       command: tricky,
       cwd: "/srv/app",
       elevate: { user: "root" },
     }).script;
-    const quotedArg = elevatedScript.slice(elevatedScript.indexOf("/bin/sh -c ") + "/bin/sh -c ".length);
+    const sudoShellMarker = '"$__sushi_shell" -c ';
+    const quotedArg = elevatedScript.slice(
+      elevatedScript.indexOf(sudoShellMarker) + sudoShellMarker.length
+    );
     const roundTripped = execFileSync("sh", ["-c", `printf %s ${quotedArg}`], { encoding: "utf8" });
-    assert.equal(roundTripped, bodyScript);
+    // The plain wrapper must carry the exact same body (unquote it the same way).
+    const plainPrefix = 'exec "$__sushi_shell" -c ';
+    const plainQuoted = plainScript.slice(plainScript.indexOf(plainPrefix) + plainPrefix.length);
+    const plainBody = execFileSync("sh", ["-c", `printf %s ${plainQuoted}`], { encoding: "utf8" });
+    assert.equal(roundTripped, plainBody, "sudo shell receives exactly the wrapper body");
+
+    // Regression: a bashism (process substitution) must run even when the outer shell
+    // is dash — the wrapper picks bash at runtime instead of hardcoding /bin/sh.
+    // This is `bash <(curl …)` dying with `Syntax error: "(" unexpected` on Ubuntu.
+    const bashism = buildExecScript({ command: "cat <(echo sushi-bashism-ok)" });
+    for (const outer of ["/bin/sh", "/bin/bash"]) {
+      const out = execFileSync(outer, ["-c", bashism.script], { encoding: "utf8" });
+      assert.ok(
+        out.includes("sushi-bashism-ok"),
+        `${outer} must run the process substitution (got: ${JSON.stringify(out)})`
+      );
+      assert.match(out, /SUSHI_META;0;/);
+    }
   }
 
   // sudo password prompt: answered exactly once, then give up (never hang)
@@ -2437,18 +2463,28 @@ async function runTests() {
   assert.match(menuScript.script, /if command -v mkfifo .*&& command -v script /);
   assert.match(menuScript.script, /trap 'kill \$__sushi_writer/);
   assert.match(menuScript.script, /exec 9<'\/tmp\/\.sushi-keys-/);
-  assert.match(menuScript.script, /SHELL=\/bin\/sh script -q -c '/);
+  // script(1) runs the body with $SHELL -c: bash is picked inline, never /bin/sh
+  // (dash would kill `bash <(curl …)` with `Syntax error: "(" unexpected`).
+  assert.match(menuScript.script, /^__sushi_shell=\$\(command -v bash/);
+  assert.match(menuScript.script, /SHELL="\$\(command -v bash[^"]*" script -q -c '/);
+  assert.ok(!menuScript.script.includes("SHELL=/bin/sh"), "never force dash for script(1)");
+  // The FIFO writer is disowned where possible, so bash prints no
+  // `Terminated ( sleep 3900 > "$__sushi_keys" … )` noise when the trap kills it.
+  assert.match(menuScript.script, /disown "\$__sushi_writer"/);
   assert.match(menuScript.script, /SUSHI_META/);
-  // ... and it still runs the command unchanged when script(1) is not installed.
-  assert.match(menuScript.script, /else\n  export PAGER=cat/);
+  // ... and when script(1) is missing it still runs the command through the picked
+  // shell — quoted, because dash parses the whole script up front and a raw bashism
+  // in the fallback branch would abort everything with `Syntax error: "(" unexpected`.
+  assert.match(menuScript.script, /else\n"\$\(command -v bash[^"]*" -c 'export PAGER=cat/);
 
   const menuElevated = buildExecScript({
     command: "apt install lightdm",
     elevate: { user: "root", password: "hunter2" },
     keyChannel: keyPath,
   });
-  assert.match(menuElevated.script, /^__sushi_keys=/);
-  assert.match(menuElevated.script, /sudo -S -- \/bin\/sh -c '/);
+  assert.match(menuElevated.script, /^__sushi_shell=\$\(command -v bash/);
+  assert.match(menuElevated.script, /__sushi_keys='\/tmp\/\.sushi-keys-/);
+  assert.match(menuElevated.script, /sudo -S -- "\$__sushi_shell" -c '/);
   assert.equal(menuElevated.feedPassword, "hunter2");
   assert.deepEqual(menuElevated.ptyModes, { ECHO: 0 });
   assert.equal(menuElevated.script.includes("hunter2"), false);
@@ -2467,6 +2503,25 @@ async function runTests() {
   assert.equal(plainExec.keyChannel, null);
   assert.equal(plainExec.script.includes("mkfifo"), false);
   assert.equal(plainExec.script.includes("script -q"), false);
+  assert.match(plainExec.script, /exec "\$__sushi_shell" -c '/);
+
+  // Regression, end to end: a bashism inside a key-channel command must survive even
+  // when the outer shell is dash. Runs the real generated script locally (mkfifo +
+  // script(1) exist on the host), with the FIFO cleanup verified afterwards.
+  {
+    const fifo = createKeyChannelPath();
+    const fifoBashism = buildExecScript({
+      command: "cat <(echo sushi-fifo-ok)",
+      keyChannel: fifo,
+    });
+    const out = execFileSync("/bin/sh", ["-c", fifoBashism.script], {
+      encoding: "utf8",
+      timeout: 20000,
+    });
+    assert.ok(out.includes("sushi-fifo-ok"), `fifo path must run the bashism (got ${JSON.stringify(out)})`);
+    assert.match(out, /SUSHI_META;0;/);
+    assert.equal(fs.existsSync(fifo), false, "FIFO is removed when the command ends");
+  }
 
   console.log(
     "==> [9b] Testing remote system info (distro, version, cloud provider)..."

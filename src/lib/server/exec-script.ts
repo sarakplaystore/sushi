@@ -58,6 +58,25 @@ export const PAGER_ENV_LINE =
  */
 export const KEY_CHANNEL_PREFIX = "/tmp/.sushi-keys-";
 
+/**
+ * Inline shell picker: resolves to bash when the host has it, otherwise /bin/sh.
+ *
+ * `/bin/sh` is dash on Debian/Ubuntu and cannot parse bash syntax such as process
+ * substitution — `bash <(curl -Ls …)` dies with `Syntax error: "(" unexpected`.
+ * A command typed into Sushi has to run under the same kind of shell an interactive
+ * login would give, so every wrapper below runs it through bash when bash exists and
+ * only falls back to /bin/sh on minimal systems (BusyBox/Alpine) without bash.
+ *
+ * The expression is POSIX-only, so it is safe at the top of a script even when the
+ * SSH login shell itself is dash, and inline inside `sudo -- <shell> -c …` (sudo
+ * starts a fresh shell, so the FIFO runner cannot rely on a variable set outside).
+ */
+const SHELL_PICK_CMD =
+  "command -v bash 2>/dev/null || { [ -x /bin/bash ] && echo /bin/bash || echo /bin/sh; }";
+
+/** `$(…)` form of the shell picker, for assignments and env prefixes. */
+export const SHELL_PICK = `$(${SHELL_PICK_CMD})`;
+
 /** Random path for a new keystroke FIFO. Hex only, so it is safe to embed in a shell. */
 export function createKeyChannelPath(): string {
   return `${KEY_CHANNEL_PREFIX}${randomBytes(9).toString("hex")}`;
@@ -123,16 +142,27 @@ export function buildExecScript({
   // `-p ''`) so the password is only sent after sudo is actually waiting for it —
   // that also means NOPASSWD hosts never have their stdin polluted.
   const passwordFlag = password ? " -S" : " -n";
+  // `"$__sushi_shell"` is expanded by the outer (login) shell into the bash path
+  // picked at the top of the script — never hardcode /bin/sh here, it is dash on
+  // Debian/Ubuntu and rejects bashisms like `bash <(curl …)` (see SHELL_PICK).
   const sudoRunner = (inner: string) =>
-    `sudo${passwordFlag}${userFlag} -- /bin/sh -c ${shellQuote(inner)}`;
+    `sudo${passwordFlag}${userFlag} -- "$__sushi_shell" -c ${shellQuote(inner)}`;
 
   const channel = (keyChannel || "").trim();
+  // Resolve the shell once; the wrappers re-exec into it so the command runs under
+  // bash even when the SSH login shell (or /bin/sh) is plain dash.
+  const shellHead = `__sushi_shell=${SHELL_PICK}`;
   if (!channel) {
     if (!elevate) {
-      return { script: body, feedPassword: null, ptyModes: null, keyChannel: null };
+      return {
+        script: `${shellHead}\nexec "$__sushi_shell" -c ${shellQuote(body)}`,
+        feedPassword: null,
+        ptyModes: null,
+        keyChannel: null,
+      };
     }
     return {
-      script: sudoRunner(body),
+      script: `${shellHead}\n${sudoRunner(body)}`,
       feedPassword: password || null,
       ptyModes: password ? { ECHO: 0 } : null,
       keyChannel: null,
@@ -147,21 +177,24 @@ export function buildExecScript({
   // user's FIFO opened by root through sudo). A detached writer keeps it open so the
   // read never blocks and never reports EOF between key presses.
   // The SUSHI_META marker inside the body carries the real exit code to Sushi.
+  // script(1) runs the body with $SHELL -c: pick bash inline (self-contained, this
+  // runner may execute inside sudo's fresh shell) so bashisms keep working.
   const fifoRunner = [
     `if [ -p ${quotedChannel} ] && command -v script >/dev/null 2>&1; then`,
     `exec 9<${quotedChannel}`,
     ...(pipedInput
       ? [`( sleep 1; printf %s ${shellQuote(pipedInput)} > ${quotedChannel} ) 2>/dev/null &`]
       : []),
-    `SHELL=/bin/sh script -q -c ${shellQuote(body)} /dev/null <&9`,
+    `SHELL="${SHELL_PICK}" script -q -c ${shellQuote(body)} /dev/null <&9`,
     "__sushi_script_ec=$?",
     "exec 9<&-",
     "exit $__sushi_script_ec",
+    // Fallback when script(1)/the FIFO is missing: still run the body through the
+    // picked shell (quoted!) — a raw body would be parsed by the outer shell, which
+    // is dash on Debian/Ubuntu and rejects bashisms at parse time, before anything
+    // runs. Inline pick because this runner may execute inside sudo's fresh shell.
     "else",
-    body
-      .split("\n")
-      .map((line) => `  ${line}`)
-      .join("\n"),
+    `"${SHELL_PICK}" -c ${shellQuote(body)}`,
     "fi",
   ].join("\n");
 
@@ -172,6 +205,7 @@ export function buildExecScript({
   // still read it as root. The writer below holds the read end open; the trap closes
   // both and removes the FIFO however the command ends.
   const script = [
+    shellHead,
     `__sushi_keys=${quotedChannel}`,
     `rm -f "$__sushi_keys" 2>/dev/null`,
     `trap 'kill $__sushi_writer 2>/dev/null; rm -f "$__sushi_keys" 2>/dev/null' EXIT`,
@@ -180,6 +214,10 @@ export function buildExecScript({
     `  (umask 077; mkfifo -m 600 "$__sushi_keys") 2>/dev/null`,
     `  ( sleep 3900 > "$__sushi_keys" 2>/dev/null ) &`,
     "  __sushi_writer=$!",
+    // Keep the writer out of the job table: bash would otherwise print
+    // `Terminated ( sleep 3900 > "$__sushi_keys" … )` into the terminal when the
+    // trap kills it. dash has no disown, so guard it.
+    '  if command -v disown >/dev/null 2>&1; then disown "$__sushi_writer" 2>/dev/null || true; fi',
     "fi",
     runner,
   ].join("\n");

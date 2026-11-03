@@ -128,7 +128,14 @@ export function parseElevationCommand(input: string): ElevationCommand | null {
  * program (vim, top, less, a bare REPL ...) that serverless SSH cannot drive.
  */
 export function detectInteractiveProgram(command: string): string | null {
-  for (const segment of command.split(/&&|\|\||;|\|/)) {
+  // Split keeping the separators: a segment that follows a single `|` is fed by a
+  // pipe, so a bare shell there (`curl -fsSL https://get.docker.com | sh`) reads its
+  // script from stdin instead of the keyboard — that is the standard installer idiom,
+  // not an interactive shell, and it must run.
+  const parts = command.split(/(&&|\|\||;|\|)/);
+  for (let i = 0; i < parts.length; i += 2) {
+    const segment = parts[i];
+    const pipeFed = i > 0 && parts[i - 1] === "|";
     const words = segment.trim().split(/\s+/).filter(Boolean);
     while (
       words.length > 0 &&
@@ -149,8 +156,9 @@ export function detectInteractiveProgram(command: string): string | null {
     if (FULLSCREEN_PROGRAMS.has(program)) return program;
     if (program === "crontab" && args.includes("-e")) return "crontab -e";
     if (program === "systemctl" && args[0] === "edit") return "systemctl edit";
-    if (BARE_INTERACTIVE_PROGRAMS.has(program) && args.length === 0) {
-      // su / sudo su are handled by the elevation parser before we get here
+    if (BARE_INTERACTIVE_PROGRAMS.has(program) && args.length === 0 && !pipeFed) {
+      // su / sudo su are handled by the elevation parser before we get here.
+      // Pipe-fed shells (… | sh) are exempt: their script comes from the pipe.
       return program;
     }
   }

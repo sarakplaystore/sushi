@@ -831,6 +831,20 @@ async function runTests() {
     assert.equal(detectInteractiveProgram("crontab -e"), "crontab -e");
     assert.equal(detectInteractiveProgram("python3"), "python3");
     assert.equal(detectInteractiveProgram("python3 -V"), null);
+    // A shell on the right side of a pipe reads its script from the pipe — the
+    // standard `curl … | sh` installer idiom is NOT an interactive shell.
+    assert.equal(detectInteractiveProgram("curl -fsSL https://get.docker.com | sh"), null);
+    assert.equal(detectInteractiveProgram("curl -fsSL https://get.docker.com | sudo sh"), null);
+    assert.equal(detectInteractiveProgram("wget -qO- https://x/install.sh | bash"), null);
+    assert.equal(detectInteractiveProgram("cat x | sh | tee /tmp/log"), null);
+    assert.equal(detectInteractiveProgram("bash <(curl -Ls https://x/install.sh)"), null);
+    // …but a bare shell as a standalone command (or after ;, &&, ||) still is
+    assert.equal(detectInteractiveProgram("sh"), "sh");
+    assert.equal(detectInteractiveProgram("echo hi; sh"), "sh");
+    assert.equal(detectInteractiveProgram("echo hi && bash"), "bash");
+    assert.equal(detectInteractiveProgram("cmd || sh"), "sh");
+    // full-screen pagers stay blocked even when pipe-fed
+    assert.equal(detectInteractiveProgram("cmd | less"), "less");
   }
 
   // Serverless exec script: plain, sudo without a password, and sudo with one

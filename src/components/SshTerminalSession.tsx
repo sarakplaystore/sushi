@@ -24,6 +24,7 @@ import {
   CornerDownLeft,
   Cpu,
   Languages,
+  Infinity,
 } from "lucide-react";
 import type {
   CommandSnippet,
@@ -223,6 +224,24 @@ export function SshTerminalSession({
   const [hasSelection, setHasSelection] = useState(false);
   /** Selected text open in the translate panel (null = panel closed). */
   const [translateSource, setTranslateSource] = useState<string | null>(null);
+  /**
+   * No-timeout mode for serverless commands: prompts wait forever, and if the
+   * internet drops the command keeps running on the host (output logged to /tmp,
+   * keystrokes still accepted through its FIFO). Persisted per browser.
+   */
+  const [noTimeout, setNoTimeout] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem("sushi.noTimeout") === "1";
+    } catch {
+      return false;
+    }
+  });
+  const noTimeoutRef = useRef(false);
+  noTimeoutRef.current = noTimeout;
+  /** A no-timeout command still running on the host after our request died. */
+  const [detachedRun, setDetachedRun] = useState<(ExecKeyChannel & { runLog?: string }) | null>(
+    null
+  );
   const [connectSeq, setConnectSeq] = useState(0);
   /** The failure that ended the session; null while the session is healthy. */
   const [connectFailure, setConnectFailure] = useState<SshConnectFailure | null>(
@@ -433,6 +452,7 @@ export function SshTerminalSession({
         cols: term?.cols || 100,
         rows: term?.rows || 30,
         ...(withKeyChannel ? { keyChannel: true } : {}),
+        ...(noTimeoutRef.current ? { noTimeout: true } : {}),
         ...(options.stdin ? { stdin: options.stdin } : {}),
         ...(options.elevateUser
           ? {
@@ -460,9 +480,14 @@ export function SshTerminalSession({
         let gotReady = false;
         let settled = false;
         let connectError: string | undefined;
+        let runLogPath = "";
+        let keyPath = "";
+        let gotMeta = false;
 
         const streaming = allowStreaming && canStreamExecStdin();
-        const payload = buildPayload(!streaming);
+        // No-timeout always asks for the keystroke FIFO: if the request dies, keys
+        // must still be able to reach the command on the host.
+        const payload = buildPayload(!streaming || noTimeoutRef.current);
         const channel = streaming ? createExecRequestBody(payload) : null;
         const headers = getAuthHeaders(gatewaySettings);
         if (channel) headers["Content-Type"] = "application/x-ndjson";
@@ -530,8 +555,17 @@ export function SshTerminalSession({
                 setStatus("connected");
                 if (channel) streamingConfirmedRef.current = true;
                 if (typeof evt.keyChannel === "string" && evt.keyChannel) {
+                  keyPath = evt.keyChannel;
                   keyChannelRef.current = { path: evt.keyChannel, credentials };
                   setKeyChannelActive(true);
+                }
+                if (typeof evt.runLog === "string" && evt.runLog) {
+                  runLogPath = evt.runLog;
+                  if (noTimeoutRef.current) {
+                    options.stream?.(
+                      `\r\n\x1b[90mno-timeout run: output is also logged to ${evt.runLog}, and keys still reach it via ${evt.keyChannel ?? "the key channel"} — the command survives a disconnect.\x1b[0m\r\n`
+                    );
+                  }
                 }
                 if (typeof evt.fingerprint === "string") setFingerprint(evt.fingerprint);
               } else if (evt.type === "data" && typeof evt.data === "string") {
@@ -541,6 +575,7 @@ export function SshTerminalSession({
                 output += text;
                 options.stream?.(text);
               } else if (evt.type === "meta") {
+                gotMeta = true;
                 exitCode = Number(evt.exitCode ?? 0);
                 if (typeof evt.cwd === "string" && evt.cwd) {
                   cwdRef.current = evt.cwd;
@@ -560,6 +595,11 @@ export function SshTerminalSession({
                 }
               }
             }
+          }
+          if (!gotMeta && noTimeoutRef.current && keyPath) {
+            // The request ended without an exit marker: in no-timeout mode the
+            // command is (by design) still running on the host.
+            setDetachedRun({ path: keyPath, credentials, runLog: runLogPath || undefined });
           }
         } catch (err) {
           // Any failure before the stream produced output means the streamed body was
@@ -581,6 +621,11 @@ export function SshTerminalSession({
             output += `\n${message}`;
             exitCode = 1;
             options.stream?.(`\r\n\x1b[31m${message}\x1b[0m`);
+            // Internet dropped mid-run: the no-timeout command is still alive on the
+            // host — offer its key channel + output log so it can be answered later.
+            if (noTimeoutRef.current && gotReady && keyPath) {
+              setDetachedRun({ path: keyPath, credentials, runLog: runLogPath || undefined });
+            }
           }
         } finally {
           if (startWatchdog) clearTimeout(startWatchdog);
@@ -666,8 +711,24 @@ export function SshTerminalSession({
   const stopRunningCommand = useCallback(() => {
     const stdin = stdinRef.current;
     if (stdin?.canSendInput && stdin.sendSignal("INT")) return;
+    // In no-timeout mode the server never kills the remote command on abort, so
+    // deliver the Ctrl+C through the keystroke FIFO explicitly.
+    if (noTimeoutRef.current && keyChannelRef.current) {
+      void sendKeyChannelInput(keyChannelRef.current, "\x03", gatewaySettings);
+    }
     abortExecRef.current?.abort();
-  }, []);
+  }, [gatewaySettings]);
+
+  /** Sends keys to a no-timeout command that outlived its request (after a drop). */
+  const sendDetachedKeys = useCallback(
+    (keys: string) => {
+      if (!detachedRun) return;
+      void sendKeyChannelInput(detachedRun, keys, gatewaySettings).then((result) => {
+        if (result === "missing") setDetachedRun(null); // it finished on the host
+      });
+    },
+    [detachedRun, gatewaySettings]
+  );
 
   /**
    * Writes raw bytes into the running command's keystroke FIFO.
@@ -1777,6 +1838,48 @@ export function SshTerminalSession({
             </span>
           )}
 
+          {detachedRun && (
+            <span
+              title={`This no-timeout command is still running on the host. Output log: ${detachedRun.runLog || "n/a"} (read it via SFTP or \`cat ${detachedRun.runLog}\`). Keystrokes are delivered to ${detachedRun.path}.`}
+              className="inline-flex items-center gap-1 rounded-md border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-[11px] font-medium text-amber-200"
+            >
+              <Infinity className="h-3 w-3 shrink-0" />
+              <span className="hidden lg:inline">still running on host</span>
+              <button
+                type="button"
+                onClick={() => sendDetachedKeys("y\r")}
+                className="rounded border border-amber-400/40 px-1 font-semibold hover:bg-amber-500/20"
+                title="Answer y + Enter"
+              >
+                y⏎
+              </button>
+              <button
+                type="button"
+                onClick={() => sendDetachedKeys("\r")}
+                className="rounded border border-amber-400/40 px-1 font-semibold hover:bg-amber-500/20"
+                title="Press Enter"
+              >
+                ⏎
+              </button>
+              <button
+                type="button"
+                onClick={() => sendDetachedKeys("\x03")}
+                className="rounded border border-rose-400/40 px-1 font-semibold text-rose-200 hover:bg-rose-500/20"
+                title="Send Ctrl+C to the detached command"
+              >
+                ^C
+              </button>
+              <button
+                type="button"
+                onClick={() => setDetachedRun(null)}
+                className="text-amber-200/70 hover:text-white"
+                title="Dismiss"
+              >
+                <X className="h-3 w-3" />
+              </button>
+            </span>
+          )}
+
           {transportMode === "serverless" && (
             <button
               type="button"
@@ -1944,6 +2047,29 @@ export function SshTerminalSession({
             title="Clear terminal"
           >
             <Trash2 className="h-3.5 w-3.5" />
+          </button>
+
+          {/* No-timeout toggle for serverless commands */}
+          <button
+            type="button"
+            onClick={() => {
+              const next = !noTimeout;
+              setNoTimeout(next);
+              try {
+                localStorage.setItem("sushi.noTimeout", next ? "1" : "0");
+              } catch {
+                // private mode — just keep it for this session
+              }
+            }}
+            className={`flex items-center gap-1 rounded-lg border px-2.5 py-1 text-xs transition ${
+              noTimeout
+                ? "border-emerald-500/40 bg-emerald-500/15 text-emerald-200 hover:bg-emerald-500/25"
+                : "border-white/10 bg-white/5 text-slate-200 hover:bg-white/10"
+            }`}
+            title="No timeout (serverless shell): prompts like [y/n] wait forever, and the command keeps running on the host even if the internet drops — output is logged to a /tmp file and keys still reach it"
+          >
+            <Infinity className="h-3.5 w-3.5" />
+            <span className="hidden sm:inline">No timeout</span>
           </button>
 
           {/* Reconnect */}

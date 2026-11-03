@@ -11,6 +11,7 @@ import {
   buildExecScript,
   buildKeyDeliveryScript,
   createKeyChannelPath,
+  createRunLogPath,
   createSudoAnswerer,
   type ExecElevation,
 } from "@/lib/server/exec-script";
@@ -57,6 +58,14 @@ export async function POST(req: NextRequest) {
      * (whiptail / debconf / ncurses) stay answerable.
      */
     keyChannel?: boolean;
+    /**
+     * No-timeout run (needs a key channel): the command ignores SIGHUP, so an
+     * internet blip that closes this request does not kill it on the host; the
+     * session is also logged to a file and the FIFO stays open for a day, so a
+     * prompt like `Confirm to continue? [y/n]` can still be answered afterwards
+     * via `/api/ssh/exec/keys`. The log path is returned in the `ready` event.
+     */
+    noTimeout?: boolean;
   };
 
   // Two request shapes: a plain JSON body (fire-and-run) or a streaming NDJSON body
@@ -129,6 +138,7 @@ export async function POST(req: NextRequest) {
   const cols = Math.max(40, Math.min(300, Number(body.cols || 100)));
   const rows = Math.max(10, Math.min(120, Number(body.rows || 30)));
   const cwd = body.cwd?.trim() || "";
+  const noTimeout = Boolean(body.noTimeout);
 
   const encoder = new TextEncoder();
 
@@ -157,21 +167,26 @@ export async function POST(req: NextRequest) {
        */
       const onAbort = () => {
         closed = true;
-        try {
-          activeChannel?.write("\x03");
-        } catch {
-          // channel already gone
-        }
-        if (keyChannelPath && lease) {
+        // A no-timeout run ignores SIGHUP on the host (the wrapper traps it), so we
+        // only close the channel here — no Ctrl+C — and the command keeps running
+        // there, still answerable through its keystroke FIFO after the reconnect.
+        if (!noTimeout) {
           try {
-            lease.session.client.exec(
-              buildKeyDeliveryScript(keyChannelPath, "\x03"),
-              () => {
-                // fire and forget: this request is already cancelled
-              }
-            );
+            activeChannel?.write("\x03");
           } catch {
-            // connection already gone
+            // channel already gone
+          }
+          if (keyChannelPath && lease) {
+            try {
+              lease.session.client.exec(
+                buildKeyDeliveryScript(keyChannelPath, "\x03"),
+                () => {
+                  // fire and forget: this request is already cancelled
+                }
+              );
+            } catch {
+              // connection already gone
+            }
           }
         }
         try {
@@ -189,6 +204,9 @@ export async function POST(req: NextRequest) {
 
         const keyChannel = body.keyChannel ? createKeyChannelPath() : null;
         keyChannelPath = keyChannel;
+        // Created here (before the ready event) so the client learns the log path up
+        // front; passed into buildExecScript so both use the same path.
+        const runLog = noTimeout && keyChannel ? createRunLogPath() : null;
         sendEvent({
           type: "ready",
           fingerprint: lease.session.fingerprint,
@@ -197,6 +215,9 @@ export async function POST(req: NextRequest) {
           reused: lease.reused,
           connectMs: lease.connectMs,
           ...(keyChannel ? { keyChannel } : {}),
+          // No-timeout runs tell the client where the session log lives, so the
+          // output can still be read after the starting request died.
+          ...(runLog ? { runLog } : {}),
         });
 
         const { script, feedPassword, ptyModes } = buildExecScript({
@@ -208,6 +229,8 @@ export async function POST(req: NextRequest) {
           // the SSH channel's stdin (that stdin belongs to `script(1)`, not the
           // command), so it must be part of the remote script.
           pipedInput: keyChannel ? body.stdin ?? null : null,
+          noTimeout: keyChannel ? noTimeout : false,
+          runLogPath: runLog,
         });
 
         const ptyOptions = {
@@ -341,8 +364,10 @@ export async function POST(req: NextRequest) {
               // type an answer, which Sushi replays by re-running the command with that
               // answer piped in. A piped answer only needs a moment; an unanswerable
               // prompt gets a generous grace period instead of being killed instantly.
+              // A no-timeout command waits at its prompt forever — never send the
+              // Ctrl-D that would close stdin and abort e.g. an installer's [y/n].
               const stdinCloseTimer =
-                inputReader || feedPassword
+                noTimeout || inputReader || feedPassword
                   ? null
                   : setTimeout(() => {
                       if (finished) return;

@@ -79,8 +79,10 @@ import {
   buildExecScript,
   buildKeyDeliveryScript,
   createKeyChannelPath,
+  createRunLogPath,
   createSudoAnswerer,
   isKeyChannelPath,
+  isRunLogPath,
   parseKeyDeliveryResult,
 } from "../src/lib/server/exec-script";
 import {
@@ -2534,6 +2536,65 @@ async function runTests() {
     assert.equal(fs.existsSync(fifo), false, "FIFO is removed when the command ends");
   }
 
+  // No-timeout runs: SIGHUP is ignored, the session is logged to a /tmp file, the
+  // FIFO writer lives for a day, and script(1) output is streamed from that log via
+  // `tail -F` — so the command survives its own SSH channel closing (internet blip).
+  {
+    const keyPath2 = createKeyChannelPath();
+    const nt = buildExecScript({ command: "echo hi", keyChannel: keyPath2, noTimeout: true });
+    assert.match(nt.script, /trap '' HUP/);
+    assert.ok(nt.runLog && isRunLogPath(nt.runLog), `run log path returned: ${String(nt.runLog)}`);
+    assert.match(nt.script, /sleep 86400/);
+    assert.ok(
+      nt.script.includes(`script -q -c `) && nt.script.includes(`'${nt.runLog}' <&9`),
+      "no-timeout runs log the session to the run log via script(1)'s typescript file"
+    );
+    assert.ok(!nt.script.includes("tail -n +1 -F"), "no tail helper needed");
+
+    // default (with-timeout) behaviour is unchanged
+    const normal = buildExecScript({ command: "echo hi", keyChannel: keyPath2 });
+    assert.ok(!normal.script.includes("trap '' HUP"));
+    assert.match(normal.script, /sleep 3900/);
+    assert.equal(normal.runLog, null);
+    assert.ok(normal.script.includes("'/dev/null' <&9"), "normal runs still log to /dev/null");
+
+    // no-timeout without a key channel: HUP trap only, no log
+    const ntPlain = buildExecScript({ command: "whoami", noTimeout: true });
+    assert.match(ntPlain.script, /trap '' HUP/);
+    assert.equal(ntPlain.runLog, null);
+
+    // run-log path validation
+    assert.equal(isRunLogPath(createRunLogPath()), true);
+    assert.equal(isRunLogPath("/tmp/.sushi-run-0123456789abcdef01.log"), true);
+    assert.equal(isRunLogPath("/tmp/.sushi-run-$(rm -rf /).log"), false);
+    assert.equal(isRunLogPath("/tmp/.sushi-keys-0123456789abcdef"), false);
+
+    // Execute a real no-timeout key-channel script locally: output must arrive (via
+    // tail -F of the log), the META marker must be there, and the log must be kept.
+    const fifo = createKeyChannelPath();
+    const ntScript = buildExecScript({
+      command: "echo sushi-notimeout-ok",
+      keyChannel: fifo,
+      noTimeout: true,
+    });
+    const out = execFileSync("/bin/sh", ["-c", ntScript.script], {
+      encoding: "utf8",
+      timeout: 20000,
+    });
+    assert.ok(
+      out.includes("sushi-notimeout-ok"),
+      `no-timeout output must stream from the log (got ${JSON.stringify(out)})`
+    );
+    assert.match(out, /SUSHI_META;0;/);
+    assert.ok(fs.existsSync(ntScript.runLog!), "run log is kept after the command");
+    assert.ok(
+      fs.readFileSync(ntScript.runLog!, "utf8").includes("sushi-notimeout-ok"),
+      "run log contains the command output"
+    );
+    fs.unlinkSync(ntScript.runLog!);
+    assert.equal(fs.existsSync(fifo), false, "FIFO is removed when the command ends");
+  }
+
   console.log(
     "==> [9b] Testing remote system info (distro, version, cloud provider)..."
   );
@@ -3002,13 +3063,69 @@ async function runTests() {
     assert.ok(TRANSLATE_TARGETS.some((t) => t.code === "zh-CN"));
   }
 
+  console.log("==> [9e] Testing no-timeout exec route (run log in ready event)...");
+  {
+    const creds: ConnectionCredentials = {
+      host: "127.0.0.1",
+      port: sshPort,
+      username: "tester",
+      authMethod: "password",
+      password: "sushipass",
+    };
+    const headers = new Headers({
+      "content-type": "application/json",
+      "x-sushi-session": validSessionToken,
+    });
+    const postEvents = async (body: Record<string, unknown>) => {
+      const res = await execRoutePost(
+        new NextRequest("http://localhost/api/ssh/exec", {
+          method: "POST",
+          headers,
+          body: JSON.stringify(body),
+        })
+      );
+      assert.equal(res.status, 200);
+      return (await res.text())
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+    };
+
+    // noTimeout + key channel → the ready event announces the run log
+    const ntEvents = await postEvents({
+      credentials: creds,
+      command: "echo hi",
+      keyChannel: true,
+      noTimeout: true,
+    });
+    const ntReady = ntEvents.find((e) => e.type === "ready") as
+      | { keyChannel?: string; runLog?: string }
+      | undefined;
+    assert.ok(ntReady?.keyChannel, "key channel present");
+    assert.ok(
+      ntReady?.runLog && isRunLogPath(String(ntReady.runLog)),
+      `run log announced in ready event: ${String(ntReady?.runLog)}`
+    );
+
+    // plain exec → no run log; noTimeout without a key channel → no run log either
+    const plainEvents = await postEvents({ credentials: creds, command: "echo hi" });
+    const plainReady = plainEvents.find((e) => e.type === "ready") as { runLog?: string } | undefined;
+    assert.equal(plainReady?.runLog, undefined, "no run log without noTimeout");
+
+    const ntNoChannel = await postEvents({ credentials: creds, command: "echo hi", noTimeout: true });
+    const ntNoChannelReady = ntNoChannel.find((e) => e.type === "ready") as
+      | { runLog?: string }
+      | undefined;
+    assert.equal(ntNoChannelReady?.runLog, undefined, "run log only exists with a key channel");
+  }
+
   console.log("==> [10/10] Cleaning up test servers...");
   httpServer.close();
   guacdMock.close();
   rdpMock.close();
   sshServer.close();
   console.log(
-    "ALL AUTH, PASSKEY, KEY WHITELIST, TERMIX, SSH, SFTP, RDP, RDP-SESSION, EXEC STDIN, FOLDER-DOWNLOAD, SELECTION-DOWNLOAD, RDP-COMPANION, MENU-KEYS, SYSTEM-INFO, SSH-CONNECT-ERROR, SSH-REUSE, AND TRANSLATE E2E TESTS PASSED!"
+    "ALL AUTH, PASSKEY, KEY WHITELIST, TERMIX, SSH, SFTP, RDP, RDP-SESSION, EXEC STDIN, FOLDER-DOWNLOAD, SELECTION-DOWNLOAD, RDP-COMPANION, MENU-KEYS, SYSTEM-INFO, SSH-CONNECT-ERROR, SSH-REUSE, TRANSLATE, AND NO-TIMEOUT E2E TESTS PASSED!"
   );
 }
 

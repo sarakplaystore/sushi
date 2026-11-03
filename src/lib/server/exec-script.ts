@@ -35,6 +35,19 @@ export interface ExecScriptOptions {
   keyChannel?: string | null;
   /** Text piped into the command's stdin (routed through the FIFO when there is one). */
   pipedInput?: string | null;
+  /**
+   * No-timeout run: the wrapper ignores SIGHUP (so closing the SSH channel — an
+   * internet blip — does not kill the command), the session is also written to a
+   * log file in /tmp, and the keystroke FIFO stays open for a day. Prompts such as
+   * `Confirm to continue? [y/n]` can then be answered long after the request that
+   * started the command is gone, via `/api/ssh/exec/keys`.
+   */
+  noTimeout?: boolean | null;
+  /**
+   * Pre-made log path for a no-timeout key-channel run (the route announces it in
+   * its `ready` event before the script is built, so it creates the path itself).
+   */
+  runLogPath?: string | null;
 }
 
 export interface ExecScript {
@@ -45,6 +58,8 @@ export interface ExecScript {
   ptyModes: { ECHO: 0 } | null;
   /** Keystroke FIFO used by this run (null when no key channel was requested). */
   keyChannel: string | null;
+  /** Output log of a no-timeout key-channel run (null otherwise). */
+  runLog: string | null;
 }
 
 /** Pagers would block forever on a command that has no keystrokes available. */
@@ -88,6 +103,24 @@ export function isKeyChannelPath(value: string): boolean {
 }
 
 /**
+ * Prefix of the per-command output log used by no-timeout runs (see
+ * `ExecScriptOptions.noTimeout`). Lives in `/tmp` next to the keystroke FIFO and is
+ * deliberately kept after the command ends, so the output can still be read when
+ * the connection that started the command dropped in the middle of it.
+ */
+export const RUN_LOG_PREFIX = "/tmp/.sushi-run-";
+
+/** Random path for a new no-timeout run log. Hex only, safe to embed in a shell. */
+export function createRunLogPath(): string {
+  return `${RUN_LOG_PREFIX}${randomBytes(9).toString("hex")}.log`;
+}
+
+/** Rejects anything that is not a path produced by `createRunLogPath`. */
+export function isRunLogPath(value: string): boolean {
+  return /^\/tmp\/\.sushi-run-[0-9a-f]{8,32}\.log$/.test(value);
+}
+
+/**
  * Script for one key press: writes the exact bytes into the running command's FIFO.
  *
  * It runs as the SSH login user (the FIFO's owner), never through sudo, so it works
@@ -120,6 +153,8 @@ export function buildExecScript({
   elevate,
   keyChannel,
   pipedInput,
+  noTimeout,
+  runLogPath,
 }: ExecScriptOptions): ExecScript {
   const cdPrefix =
     cwd && cwd !== "~" ? `cd -- ${shellQuote(cwd)} 2>/dev/null || true` : "";
@@ -152,24 +187,35 @@ export function buildExecScript({
   // Resolve the shell once; the wrappers re-exec into it so the command runs under
   // bash even when the SSH login shell (or /bin/sh) is plain dash.
   const shellHead = `__sushi_shell=${SHELL_PICK}`;
+  // A no-timeout run survives its own SSH channel closing (internet blip): SIGHUP
+  // is ignored, so the command keeps running on the host instead of dying with the
+  // request that started it.
+  const hupTrap = noTimeout ? "trap '' HUP" : "";
   if (!channel) {
     if (!elevate) {
       return {
-        script: `${shellHead}\nexec "$__sushi_shell" -c ${shellQuote(body)}`,
+        script: [shellHead, hupTrap, `exec "$__sushi_shell" -c ${shellQuote(body)}`]
+          .filter(Boolean)
+          .join("\n"),
         feedPassword: null,
         ptyModes: null,
         keyChannel: null,
+        runLog: null,
       };
     }
     return {
-      script: `${shellHead}\n${sudoRunner(body)}`,
+      script: [shellHead, hupTrap, sudoRunner(body)].filter(Boolean).join("\n"),
       feedPassword: password || null,
       ptyModes: password ? { ECHO: 0 } : null,
       keyChannel: null,
+      runLog: null,
     };
   }
 
   const quotedChannel = shellQuote(channel);
+  // No-timeout runs additionally write the whole session to a log file (kept after
+  // the command ends), so the output is still there when the starting request died.
+  const runLog = noTimeout ? (runLogPath ?? createRunLogPath()) : null;
   // `script -q -c` gives the command a terminal of its own; its stdin is the FIFO,
   // so a key press written by another exec shows up as a keystroke. The FIFO is
   // opened read-only on purpose: opening it read-write would create it when it is
@@ -179,13 +225,19 @@ export function buildExecScript({
   // The SUSHI_META marker inside the body carries the real exit code to Sushi.
   // script(1) runs the body with $SHELL -c: pick bash inline (self-contained, this
   // runner may execute inside sudo's fresh shell) so bashisms keep working.
+  const scriptFile = runLog ?? "/dev/null";
   const fifoRunner = [
     `if [ -p ${quotedChannel} ] && command -v script >/dev/null 2>&1; then`,
     `exec 9<${quotedChannel}`,
     ...(pipedInput
       ? [`( sleep 1; printf %s ${shellQuote(pipedInput)} > ${quotedChannel} ) 2>/dev/null &`]
       : []),
-    `SHELL="${SHELL_PICK}" script -q -c ${shellQuote(body)} /dev/null <&9`,
+    // script(1) streams the session live to stdout AND writes it to the typescript
+    // file (scriptFile = the run log for no-timeout runs, /dev/null otherwise). If the
+    // SSH channel drops, stdout writes fail but script(1) keeps running (verified:
+    // it survives write errors), so the command's terminal stays alive, the log keeps
+    // the full session, and keys still arrive through the FIFO.
+    `SHELL="${SHELL_PICK}" script -q -c ${shellQuote(body)} ${shellQuote(scriptFile)} <&9`,
     "__sushi_script_ec=$?",
     "exec 9<&-",
     "exit $__sushi_script_ec",
@@ -206,13 +258,18 @@ export function buildExecScript({
   // both and removes the FIFO however the command ends.
   const script = [
     shellHead,
+    // No-timeout runs ignore SIGHUP so they survive their own channel closing.
+    ...(noTimeout ? ["trap '' HUP"] : []),
+    `__sushi_log=${shellQuote(scriptFile)}`,
     `__sushi_keys=${quotedChannel}`,
     `rm -f "$__sushi_keys" 2>/dev/null`,
     `trap 'kill $__sushi_writer 2>/dev/null; rm -f "$__sushi_keys" 2>/dev/null' EXIT`,
     // Only when both halves exist: a FIFO nobody reads would swallow key presses.
     `if command -v mkfifo >/dev/null 2>&1 && command -v script >/dev/null 2>&1; then`,
     `  (umask 077; mkfifo -m 600 "$__sushi_keys") 2>/dev/null`,
-    `  ( sleep 3900 > "$__sushi_keys" 2>/dev/null ) &`,
+    // No-timeout keeps the FIFO open for a day, so a prompt can be answered long
+    // after the request that started the command is gone.
+    `  ( sleep ${noTimeout ? 86400 : 3900} > "$__sushi_keys" 2>/dev/null ) &`,
     "  __sushi_writer=$!",
     // Keep the writer out of the job table: bash would otherwise print
     // `Terminated ( sleep 3900 > "$__sushi_keys" … )` into the terminal when the
@@ -227,6 +284,7 @@ export function buildExecScript({
     feedPassword: password || null,
     ptyModes: password ? { ECHO: 0 } : null,
     keyChannel: channel,
+    runLog,
   };
 }
 

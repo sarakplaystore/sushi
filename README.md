@@ -352,6 +352,14 @@ ways past a question — including the old curses installers (`Configuring light
    seconds; both switch to (1) without an error in the terminal.
 4. **Non-interactive flags** — the safest habit: `apt install -y`, `apt-get -y`, `ssh-keygen -N ''`,
    `DEBIAN_FRONTEND=noninteractive`, `debconf-set-selections`.
+5. **No timeout** (terminal header toggle, serverless shell): the command ignores SIGHUP, so if the
+   internet drops mid-install the command **keeps running on the host** instead of being killed with
+   the request; prompts like `确认是否继续?[y/n]:` wait forever (no automatic Ctrl-D), the whole
+   session is also written to a log file (`/tmp/.sushi-run-….log`, announced in the terminal when the
+   command starts), and the keystroke FIFO stays open for a day. After reconnecting, a
+   *still running on host* chip appears in the header with **y⏎ / ⏎ / ^C** buttons that deliver keys
+   to that command through `/api/ssh/exec/keys`, and the output log can be read via SFTP or
+   `cat /tmp/.sushi-run-….log`. Stop always sends a real Ctrl+C through the FIFO.
 
 Ctrl+C sends a real SIGINT when stdin is live and cancels the request otherwise, and always leaves the
 session healthy. After a deployment, an open tab shows a **Reload** banner instead of silently keeping

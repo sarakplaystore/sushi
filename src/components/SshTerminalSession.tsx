@@ -214,7 +214,8 @@ export function SshTerminalSession({
   const [currentCwd, setCurrentCwd] = useState<string>(
     initialPath || profile.initialPath || "~"
   );
-  const [fontSize, setFontSize] = useState(13);
+  // Default terminal text size when a session opens (the −/+ buttons adjust 11–20).
+  const [fontSize, setFontSize] = useState(14);
   const [themeKey, setThemeKey] = useState<string>("obsidian");
   const [showSearch, setShowSearch] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");

@@ -950,6 +950,9 @@ export function SshTerminalSession({
             `\x1b[33m"${interactive}" needs a live terminal, and this session can only run one command at a time — it would sit there waiting for keystrokes.`
           );
           term.writeln(
+            "\x1b[90mPiping into a shell is fine, though: `curl -fsSL … | sh` runs the piped script, and its [y/n] prompts are still answerable here.\x1b[0m"
+          );
+          term.writeln(
             "Use these here: cat / tail -n 100 / sed -i / top -bn1, or open a self-hosted Sushi (VPS / Docker) or a VPS gateway for vim, nano, less, tmux…\x1b[0m"
           );
           writePrompt(term);

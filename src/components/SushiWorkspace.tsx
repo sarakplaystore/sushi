@@ -190,6 +190,7 @@ export function SushiWorkspace() {
   }, []);
 
   const bootAuthenticatedWorkspace = useCallback(async () => {
+    setVaultReady(false);
     const gw = loadGatewaySettings();
     setGatewaySettings(gw);
 
@@ -240,6 +241,14 @@ export function SushiWorkspace() {
     }
 
     if (!envelope) {
+      setHosts([]);
+      setSnippets(DEFAULT_SNIPPETS);
+      setSshKeys([]);
+      setEnforceKeyWhitelist(false);
+      setPendingEnvelope(null);
+      setActivePassphrase(null);
+      setUnlockError(null);
+      setVaultLocked(false);
       setVaultMode("device");
       setVaultReady(true);
       return;
@@ -257,8 +266,15 @@ export function SushiWorkspace() {
         setSnippets(plain.snippets);
         setSshKeys(plain.sshKeys || []);
         setEnforceKeyWhitelist(Boolean(plain.enforceKeyWhitelist));
+        setPendingEnvelope(envelope);
+        setActivePassphrase(null);
+        setUnlockError(null);
+        setVaultLocked(false);
       } catch {
-        setHosts([]);
+        // Never expose an empty editable workspace when a device vault cannot be read.
+        setPendingEnvelope(envelope);
+        setUnlockError("Unable to decrypt this device vault. Use the original browser/device or reset after ensuring you have a backup.");
+        setVaultLocked(true);
       }
       setVaultReady(true);
     }
@@ -290,6 +306,7 @@ export function SushiWorkspace() {
           ? passphraseOverride ?? activePassphrase
           : null;
 
+      if (targetMode === "passphrase" && !passToUse) throw new Error("Unlock the master-passphrase vault before saving.");
       const envelope = await encryptVaultData(
         {
           version: 1,
@@ -568,8 +585,19 @@ export function SushiWorkspace() {
     );
   }
 
+  // Do not allow imports or edits against an empty in-memory workspace while
+  // the existing vault is still loading; saving then could overwrite it.
+  if (!vaultReady) {
+    return (
+      <div role="status" className="flex h-full w-full items-center justify-center gap-2 bg-[#090b10] text-sm text-slate-400">
+        <Loader2 className="h-5 w-5 animate-spin text-[#ff6b57]" />
+        Loading vault…
+      </div>
+    );
+  }
+
   // Vault Unlock Gate
-  if (vaultReady && vaultLocked) {
+  if (vaultLocked) {
     return (
       <div className="flex h-full w-full items-center justify-center bg-[#090b10] p-4">
         <form
@@ -585,7 +613,7 @@ export function SushiWorkspace() {
                 Unlock Sushi Vault
               </h1>
               <p className="text-xs text-slate-400">
-                AES-256-GCM Master Passphrase Protection
+                {vaultMode === "passphrase" ? "AES-256-GCM Master Passphrase Protection" : "Device-key vault could not be opened"}
               </p>
             </div>
           </div>
@@ -596,14 +624,14 @@ export function SushiWorkspace() {
             </div>
           )}
 
-          <input
+          {vaultMode === "passphrase" && <input
             type="password"
             value={unlockInput}
             onChange={(e) => setUnlockInput(e.target.value)}
             placeholder="Enter master passphrase..."
             autoFocus
             className="w-full rounded-xl border border-white/12 bg-[#090b10] px-4 py-2.5 text-sm text-white placeholder-slate-500 outline-none focus:border-[#ff6b57]"
-          />
+          />}
 
           <div className="flex items-center justify-between">
             <button
@@ -617,6 +645,12 @@ export function SushiWorkspace() {
                   localStorage.removeItem("sushi_encrypted_vault_v1");
                   clearDeviceKey();
                   setHosts([]);
+                  setSnippets(DEFAULT_SNIPPETS);
+                  setSshKeys([]);
+                  setEnforceKeyWhitelist(false);
+                  setPendingEnvelope(null);
+                  setActivePassphrase(null);
+                  setUnlockError(null);
                   setVaultMode("device");
                   setVaultLocked(false);
                 }
@@ -629,7 +663,7 @@ export function SushiWorkspace() {
               type="submit"
               className="rounded-xl bg-[#ff6b57] px-5 py-2 text-xs font-semibold text-white transition hover:bg-[#ff7f6e]"
             >
-              Unlock Workspace
+              {vaultMode === "passphrase" ? "Unlock Workspace" : "Retry Device Key"}
             </button>
           </div>
         </form>
@@ -884,10 +918,10 @@ export function SushiWorkspace() {
                   setVaultModalOpen(true);
                 }}
                 className="flex items-center justify-center gap-1 rounded-xl border border-white/8 bg-[#131823] px-2 py-2 text-[11px] font-medium text-slate-200 transition hover:border-white/18 hover:bg-white/8"
-                title="Import a Termix SQLite database or JSON export, or export to Termix"
+                title="Import SSH client exports or restore an encrypted backup"
               >
                 <ArrowLeftRight className="h-3.5 w-3.5 text-[#ff6b57]" />
-                Termix
+                Import
               </button>
               <button
                 type="button"
@@ -1084,7 +1118,7 @@ export function SushiWorkspace() {
                       className="inline-flex items-center gap-1.5 rounded-xl border border-white/12 bg-white/5 px-3.5 py-2 text-xs font-medium text-slate-200 transition hover:bg-white/10"
                     >
                       <ArrowLeftRight className="h-3.5 w-3.5 text-[#ff6b57]" />
-                      Termix Import / Export
+                      Import / Export
                     </button>
                     <button
                       type="button"
@@ -1471,29 +1505,33 @@ export function SushiWorkspace() {
         onClose={() => setVaultModalOpen(false)}
         onSetPassphrase={async (pass) => {
           if (pass) {
+            await persistVault(hosts, snippets, pass, "passphrase");
             clearDeviceKey();
             setVaultMode("passphrase");
             setActivePassphrase(pass);
-            await persistVault(hosts, snippets, pass, "passphrase");
           } else {
+            await persistVault(hosts, snippets, null, "device");
             setVaultMode("device");
             setActivePassphrase(null);
-            await persistVault(hosts, snippets, null, "device");
           }
         }}
         onLockNow={() => {
           setActivePassphrase(null);
           setVaultLocked(true);
         }}
-        onExportEnvelope={() => loadLocalEnvelope()}
+        onExportPortableEnvelope={(passphrase) =>
+          encryptVaultData({
+            version: 1,
+            hosts,
+            snippets,
+            sshKeys,
+            enforceKeyWhitelist,
+          }, passphrase)
+        }
         onImportEnvelope={async (env, pass) => {
           const plain = await decryptVaultEnvelope(env, pass);
           const nextKeys = plain.sshKeys || [];
           const nextEnforce = Boolean(plain.enforceKeyWhitelist);
-          setHosts(plain.hosts);
-          setSnippets(plain.snippets);
-          setSshKeys(nextKeys);
-          setEnforceKeyWhitelist(nextEnforce);
           await persistVault(
             plain.hosts,
             plain.snippets,
@@ -1502,6 +1540,10 @@ export function SushiWorkspace() {
             nextKeys,
             nextEnforce
           );
+          setHosts(plain.hosts);
+          setSnippets(plain.snippets);
+          setSshKeys(nextKeys);
+          setEnforceKeyWhitelist(nextEnforce);
         }}
         onUpdateKeychain={async (nextKeys, nextEnforce) => {
           setSshKeys(nextKeys);
@@ -1582,9 +1624,6 @@ export function SushiWorkspace() {
             }
           }
 
-          setHosts(mergedHosts);
-          setSshKeys(mergedKeys);
-          setSnippets(mergedSnippets);
           await persistVault(
             mergedHosts,
             mergedSnippets,
@@ -1593,6 +1632,9 @@ export function SushiWorkspace() {
             mergedKeys,
             enforceKeyWhitelist
           );
+          setHosts(mergedHosts);
+          setSshKeys(mergedKeys);
+          setSnippets(mergedSnippets);
           return {
             addedHosts: newHosts.length,
             skippedHosts,
@@ -1619,6 +1661,7 @@ export function SushiWorkspace() {
           setAccountModalOpen(false);
           setTabs([]);
           setActiveTabId("launchpad");
+          setVaultReady(false);
           setAuthStatus((prev) =>
             prev ? { ...prev, authenticated: false } : null
           );

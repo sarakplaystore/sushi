@@ -14,9 +14,9 @@ It is designed around a **Hybrid VPS + Serverless Architecture**:
   - Interactive first-run Admin Setup directly in the browser on **both VPS and Vercel** (no manual env copy-paste required!), plus optional `SUSHI_AUTH_USERNAME` / `SUSHI_AUTH_PASSWORD` / `SUSHI_AUTHORIZED_KEYS` environment overrides
   - **Whitelisted Private Key Login & SSH Keychain**: Sign in to Sushi using an `ed25519` / `rsa` / `ecdsa` private key verified via cryptographic challenge signature against whitelisted public keys, and optionally enforce a strict **Vault SSH Key Whitelist** across all SSH/SFTP server connections
   - **FIDO2 / WebAuthn Passkeys** (`@simplewebauthn/server` & `@simplewebauthn/browser`) for Touch ID, Face ID, Windows Hello, and YubiKey
-- **Termix Import & Export (`Termix-SSH/Termix`)**
-  - **Termix SQLite database import**: drop in Termix's `db.sqlite` or its default encrypted-at-rest `db.sqlite.encrypted` (plus the legacy `.meta` two-file layout) to import hosts, SSH/RDP logins, credential-library keys, and command snippets
-  - Seamless import from Termix Host Export (`.json`), Termix Share Export, Termix v2.0 User Data Export, and OpenSSH `~/.ssh/config` — plus 1-click export to Termix JSON (with or without secrets)
+- **SSH Client Import & Export**
+  - Import OpenSSH config, Termius-compatible CSV, PuTTY registry exports, MobaXterm, WinSCP, Tabby, Xshell, SecureCRT sessions, SSHBorg and 7 Term backups, and simple SSH-host JSON, plus Termix (`Termix-SSH/Termix`) JSON and SQLite databases
+  - Select files or supported ZIPs from the device or iCloud Drive, review warnings, then merge or replace hosts. Export to Termix JSON with or without secrets.
 - **SSH Terminal (`@xterm/xterm` + `ssh2`)**
   - Live bidirectional **WebSocket PTY** (`/ws/ssh`) on VPS/Gateway (`vim`, `htop`, `tmux`, resize, 256-color ANSI)
   - Automatic **Serverless HTTP Streaming Shell** (`/api/ssh/exec`) fallback on Vercel with persistent working directory (`cd`), command history, and Ctrl+C cancellation
@@ -42,7 +42,82 @@ It is designed around a **Hybrid VPS + Serverless Architecture**:
   - **Open via RDP from anywhere**: a desktop button on every SSH/SFTP host row and host card, plus **Open RDP** in the terminal header and **RDP** in the file manager toolbar — the same host, reached as a desktop on port 3389, no duplicate host needed (see *Open a host's desktop over RDP*).
 - **AES-256-GCM Encrypted Credential Vault**
   - Client-side WebCrypto `AES-256-GCM` encryption (automatic device key or `PBKDF2-SHA256` Master Passphrase lock)
-  - Portable encrypted JSON backup import/export + automatic `/data/vault.enc.json` sync when self-hosted on a VPS
+  - Passphrase-encrypted portable JSON backups (including files stored in iCloud Drive) + automatic `/data/vault.enc.json` sync when self-hosted on a VPS
+
+---
+
+## Importing SSH clients and iCloud Drive files
+
+Open **Import / Export** on the dashboard or in the sidebar. Choose files, or on
+an iPhone/iPad use the Files picker and select **Browse → iCloud Drive**. Files
+are parsed locally in the browser; no Apple account or SSH client account is
+connected and the original files are not uploaded. Review the preview and its
+warnings before **Merge into Sushi** or **Replace Existing Hosts**. Merge skips
+matching profiles; Replace asks for confirmation and replaces hosts only, while
+keeping existing keys and snippets.
+
+| Source | Supported file / data |
+| --- | --- |
+| OpenSSH | `~/.ssh/config`: literal host aliases, HostName, User, Port, and matching `Host` defaults. |
+| Termius-compatible or generic CSV | Header such as `Groups,Label,Tags,Hostname/IP,Protocol,Port,Username,Password`; headerless `Name,Address,Username` CSV also works. Quoted fields and newlines are supported. |
+| PuTTY | Export `HKCU\Software\SimonTatham\PuTTY\Sessions` with `reg export` to a `.reg` file (UTF-16 or UTF-8). |
+| MobaXterm | `.mxtsessions`, `.moba`, or `MobaXterm.ini` bookmark sections. |
+| WinSCP | `WinSCP.ini` SFTP or SCP session sections. SCP-only entries become SSH profiles; Sushi's file browser needs SFTP. |
+| Tabby | Unencrypted `config.yaml` SSH profiles and `profileDefaults.ssh`. |
+| Xshell | `.xsh` SSH/SFTP session files (select multiple files together). |
+| SecureCRT | Per-session typed `.ini` files (SSH2 only). Passwords are encrypted and are not imported; XML settings exports are not supported. |
+| SSHBorg for iOS / Android | Host-backup JSON (`hosts`, `groups`, `exported_at`). Backups omit credentials and host keys; key labels, jumps and forwards need manual attention. |
+| 7 Term for macOS | Version 1 `7term-backup.json`; SSH hosts only. Keychain passwords and private key contents are omitted; serial profiles are skipped. |
+| Termix | Host/Share JSON, v2 user data JSON, and the Termix SQLite database described below. This is **Termix-SSH/Termix**, not an unrelated iOS app with the same name. |
+| Simple JSON | An array, or an object with a `hosts`, `connections`, or `servers` array. Supported fields include name/label, host/hostname/address/ip, port, user/username, protocol, password, privateKey, passphrase, group, tags and notes. |
+| ZIP | Unencrypted ZIP containing supported exports; choose it directly from iCloud Drive or locally. Import limits are 50 MB combined input and expanded output, 200 archive entries, and 100 supported files; text files are limited to 10 MB. Nested/encrypted archives are not opened. |
+
+For example, a CSV can be:
+
+```csv
+Groups,Label,Tags,Hostname/IP,Protocol,Port,Username,Password
+Production,Web 1,"web,prod",192.0.2.10,ssh,2222,deploy,"example password"
+```
+
+Embedded plaintext private keys are added to the keychain. **File paths are not
+private keys**: browsers cannot read `IdentityFile`, `.ppk` paths, SSH agents or
+other apps' keychains. You can select actual private key files alongside an
+export (or include them in the selected ZIP); uniquely matching filenames are
+linked to the host. Ambiguous or missing matches must be selected manually in
+the host editor. If an imported key is passphrase-protected, enter its passphrase
+in the host editor. PuTTY, MobaXterm, WinSCP, Xshell, and Tabby do not
+provide portable plaintext passwords in the supported exports; re-enter the
+missing secrets. Secrets marked encrypted, or using an `enc:`, `encrypted:`,
+`vault://`, or `keychain://` prefix, are not imported as plaintext; re-enter them
+if a legitimate password uses one of those prefixes. Proxy/jump hosts, tunnels, agent forwarding,
+commands, host-key trust and unsupported protocols are not migrated; the preview
+reports affected entries. Recheck each
+host and verify its server fingerprint before connecting. OpenSSH `Include`
+files and `Match` rules are not evaluated.
+
+**iCloud Drive is not the same as an iCloud device backup.** Sushi can import a
+supported file that you explicitly choose from Files/iCloud Drive, but it cannot
+sign in to iCloud, access iCloud Keychain, or decrypt an iPhone/iPad device backup
+or a third-party app's proprietary encrypted backup. Restore the original app on
+an Apple device first and export a supported format from it; ask that app's
+developer for its export options. Not every SSH client has a portable export.
+
+### Save or restore a portable Sushi backup
+
+1. Open **Vault Encryption**. Under **Portable Encrypted Sushi Backup**, enter
+   and confirm a backup passphrase, then choose **Download Portable Backup**.
+   This creates a separate AES-256-GCM / PBKDF2-encrypted `.enc.json` and does
+   **not** change the current vault password. Keep the passphrase separately.
+2. Save or move that file to iCloud Drive using your browser/Files app (or any
+   other storage you choose). This is a manual backup, not automatic iCloud sync.
+3. On the new device, select the file using **Import / Export** or **Choose
+   Backup to Restore**, enter its passphrase, and confirm replacement of the
+   current vault. The restored contents are re-encrypted using that device's
+   current vault protection.
+
+Old backups exported in **device-key mode** can only be decrypted in the
+original browser with the same device key: the device key was never included in those files. Create a new
+passphrase-protected portable backup there before changing devices.
 
 ---
 
@@ -53,7 +128,7 @@ It is designed around a **Hybrid VPS + Serverless Architecture**:
    docker cp termix:/app/data/db.sqlite.encrypted .
    docker cp termix:/app/data/.env termix.env
    ```
-2. In Sushi, open **Vault → Termix Import / Export**, drop `db.sqlite.encrypted`, and paste (or load) `termix.env`:
+2. In Sushi, open **Vault → Import / Export**, drop `db.sqlite.encrypted`, and paste (or load) `termix.env`:
    - `DATABASE_KEY` decrypts the `db.sqlite.encrypted` file itself.
    - `ENCRYPTION_KEY` unwraps each Termix user's data key, decrypting saved passwords, private keys, key passphrases, and RDP logins.
    - Older **Termix 2.x** accounts whose data key is still wrapped by the account password can be unlocked by entering that Termix password.

@@ -13,7 +13,7 @@ import {
   resolveWebAuthnRpFromRequest,
   saveServerPasskey,
   verifyChallengeToken,
-  verifyIncomingAuth,
+  verifyAdminSession,
   verifySignedPasskeyCertificates,
 } from "@/lib/server/auth";
 import { getCorsHeaders } from "@/lib/server/security";
@@ -30,7 +30,7 @@ export async function OPTIONS(req: NextRequest) {
 
 export async function POST(req: NextRequest) {
   const cors = getCorsHeaders(req.headers.get("origin"));
-  const auth = await verifyIncomingAuth(req.headers);
+  const auth = await verifyAdminSession(req.headers);
   if (!auth.ok) {
     return NextResponse.json(
       { ok: false, error: auth.error },

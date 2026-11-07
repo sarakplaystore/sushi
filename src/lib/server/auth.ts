@@ -1,5 +1,4 @@
 import crypto from "node:crypto";
-import fs from "node:fs/promises";
 import path from "node:path";
 import type { IncomingMessage } from "node:http";
 import type { NextRequest, NextResponse } from "next/server";
@@ -9,6 +8,7 @@ import type {
   StoredPasskeyRecord,
 } from "@/types/auth";
 import { parseAuthorizedKeysBlock } from "./ssh-key-utils";
+import { compareAndSwapAuthWithVaultGuard, compareAndSwapStateRecord, getStateStoreKind, hasPersistentStateStore, readStateRecord } from "./state-store";
 
 export const SESSION_COOKIE_NAME = "sushi_session";
 export const ADMIN_CERT_COOKIE_NAME = "sushi_admin_cert";
@@ -47,6 +47,7 @@ export interface EffectiveAuthConfig {
   username: string;
   verifyPassword: (candidate: string) => Promise<boolean>;
   authSecret: string;
+  sessionVersion?: string;
   serverPasskeys: StoredPasskeyRecord[];
   authorizedKeys: AuthorizedKeyRecord[];
   adminProfilePayload?: SignedAdminProfilePayload;
@@ -139,30 +140,55 @@ function deriveInstanceSecret(seedMaterial?: string): string {
   ).toString("hex");
 }
 
-async function readDiskAuthFile(): Promise<DiskAuthFile | null> {
-  if (!isPersistentDiskAvailable()) return null;
-  try {
-    const raw = await fs.readFile(getAuthFilePath(), "utf8");
-    const parsed = JSON.parse(raw) as DiskAuthFile;
-    if (!parsed?.username || (!parsed?.passwordHash && !parsed?.authorizedKeys?.length)) {
-      return null;
-    }
-    return {
-      ...parsed,
-      passkeys: Array.isArray(parsed.passkeys) ? parsed.passkeys : [],
-      authorizedKeys: Array.isArray(parsed.authorizedKeys)
-        ? parsed.authorizedKeys
-        : [],
-    };
-  } catch {
-    return null;
-  }
+// Remember the exact bytes read so concurrent account changes cannot overwrite
+// one another. The metadata is not serialized into the account record.
+const authRecordSources = new WeakMap<DiskAuthFile, string>();
+
+/** Bind sessions to the current credentials without exposing their hash. */
+function credentialSessionVersion(secret: string, ...parts: string[]): string {
+  return crypto.createHmac("sha256", secret)
+    .update("sushi-session-credentials-v1\0")
+    .update(JSON.stringify(parts))
+    .digest("hex");
 }
 
-async function writeDiskAuthFile(data: DiskAuthFile): Promise<void> {
-  const filePath = getAuthFilePath();
-  await fs.mkdir(path.dirname(filePath), { recursive: true });
-  await fs.writeFile(filePath, JSON.stringify(data, null, 2), { mode: 0o600 });
+async function readDiskAuthFile(): Promise<DiskAuthFile | null> {
+  if (!hasPersistentStateStore()) return null;
+  const raw = await readStateRecord("auth");
+  if (raw === null) return null;
+  let parsed: DiskAuthFile;
+  try {
+    parsed = JSON.parse(raw) as DiskAuthFile;
+  } catch {
+    throw new Error("Persistent account data is corrupt; setup is disabled until it is restored.");
+  }
+  if (!parsed || parsed.version !== 1 || typeof parsed.username !== "string" ||
+      !parsed.username || typeof parsed.authSecret !== "string" || !parsed.authSecret ||
+      typeof parsed.passwordSalt !== "string" || typeof parsed.passwordHash !== "string" ||
+      (parsed.passkeys !== undefined && !Array.isArray(parsed.passkeys)) ||
+      (parsed.authorizedKeys !== undefined && !Array.isArray(parsed.authorizedKeys))) {
+    throw new Error("Persistent account data is invalid; setup is disabled until it is restored.");
+  }
+  const record: DiskAuthFile = {
+    ...parsed,
+    passkeys: Array.isArray(parsed.passkeys) ? parsed.passkeys : [],
+    authorizedKeys: Array.isArray(parsed.authorizedKeys) ? parsed.authorizedKeys : [],
+  };
+  authRecordSources.set(record, raw);
+  return record;
+}
+
+async function writeDiskAuthFile(data: DiskAuthFile, vaultGuard?: { raw: string | null }): Promise<void> {
+  const previous = authRecordSources.get(data) ?? null;
+  const next = JSON.stringify(data, null, 2);
+  const saved = vaultGuard
+    ? await compareAndSwapAuthWithVaultGuard(previous, next, vaultGuard.raw)
+    : await compareAndSwapStateRecord("auth", previous, next);
+  if (!saved) {
+    if (previous === null) throw new Error("Admin account is already initialized.");
+    throw new Error("Account or vault changed in another request. Refresh and try again.");
+  }
+  authRecordSources.set(data, next);
 }
 
 function parseEnvPasskeys(): StoredPasskeyRecord[] {
@@ -258,7 +284,9 @@ export function verifyAdminProfileCertificate(
   secret: string
 ): SignedAdminProfilePayload | null {
   const parsed = verifySignedPayload<SignedAdminProfilePayload>(cert, secret);
-  if (!parsed || parsed.v !== 1 || typeof parsed.username !== "string") {
+  if (!parsed || parsed.v !== 1 || typeof parsed.username !== "string" ||
+      !parsed.username || typeof parsed.passwordSalt !== "string" ||
+      typeof parsed.passwordHash !== "string") {
     return null;
   }
   return {
@@ -355,6 +383,7 @@ export async function getEffectiveAuthConfig(
       envConfigured: true,
       username: envUser,
       authSecret: derivedSecret,
+      sessionVersion: credentialSessionVersion(derivedSecret, envUser, envPassHash || envPass || envAuthorizedKeys[0]?.fingerprint || ""),
       serverPasskeys: Array.from(mergedPasskeysMap.values()),
       authorizedKeys,
       verifyPassword: async (candidate: string) => {
@@ -394,11 +423,12 @@ export async function getEffectiveAuthConfig(
 
     return {
       initialized: true,
-      canBootstrapOnDisk: true,
+      canBootstrapOnDisk: isPersistentDiskAvailable(),
       canBootstrapInteractive: true,
       envConfigured: false,
       username: disk.username,
       authSecret: envSecret || disk.authSecret,
+      sessionVersion: credentialSessionVersion(envSecret || disk.authSecret, disk.username, disk.passwordSalt, disk.passwordHash),
       serverPasskeys: Array.from(mergedPasskeysMap.values()),
       authorizedKeys,
       verifyPassword: async (candidate: string) => {
@@ -422,6 +452,27 @@ export async function getEffectiveAuthConfig(
   );
 
   if (verifiedProfile) {
+    if (getStateStoreKind() === "redis") {
+      if (!verifiedProfile.passwordSalt || !verifiedProfile.passwordHash) {
+        throw new Error("The existing browser account cannot be migrated without its password profile.");
+      }
+      const now = Date.now();
+      const record: DiskAuthFile = {
+        version: 1,
+        username: verifiedProfile.username,
+        passwordSalt: verifiedProfile.passwordSalt,
+        passwordHash: verifiedProfile.passwordHash,
+        authSecret: serverlessSecret,
+        passkeys: [],
+        authorizedKeys: verifiedProfile.authorizedKeys,
+        createdAt: now,
+        updatedAt: verifiedProfile.updatedAt || now,
+      };
+      // Another browser may have initialized the store at the same time. In
+      // either case, re-read the authoritative record instead of overwriting it.
+      await compareAndSwapStateRecord("auth", null, JSON.stringify(record, null, 2));
+      return getEffectiveAuthConfig(headers, explicitAdminCert);
+    }
     const authorizedKeys = mergeAuthorizedKeyLists(
       verifiedProfile.authorizedKeys.map((k) => ({
         ...k,
@@ -437,6 +488,7 @@ export async function getEffectiveAuthConfig(
       envConfigured: false,
       username: verifiedProfile.username,
       authSecret: serverlessSecret,
+      sessionVersion: credentialSessionVersion(serverlessSecret, verifiedProfile.username, verifiedProfile.passwordSalt, verifiedProfile.passwordHash),
       serverPasskeys: envPasskeys,
       authorizedKeys,
       adminProfilePayload: verifiedProfile,
@@ -461,6 +513,7 @@ export async function getEffectiveAuthConfig(
       envConfigured: true,
       username: "admin",
       authSecret: serverlessSecret,
+      sessionVersion: credentialSessionVersion(serverlessSecret, "admin", ...envAuthorizedKeys.map((key) => key.fingerprint)),
       serverPasskeys: envPasskeys,
       authorizedKeys: envAuthorizedKeys,
       verifyPassword: async () => false,
@@ -471,7 +524,7 @@ export async function getEffectiveAuthConfig(
   return {
     initialized: false,
     canBootstrapOnDisk: isPersistentDiskAvailable(),
-    canBootstrapInteractive: true,
+    canBootstrapInteractive: hasPersistentStateStore() || process.env.SUSHI_ALLOW_STATELESS_SETUP === "true",
     envConfigured: false,
     username: "",
     authSecret: serverlessSecret,
@@ -494,6 +547,7 @@ export async function bootstrapAdminAccount(
   authSecret: string;
   adminProfileCert: string;
   persistedOnDisk: boolean;
+  sessionVersion: string;
 }> {
   const cleanUser = username.trim();
   if (cleanUser.length < 2 || cleanUser.length > 64) {
@@ -508,7 +562,7 @@ export async function bootstrapAdminAccount(
   const passwordHash = derived.toString("hex");
   const now = Date.now();
 
-  if (isPersistentDiskAvailable()) {
+  if (hasPersistentStateStore()) {
     const existing = await readDiskAuthFile();
     if (existing) {
       throw new Error("Admin account is already initialized.");
@@ -543,8 +597,13 @@ export async function bootstrapAdminAccount(
       username: cleanUser,
       authSecret,
       adminProfileCert,
-      persistedOnDisk: true,
+      persistedOnDisk: getStateStoreKind() === "disk",
+      sessionVersion: credentialSessionVersion(authSecret, cleanUser, saltHex, passwordHash),
     };
+  }
+
+  if (process.env.SUSHI_ALLOW_STATELESS_SETUP !== "true") {
+    throw new Error("Configure persistent shared storage before creating an account on Vercel.");
   }
 
   // Stateless Vercel deployment: seal profile into an HMAC-SHA256 certificate
@@ -566,6 +625,7 @@ export async function bootstrapAdminAccount(
     authSecret,
     adminProfileCert,
     persistedOnDisk: false,
+    sessionVersion: credentialSessionVersion(authSecret, cleanUser, saltHex, passwordHash),
   };
 }
 
@@ -575,17 +635,26 @@ export const bootstrapDiskAdminAccount = bootstrapAdminAccount;
 export async function updateAdminCredentials(
   cfg: EffectiveAuthConfig,
   nextUsername: string,
-  nextPassword?: string
-): Promise<{ adminProfileCert?: string }> {
+  nextPassword?: string,
+  currentPassword?: string,
+  vaultGuard?: { raw: string | null }
+): Promise<{ adminProfileCert?: string; sessionVersion: string }> {
   const cleanUser = nextUsername.trim();
   if (cleanUser.length < 2 || cleanUser.length > 64) {
     throw new Error("Username must be between 2 and 64 characters.");
   }
 
-  if (isPersistentDiskAvailable()) {
+  if (hasPersistentStateStore()) {
     const existing = await readDiskAuthFile();
     if (!existing) {
-      throw new Error("No disk account record found.");
+      throw new Error("No persistent account record found.");
+    }
+    if (currentPassword !== undefined) {
+      const derived = await scryptHash(currentPassword, existing.passwordSalt);
+      const expected = Buffer.from(existing.passwordHash, "hex");
+      if (derived.length !== expected.length || !crypto.timingSafeEqual(derived, expected)) {
+        throw new Error("Account credentials changed in another request. Sign in again.");
+      }
     }
     existing.username = cleanUser;
     if (nextPassword && nextPassword.length > 0) {
@@ -598,7 +667,7 @@ export async function updateAdminCredentials(
       existing.passwordHash = derived.toString("hex");
     }
     existing.updatedAt = Date.now();
-    await writeDiskAuthFile(existing);
+    await writeDiskAuthFile(existing, vaultGuard);
 
     const adminProfileCert = issueAdminProfileCertificate(
       {
@@ -611,7 +680,10 @@ export async function updateAdminCredentials(
       },
       existing.authSecret
     );
-    return { adminProfileCert };
+    return {
+      adminProfileCert,
+      sessionVersion: credentialSessionVersion(cfg.authSecret, existing.username, existing.passwordSalt, existing.passwordHash),
+    };
   }
 
   if (cfg.adminProfilePayload) {
@@ -638,6 +710,7 @@ export async function updateAdminCredentials(
         updatedPayload,
         cfg.authSecret
       ),
+      sessionVersion: credentialSessionVersion(cfg.authSecret, cleanUser, saltHex, passwordHash),
     };
   }
 
@@ -660,7 +733,7 @@ export async function addWhitelistedKey(
     cfg.authSecret
   );
 
-  if (isPersistentDiskAvailable()) {
+  if (hasPersistentStateStore()) {
     let disk = await readDiskAuthFile();
     if (!disk) {
       disk = {
@@ -718,7 +791,7 @@ export async function removeWhitelistedKey(
   cfg: EffectiveAuthConfig,
   fingerprint: string
 ): Promise<{ removedOnDisk: boolean; adminProfileCert?: string }> {
-  if (isPersistentDiskAvailable()) {
+  if (hasPersistentStateStore()) {
     const disk = await readDiskAuthFile();
     if (disk && Array.isArray(disk.authorizedKeys)) {
       const before = disk.authorizedKeys.length;
@@ -758,7 +831,7 @@ export async function removeWhitelistedKey(
 export async function saveServerPasskey(
   record: StoredPasskeyRecord
 ): Promise<boolean> {
-  if (!isPersistentDiskAvailable()) return false;
+  if (!hasPersistentStateStore()) return false;
   let disk = await readDiskAuthFile();
   if (!disk) {
     const cfg = await getEffectiveAuthConfig();
@@ -787,7 +860,7 @@ export async function saveServerPasskey(
 }
 
 export async function removeServerPasskey(credentialId: string): Promise<boolean> {
-  if (!isPersistentDiskAvailable()) return false;
+  if (!hasPersistentStateStore()) return false;
   const disk = await readDiskAuthFile();
   if (!disk) return false;
   const before = disk.passkeys.length;
@@ -808,14 +881,16 @@ export interface SessionClaims {
   sub: string;
   iat: number;
   exp: number;
+  sv?: string;
 }
 
-export function createSessionToken(username: string, secret: string): string {
+export function createSessionToken(username: string, secret: string, sessionVersion?: string): string {
   const now = Date.now();
   const claims: SessionClaims = {
     sub: username,
     iat: now,
     exp: now + SESSION_TTL_MS,
+    ...(sessionVersion ? { sv: sessionVersion } : {}),
   };
   return signPayload(claims as unknown as Record<string, unknown>, secret);
 }
@@ -823,7 +898,8 @@ export function createSessionToken(username: string, secret: string): string {
 export function verifySessionToken(
   token: string | undefined | null,
   secret: string,
-  expectedUsername?: string
+  expectedUsername?: string,
+  expectedSessionVersion?: string
 ): SessionClaims | null {
   const claims = verifySignedPayload<SessionClaims>(token, secret);
   if (
@@ -837,6 +913,9 @@ export function verifySessionToken(
     return null;
   }
   if (expectedUsername && !safeEqualStrings(claims.sub, expectedUsername)) {
+    return null;
+  }
+  if (expectedSessionVersion && (typeof claims.sv !== "string" || !safeEqualStrings(claims.sv, expectedSessionVersion))) {
     return null;
   }
   return claims;
@@ -1073,6 +1152,39 @@ export function mergePasskeySummaries(
 // Request & WebSocket Authentication Guard
 // ---------------------------------------------------------------------------
 
+/** Account and vault operations require an admin session, not a gateway token.
+ * Gateway tokens authorize protocol access on a companion VPS only. */
+export async function verifyAdminSession(headers: Headers): Promise<{ ok: boolean; username?: string; error?: string }> {
+  // The general gateway CORS policy can allow other origins. Account and vault
+  // cookies must not be usable by an unrelated origin (including same-site
+  // subdomains) merely because a gateway is configured with ALLOWED_ORIGIN=*.
+  const origin = headers.get("origin");
+  if (origin) {
+    const host = (headers.get("x-forwarded-host") || headers.get("host") || "").split(",")[0].trim().toLowerCase();
+    const forwardedProto = headers.get("x-forwarded-proto")?.split(",")[0].trim().toLowerCase();
+    try {
+      const parsed = new URL(origin);
+      if (!host || parsed.host.toLowerCase() !== host ||
+          (parsed.protocol !== "https:" && parsed.protocol !== "http:") ||
+          (forwardedProto && parsed.protocol !== `${forwardedProto}:`)) {
+        return { ok: false, error: "Account and vault requests must originate from this Sushi site." };
+      }
+    } catch {
+      return { ok: false, error: "Account and vault requests must originate from this Sushi site." };
+    }
+  }
+  const cfg = await getEffectiveAuthConfig(headers);
+  if (cfg.initialized) {
+    const sessionHeader = headers.get("x-sushi-session")?.trim();
+    const sessionCookie = parseCookieValue(headers.get("cookie") || "", SESSION_COOKIE_NAME);
+    for (const token of [sessionHeader, sessionCookie]) {
+      const claims = verifySessionToken(token, cfg.authSecret, cfg.username, cfg.sessionVersion);
+      if (claims) return { ok: true, username: claims.sub };
+    }
+  }
+  return { ok: false, error: "Authentication required: sign in to the admin account." };
+}
+
 export async function verifyIncomingAuth(
   headers: Headers | IncomingMessage["headers"],
   explicitSessionOrToken?: string | null
@@ -1138,12 +1250,12 @@ export async function verifyIncomingAuth(
 
   // On persistent-disk VPS or env-configured instances, sessions are only valid once
   // the admin account exists (never trust tokens signed with a fallback secret).
-  const awaitingSetup = isPersistentDiskAvailable() && !cfg.initialized;
+  const awaitingSetup = !cfg.initialized;
 
   if (!awaitingSetup) {
     const expectedUsername = cfg.initialized ? cfg.username : undefined;
     for (const tok of candidateTokens) {
-      const claims = verifySessionToken(tok, cfg.authSecret, expectedUsername);
+      const claims = verifySessionToken(tok, cfg.authSecret, expectedUsername, cfg.sessionVersion);
       if (claims) {
         return { ok: true, username: claims.sub };
       }

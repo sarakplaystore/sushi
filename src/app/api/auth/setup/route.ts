@@ -85,7 +85,7 @@ export async function POST(req: NextRequest) {
       body.password,
       initialAuthorizedKeys
     );
-    const sessionToken = createSessionToken(created.username, created.authSecret);
+    const sessionToken = createSessionToken(created.username, created.authSecret, created.sessionVersion);
 
     const signedKeyCertificates = initialAuthorizedKeys.map((rec) => ({
       fingerprint: rec.fingerprint,
@@ -113,15 +113,9 @@ export async function POST(req: NextRequest) {
     attachAdminProfileCookie(res, created.adminProfileCert, req);
     return res;
   } catch (err) {
-    return NextResponse.json(
-      {
-        ok: false,
-        error:
-          err instanceof Error
-            ? err.message
-            : "Failed to initialize admin account.",
-      },
-      { status: 400, headers: cors }
-    );
+    const message = err instanceof Error ? err.message : "Failed to initialize admin account.";
+    const status = /already initialized/i.test(message) ? 409
+      : /storage|persistent account data/i.test(message) ? 503 : 400;
+    return NextResponse.json({ ok: false, error: message }, { status, headers: cors });
   }
 }

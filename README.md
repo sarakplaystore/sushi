@@ -4,14 +4,14 @@
 
 It is designed around a **Hybrid VPS + Serverless Architecture**:
 - **Self-Hosted on a VPS (Docker Compose or Node.js)**: Runs a unified HTTP + WebSocket server (`server.ts`) paired with Apache Guacamole's `guacd` daemon for full interactive `xterm.js` PTY SSH terminals, graphical SFTP file management + remote code editing, and live 60fps HTML5 Remote Desktop (RDP) sessions.
-- **Deployed on Vercel (Serverless Node.js)**: Deploys directly to Vercel with zero database setup. Graphical **SFTP** file browsing/uploads/downloads/editing, **Serverless Streaming SSH** execution, and **MS-RDPBCGR X.224 / TLS / NLA** server probes work natively on Vercel Serverless Functions — and you can optionally link any VPS Gateway URL (`wss://...`) inside the UI to unlock persistent WebSocket PTY shells and live browser RDP streaming.
+- **Deployed on Vercel (Serverless Node.js)**: Uses a Redis-compatible REST database for a persistent account and cross-device vault (see setup below). Graphical **SFTP** file browsing/uploads/downloads/editing, **Serverless Streaming SSH** execution, and **MS-RDPBCGR X.224 / TLS / NLA** server probes work natively on Vercel Serverless Functions — and you can optionally link any VPS Gateway URL (`wss://...`) inside the UI to unlock persistent WebSocket PTY shells and live browser RDP streaming.
 
 ---
 
 ## Features
 
 - **Username, Password, WebAuthn Passkey & Whitelisted Private Key Protection**
-  - Interactive first-run Admin Setup directly in the browser on **both VPS and Vercel** (no manual env copy-paste required!), plus optional `SUSHI_AUTH_USERNAME` / `SUSHI_AUTH_PASSWORD` / `SUSHI_AUTHORIZED_KEYS` environment overrides
+  - One interactive admin account shared across devices: persistent disk on a VPS or configured Redis REST storage on Vercel. Optional `SUSHI_AUTH_USERNAME` / `SUSHI_AUTH_PASSWORD` / `SUSHI_AUTHORIZED_KEYS` environment overrides remain available.
   - **Whitelisted Private Key Login & SSH Keychain**: Sign in to Sushi using an `ed25519` / `rsa` / `ecdsa` private key verified via cryptographic challenge signature against whitelisted public keys, and optionally enforce a strict **Vault SSH Key Whitelist** across all SSH/SFTP server connections
   - **FIDO2 / WebAuthn Passkeys** (`@simplewebauthn/server` & `@simplewebauthn/browser`) for Touch ID, Face ID, Windows Hello, and YubiKey
 - **SSH Client Import & Export**
@@ -41,10 +41,64 @@ It is designed around a **Hybrid VPS + Serverless Architecture**:
   - Native serverless **MS-RDPBCGR X.224 + TLS certificate inspector** (`/api/rdp/probe`) and one-click `.rdp` profile generator
   - **Open via RDP from anywhere**: a desktop button on every SSH/SFTP host row and host card, plus **Open RDP** in the terminal header and **RDP** in the file manager toolbar — the same host, reached as a desktop on port 3389, no duplicate host needed (see *Open a host's desktop over RDP*).
 - **AES-256-GCM Encrypted Credential Vault**
-  - Client-side WebCrypto `AES-256-GCM` encryption (automatic device key or `PBKDF2-SHA256` Master Passphrase lock)
-  - Passphrase-encrypted portable JSON backups (including files stored in iCloud Drive) + automatic `/data/vault.enc.json` sync when self-hosted on a VPS
+  - Browser-side `AES-256-GCM` encryption with the account password (`PBKDF2-SHA256`, 210,000 iterations), a separate master passphrase, or a device key
+  - Encrypted cross-device host, credential, key and snippet sync with revision checks; optional passphrase-encrypted portable JSON backups
 
 ---
+
+## One account and saved connections on multiple devices
+
+1. Configure persistent storage as described in **Quick Start**. Open Sushi on a
+   trusted network and create the admin account once. Anyone who reaches a new,
+   uninitialized deployment first can claim that account, so protect setup.
+2. Save a connection. On another device, open the **same Sushi URL** and sign in
+   with the same account. Saved SSH/SFTP/RDP profiles, passwords, private keys,
+   whitelist settings and snippets are stored in the encrypted shared vault.
+   Open terminal/RDP sessions and gateway settings are not transferred.
+3. Sushi checks for shared changes when the page regains focus and periodically
+   while it is visible and no editor is open. **Sync saved connections** checks
+   manually. A conflicting save is rejected rather than overwriting another
+   device; keep your unsaved edits, reload the latest vault and reapply them.
+
+New shared vaults use the **account password** in the browser for PBKDF2 and
+AES-256-GCM. It is kept in memory while unlocked, not stored as plaintext in
+browser storage. A reload, Passkey or private-key sign-in may still ask for the
+account password to decrypt the vault. Use a long, unique password: anyone with
+an encrypted vault copy can attempt to guess it offline. Sushi sends the account
+password to its server for normal sign-in and password verification, so this is
+**not zero-knowledge encryption**. The server serves the browser code, and a
+compromised server could capture the password. Use HTTPS and trust both your
+server and storage provider. The shared store contains the account password
+hash/session signing secret, public login keys/passkeys, and encrypted vault—not
+plaintext saved SSH passwords or private keys.
+
+**Existing vaults:** On the original browser, unlock the old device-key or master
+passphrase vault and choose **Vault Encryption → Account password sync** if it is
+not already migrated. Verify it on a second device before removing the original
+browser's data. Device-key vaults and older device-key backups cannot be opened on
+another browser: keep the original device key and make a portable backup first.
+If the browser has a different local vault from the shared vault, Sushi asks you
+to download its encrypted copy before opening the shared one; it does not merge
+conflicting vaults automatically. Restoring a backup replaces the current vault.
+
+**Changing the account password:** Use **Account & Login Keys → Password** while
+the vault is unlocked. Sushi first keeps the vault decryptable with the old
+password, changes the account, then re-encrypts the vault with the new password.
+Keep the old password until the final step succeeds. If the update is interrupted,
+the interface explains how to unlock with the previous password and enable sync
+with the current one. Changing credentials signs out other device sessions; sign
+in again there with the new account credentials. Existing sessions also need to
+sign in once after upgrading to credential-bound sessions. For environment-managed
+passwords changed outside Sushi, sign in with the new password and, if prompted,
+unlock the vault with its previous password. A separate-master-passphrase vault
+keeps its separate passphrase.
+
+If shared storage is unavailable or an existing vault cannot be read, Sushi does
+not silently create an empty account/vault or claim that a save succeeded. On a
+VPS, if a crashed process left a `data/*.lock` file, stop all Sushi processes and
+confirm no writer is active before removing the **lock file only**; never remove
+the `.json` files to clear a lock. Vercel requests can synchronize encrypted
+vaults up to 4 MiB; self-hosted vault snapshots are limited to 32 MiB.
 
 ## Add Sushi to an iPhone or iPad Home Screen
 
@@ -56,12 +110,12 @@ It is designed around a **Hybrid VPS + Serverless Architecture**:
    does not make SSH, SFTP, or RDP work offline.
 
 The Home Screen app may have separate login and browser storage from Safari,
-including the local device key used to encrypt a device-key vault. You may need
-to sign in again, unlock a synced master-passphrase vault, or restore a portable
-backup. **Before switching, create and verify a passphrase-protected portable
-backup in the original browser** (see below); do not reset an unreadable vault
-until you have a working backup. The icon does not automatically sync vaults or
-keys between Safari and the installed app.
+including the local device key used to encrypt a device-key vault. Sign in to
+the same configured Sushi deployment in the Home Screen app to open an
+account-password-synced vault; the icon itself does not sync data through iCloud.
+**Before switching, create and verify a passphrase-protected portable backup in
+the original browser** (see below); do not reset an unreadable vault until you
+have a working backup.
 
 ---
 
@@ -190,6 +244,12 @@ Or run the one-step VPS installer on Ubuntu/Debian:
 bash scripts/install-vps.sh
 ```
 
+Keep the `sushi-data` volume (or `DATA_DIR` when running Node directly) persistent
+and backed up: it holds `auth.json` and `vault.enc.json`. Recreating or deleting
+that storage can lose the account and saved connections. `SUSHI_SERVER_VAULT=false`
+disables shared vault sync. A Redis REST database can optionally replace disk for
+the account and vault; configure one of the pairs described below.
+
 `docker-compose.yml` launches both:
 - `sushi` on port `3000` (Web UI + API + `/ws/ssh` + `/ws/rdp`)
 - `guacd` (`guacamole/guacd:1.5.5`) on an internal bridge network for live RDP rendering
@@ -204,20 +264,46 @@ bash scripts/install-vps.sh
 
 ### 3. Deploy to Vercel (+ Optional Companion VPS Gateway)
 
-1. Import `sarakplaystore/sushi` into **Vercel** (Framework Preset: **Next.js**, Node.js `22.x`) and deploy.
-2. Out of the box on Vercel:
-   - **SFTP File Manager & Remote File Editor** work natively.
-   - **SSH Terminal** runs in Serverless Streaming PTY mode.
-   - **RDP** runs live X.224/TLS/NLA diagnostics and exports `.rdp` launch files.
-3. *(Optional)* To enable persistent WebSocket PTY shells and live browser RDP on your Vercel deployment, run a lightweight gateway on any VPS:
+1. Create a persistent Redis database with an **Upstash-compatible REST API**
+   (for example, an Upstash Redis integration in Vercel). No database is created
+   automatically by Sushi. Obtain its REST URL and REST token from your provider.
+2. In Vercel, import `sarakplaystore/sushi` (Next.js, Node.js `22.x`) and set one
+   complete pair of **server-side** environment variables before deploying:
+   - `SUSHI_REDIS_REST_URL` and `SUSHI_REDIS_REST_TOKEN`, or
+   - `UPSTASH_REDIS_REST_URL` and `UPSTASH_REDIS_REST_TOKEN`, or
+   - `KV_REST_API_URL` and `KV_REST_API_TOKEN` (older Vercel KV integrations).
+
+   Do not expose the token with `NEXT_PUBLIC_` or commit it. The first complete
+   pair in the order above is used; a partially configured pair fails closed.
+   Redeploy after changing environment variables. Production and preview use
+   separate default Redis namespaces; `SUSHI_STORAGE_PREFIX` can set an explicit
+   namespace shared by all instances of the same environment. Back up the Redis
+   database and avoid sharing a prefix with unrelated deployments.
+3. Open the deployed URL and create the account once. Other devices visiting
+   that deployment see sign-in and can open the same encrypted vault. Without
+   persistent storage, first-time interactive setup is blocked instead of
+   silently creating a different browser-local account. Existing env-configured
+   accounts can still sign in, but have no shared vault until storage is set up.
+   For legacy browser-local behavior only, `SUSHI_ALLOW_STATELESS_SETUP=true`
+   explicitly opts back in; it does **not** provide cross-device sync.
+4. On Vercel, SFTP and serverless SSH work natively, and RDP can probe/export a
+   `.rdp` file. *(Optional)* For persistent WebSocket PTY shells and live RDP,
+   run a companion VPS gateway:
    ```bash
    docker compose up -d guacd
    SUSHI_GATEWAY_TOKEN="your-secret" ALLOWED_ORIGIN="https://your-app.vercel.app" npm run gateway
    ```
-   Put Caddy/Nginx HTTPS in front of the VPS and enter `https://gw.yourdomain.com` + your token in **Gateway** inside the Sushi UI.
-   The token you enter must equal the gateway's `SUSHI_GATEWAY_TOKEN`. If it is missing or wrong, the
-   terminal says so and falls back to serverless SSH. A full Sushi install (`docker compose`) can act
-   as the gateway too, as long as `SUSHI_GATEWAY_TOKEN` is set in its `.env`.
+   Put Caddy/Nginx HTTPS in front of the VPS and enter its URL and matching token
+   in Sushi's **Gateway** settings. A gateway token authorizes protocol access;
+   it is not an admin sign-in and cannot read or change the shared vault.
+
+**Upgrading an existing browser-local Vercel account:** Back up the old vault
+first. Preserve the existing `SUSHI_AUTH_SECRET` and deployment identity, add the
+Redis configuration, and open the upgraded deployment first in the original
+browser, before another visitor creates an account. Its valid signed account
+profile initializes the empty Redis account atomically. Unlock the original vault
+and enable account-password sync as above. Passkeys that existed only as local
+browser certificates may need to be registered again for shared storage.
 
 ### Open a host's desktop over RDP
 

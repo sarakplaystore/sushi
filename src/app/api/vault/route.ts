@@ -1,106 +1,80 @@
-import fs from "node:fs/promises";
-import path from "node:path";
 import { NextRequest, NextResponse } from "next/server";
-import { getCorsHeaders, verifyRequestAccess } from "@/lib/server/security";
+import { getCorsHeaders } from "@/lib/server/security";
+import { verifyAdminSession } from "@/lib/server/auth";
+import { isServerVaultEnabled, parseVaultEnvelope, readStoredVault, saveStoredVault } from "@/lib/server/vault-store";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-function getVaultFilePath(): string {
-  const dir = process.env.DATA_DIR?.trim() || path.join(process.cwd(), "data");
-  return path.join(dir, "vault.enc.json");
-}
-
-function isServerVaultEnabled(): boolean {
-  return process.env.VERCEL !== "1" && process.env.SUSHI_SERVER_VAULT !== "false";
-}
-
 export async function OPTIONS(req: NextRequest) {
-  return new NextResponse(null, {
-    status: 204,
-    headers: getCorsHeaders(req.headers.get("origin")),
-  });
+  return new NextResponse(null, { status: 204, headers: getCorsHeaders(req.headers.get("origin")) });
 }
 
 export async function GET(req: NextRequest) {
   const cors = getCorsHeaders(req.headers.get("origin"));
-  const auth = await verifyRequestAccess(req.headers);
-  if (!auth.ok) {
-    return NextResponse.json({ ok: false, error: auth.error }, { status: 401, headers: cors });
-  }
-
-  if (!isServerVaultEnabled()) {
-    return NextResponse.json(
-      { ok: true, enabled: false, envelope: null },
-      { headers: cors }
-    );
-  }
-
   try {
-    const raw = await fs.readFile(getVaultFilePath(), "utf8");
-    const envelope = JSON.parse(raw);
-    return NextResponse.json(
-      { ok: true, enabled: true, envelope },
-      { headers: cors }
-    );
-  } catch {
-    return NextResponse.json(
-      { ok: true, enabled: true, envelope: null },
-      { headers: cors }
-    );
+    const auth = await verifyAdminSession(req.headers);
+    if (!auth.ok) return NextResponse.json({ ok: false, error: auth.error }, { status: 401, headers: cors });
+    if (!isServerVaultEnabled()) {
+      return NextResponse.json({ ok: true, enabled: false, envelope: null, revision: null }, { headers: cors });
+    }
+    const current = await readStoredVault();
+    return NextResponse.json({
+      ok: true,
+      enabled: true,
+      envelope: current?.envelope ?? null,
+      revision: current?.revision ?? null,
+    }, { headers: cors });
+  } catch (error) {
+    return NextResponse.json({
+      ok: false,
+      error: error instanceof Error ? error.message : "Could not read the encrypted vault.",
+    }, { status: 503, headers: cors });
   }
 }
 
 export async function POST(req: NextRequest) {
   const cors = getCorsHeaders(req.headers.get("origin"));
-  const auth = await verifyRequestAccess(req.headers);
-  if (!auth.ok) {
-    return NextResponse.json({ ok: false, error: auth.error }, { status: 401, headers: cors });
-  }
-
-  if (!isServerVaultEnabled()) {
-    return NextResponse.json(
-      {
-        ok: false,
-        enabled: false,
-        error: "Server-side file vault is disabled on stateless serverless deployments.",
-      },
-      { status: 400, headers: cors }
-    );
-  }
-
   try {
-    const body = (await req.json()) as { envelope?: Record<string, unknown> };
-    if (!body?.envelope || typeof body.envelope.ciphertext !== "string") {
-      return NextResponse.json(
-        { ok: false, error: "Invalid encrypted vault envelope." },
-        { status: 400, headers: cors }
-      );
+    const auth = await verifyAdminSession(req.headers);
+    if (!auth.ok) return NextResponse.json({ ok: false, error: auth.error }, { status: 401, headers: cors });
+    if (!isServerVaultEnabled()) {
+      return NextResponse.json({ ok: false, enabled: false, error: "Persistent vault storage is not enabled." }, { status: 400, headers: cors });
     }
-
-    const filePath = getVaultFilePath();
-    await fs.mkdir(path.dirname(filePath), { recursive: true });
-    await fs.writeFile(
-      filePath,
-      JSON.stringify(
-        {
-          ...body.envelope,
-          updatedAt: Date.now(),
-        },
-        null,
-        2
-      ),
-      { mode: 0o600 }
-    );
-
-    return NextResponse.json({ ok: true, enabled: true }, { headers: cors });
-  } catch (err) {
-    return NextResponse.json(
-      {
-        ok: false,
-        error: err instanceof Error ? err.message : "Failed to persist encrypted vault.",
-      },
-      { status: 500, headers: cors }
-    );
+    let body: { envelope?: unknown; baseRevision?: unknown };
+    try {
+      body = await req.json() as typeof body;
+    } catch {
+      return NextResponse.json({ ok: false, error: "Invalid vault request." }, { status: 400, headers: cors });
+    }
+    const envelope = parseVaultEnvelope(body?.envelope);
+    if (!envelope || (body.baseRevision !== undefined && body.baseRevision !== null && typeof body.baseRevision !== "string")) {
+      return NextResponse.json({ ok: false, error: "Invalid encrypted vault envelope or revision." }, { status: 400, headers: cors });
+    }
+    // Vercel enforces a 4.5 MB request body limit. Reject oversize snapshots
+    // explicitly rather than claiming that they synchronized successfully.
+    const maxBytes = process.env.VERCEL === "1" ? 4 * 1024 * 1024 : 32 * 1024 * 1024;
+    if (Buffer.byteLength(JSON.stringify(envelope), "utf8") > maxBytes) {
+      return NextResponse.json({ ok: false, error: "The encrypted vault is too large for this deployment to synchronize." }, { status: 413, headers: cors });
+    }
+    const current = await readStoredVault();
+    // Old clients did not send a revision. Let them create a first vault, but
+    // never let them overwrite an existing one without an explicit base.
+    if (current && body.baseRevision === undefined) {
+      return NextResponse.json({ ok: false, error: "Refresh Sushi before saving: a vault revision is required." }, { status: 428, headers: cors });
+    }
+    if ((body.baseRevision ?? null) !== (current?.revision ?? null)) {
+      return NextResponse.json({ ok: false, conflict: true, error: "The vault changed on another device. Reload the latest vault before saving." }, { status: 409, headers: cors });
+    }
+    const result = await saveStoredVault(current, envelope);
+    if (!result.ok) {
+      return NextResponse.json({ ok: false, conflict: true, error: "The vault changed on another device. Reload the latest vault before saving." }, { status: 409, headers: cors });
+    }
+    return NextResponse.json({ ok: true, enabled: true, revision: result.revision }, { headers: cors });
+  } catch (error) {
+    return NextResponse.json({
+      ok: false,
+      error: error instanceof Error ? error.message : "Failed to persist encrypted vault.",
+    }, { status: 503, headers: cors });
   }
 }

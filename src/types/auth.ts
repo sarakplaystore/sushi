@@ -38,6 +38,7 @@ export interface AuthStatusResponse {
   canBootstrapOnDisk: boolean;
   canBootstrapInteractive: boolean;
   mode: "vps" | "vercel" | "gateway";
+  storage?: "disk" | "redis" | "none";
   username?: string;
   passkeyCount: number;
   authorizedKeyCount: number;

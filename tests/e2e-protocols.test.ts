@@ -1243,7 +1243,7 @@ async function runTests() {
   assert.equal(unauthCheck.ok, false);
 
   // Issue valid session token and verify access
-  const validSessionToken = createSessionToken(authCfg.username, authCfg.authSecret);
+  const validSessionToken = createSessionToken(authCfg.username, authCfg.authSecret, authCfg.sessionVersion);
   const authedHeaders = new Headers({ "x-sushi-session": validSessionToken });
   const authedCheck = await verifyIncomingAuth(authedHeaders);
   assert.equal(authedCheck.ok, true);
@@ -1291,7 +1291,14 @@ async function runTests() {
   process.env.VERCEL = "1";
   const uninitVercelCfg = await getEffectiveAuthConfig(new Headers());
   assert.equal(uninitVercelCfg.initialized, false);
-  assert.equal(uninitVercelCfg.canBootstrapInteractive, true);
+  assert.equal(uninitVercelCfg.canBootstrapInteractive, false);
+  await assert.rejects(
+    bootstrapAdminAccount("verceladmin", "vercel-pass-123"),
+    /persistent shared storage/i
+  );
+  // Stateless browser-local accounts remain available only by explicit opt-in.
+  process.env.SUSHI_ALLOW_STATELESS_SETUP = "true";
+  assert.equal((await getEffectiveAuthConfig(new Headers())).canBootstrapInteractive, true);
 
   const loginKp = generateEd25519KeyPair("vercel-admin@sushi");
   const rogueKp = generateEd25519KeyPair("rogue@attacker");
@@ -1339,6 +1346,7 @@ async function runTests() {
 
   // Restore env for WS tests below
   delete process.env.VERCEL;
+  delete process.env.SUSHI_ALLOW_STATELESS_SETUP;
   process.env.SUSHI_AUTH_USERNAME = "sushiadmin";
   process.env.SUSHI_AUTH_PASSWORD = "correct-horse-battery";
 

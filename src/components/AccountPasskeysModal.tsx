@@ -41,6 +41,8 @@ interface AccountPasskeysModalProps {
   gatewaySettings: GatewaySettings;
   onClose: () => void;
   onUsernameUpdated: (nextUsername: string) => void;
+  onPreparePasswordChange: (currentPassword: string) => Promise<boolean>;
+  onFinishPasswordChange: (newPassword: string) => Promise<void>;
   onSignedOut: () => void;
 }
 
@@ -73,6 +75,8 @@ export function AccountPasskeysModal({
   gatewaySettings,
   onClose,
   onUsernameUpdated,
+  onPreparePasswordChange,
+  onFinishPasswordChange,
   onSignedOut,
 }: AccountPasskeysModalProps) {
   const [activeTab, setActiveTab] = useState<"keys" | "passkeys" | "password">(
@@ -388,9 +392,22 @@ export function AccountPasskeysModal({
       setStatus({ ok: false, msg: "Enter your current password to confirm." });
       return;
     }
+    if (newPassword && newPassword.length < 6) {
+      setStatus({ ok: false, msg: "New password must be at least 6 characters." });
+      return;
+    }
+    if (nextUsername.trim().length < 2 || nextUsername.trim().length > 64) {
+      setStatus({ ok: false, msg: "Username must be between 2 and 64 characters." });
+      return;
+    }
 
     setSavingCreds(true);
+    let preparedVault = false;
+    let accountUpdated = false;
     try {
+      // Keep an independently decryptable copy under the old password until
+      // the account update succeeds. Every stage is revision-checked.
+      if (newPassword) preparedVault = await onPreparePasswordChange(currentPassword);
       const adminCert = getStoredAdminProfileCert();
       const res = await fetch("/api/auth/account", {
         method: "PUT",
@@ -403,25 +420,23 @@ export function AccountPasskeysModal({
         }),
       });
       const data = await res.json();
-      if (!res.ok || !data.ok) {
-        throw new Error(data.error || "Failed to update credentials.");
-      }
-
-      if (data.sessionToken) {
-        setStoredSessionToken(data.sessionToken);
-      }
-      if (data.adminProfileCert) {
-        setStoredAdminProfileCert(data.adminProfileCert);
-      }
+      if (!res.ok || !data.ok) throw new Error(data.error || "Failed to update credentials.");
+      accountUpdated = true;
+      if (data.sessionToken) setStoredSessionToken(data.sessionToken);
+      if (data.adminProfileCert) setStoredAdminProfileCert(data.adminProfileCert);
+      onUsernameUpdated(data.username);
+      if (preparedVault) await onFinishPasswordChange(newPassword);
       setCurrentPassword("");
       setNewPassword("");
-      onUsernameUpdated(data.username);
       setStatus({ ok: true, msg: "Admin credentials updated." });
     } catch (err) {
-      setStatus({
-        ok: false,
-        msg: err instanceof Error ? err.message : "Failed to update account.",
-      });
+      const reason = err instanceof Error ? err.message : "Failed to update account.";
+      const recovery = preparedVault
+        ? accountUpdated
+          ? " The account password changed, but the vault update could not be confirmed. It may still need your previous password to unlock; then enable account sync with the new one."
+          : " The vault remains encrypted with your previous password. If the account update could not be confirmed, try signing in with both passwords, then enable account sync again."
+        : "";
+      setStatus({ ok: false, msg: reason + recovery });
     } finally {
       setSavingCreds(false);
     }
@@ -818,6 +833,7 @@ export function AccountPasskeysModal({
             <div className="space-y-4">
               {canEditCredentials ? (
                 <form onSubmit={handleUpdateCredentials} className="space-y-3">
+                  <p className="text-[11px] text-slate-400">When changing your password, keep the previous one until the encrypted vault has been updated. If a connection fails, it may be needed to recover your saved connections.</p>
                   <div>
                     <label className="mb-1 block text-xs text-slate-400">
                       Admin Username

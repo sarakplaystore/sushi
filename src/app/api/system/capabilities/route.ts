@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import type { SystemCapabilities } from "@/types/connection";
 import { checkGuacdAvailable, getGuacdConfig } from "@/lib/server/guacd-bridge";
 import { getCorsHeaders } from "@/lib/server/security";
+import { isServerVaultEnabled } from "@/lib/server/vault-store";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -30,7 +31,7 @@ export async function GET(req: NextRequest) {
     serverlessSftp: true,
     rdpGuacd: guacdOk,
     rdpProbe: true,
-    serverVault: !isVercel && process.env.SUSHI_SERVER_VAULT !== "false",
+    serverVault: isServerVaultEnabled(),
     requiresGatewayToken: Boolean(process.env.SUSHI_GATEWAY_TOKEN?.trim()),
     guacdHost: `${guacdCfg.host}:${guacdCfg.port}`,
     nodeVersion: process.version,

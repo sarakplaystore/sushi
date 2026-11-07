@@ -3,11 +3,12 @@ import {
   getEffectiveAuthConfig,
   mergeAuthorizedKeys,
   mergePasskeySummaries,
-  verifyIncomingAuth,
+  verifyAdminSession,
   verifySignedAuthorizedKeyCertificates,
   verifySignedPasskeyCertificates,
 } from "@/lib/server/auth";
 import { getCorsHeaders } from "@/lib/server/security";
+import { getStateStoreKind } from "@/lib/server/state-store";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -31,7 +32,7 @@ async function buildStatusResponse(
   const mode = isVercel ? "vercel" : isGateway ? "gateway" : "vps";
 
   const cfg = await getEffectiveAuthConfig(req.headers, adminProfileCert);
-  const authCheck = await verifyIncomingAuth(req.headers);
+  const authCheck = await verifyAdminSession(req.headers);
 
   const certPasskeys = cfg.initialized
     ? verifySignedPasskeyCertificates(
@@ -60,6 +61,7 @@ async function buildStatusResponse(
       canBootstrapInteractive: cfg.canBootstrapInteractive,
       envConfigured: cfg.envConfigured,
       mode,
+      storage: getStateStoreKind(),
       username: authCheck.ok ? authCheck.username || cfg.username : undefined,
       passkeyCount: mergedPasskeys.length,
       authorizedKeyCount: mergedAuthKeys.length,
@@ -69,7 +71,13 @@ async function buildStatusResponse(
 }
 
 export async function GET(req: NextRequest) {
-  return buildStatusResponse(req);
+  try {
+    return await buildStatusResponse(req);
+  } catch (error) {
+    return NextResponse.json({ ok: false, error: error instanceof Error ? error.message : "Account storage is unavailable." }, {
+      status: 503, headers: getCorsHeaders(req.headers.get("origin")),
+    });
+  }
 }
 
 export async function POST(req: NextRequest) {
@@ -88,5 +96,11 @@ export async function POST(req: NextRequest) {
   } catch {
     // ignore empty body
   }
-  return buildStatusResponse(req, certs, keyCerts, adminProfileCert);
+  try {
+    return await buildStatusResponse(req, certs, keyCerts, adminProfileCert);
+  } catch (error) {
+    return NextResponse.json({ ok: false, error: error instanceof Error ? error.message : "Account storage is unavailable." }, {
+      status: 503, headers: getCorsHeaders(req.headers.get("origin")),
+    });
+  }
 }

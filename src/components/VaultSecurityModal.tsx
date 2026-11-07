@@ -103,6 +103,7 @@ interface VaultSecurityModalProps {
   isOpen: boolean;
   initialTab?: VaultModalTab;
   vaultMode: "device" | "passphrase";
+  vaultKeySource: "account" | "independent";
   serverVaultEnabled: boolean;
   hosts: HostProfile[];
   sshKeys: WhitelistedSshKey[];
@@ -110,6 +111,7 @@ interface VaultSecurityModalProps {
   gatewaySettings: GatewaySettings;
   onClose: () => void;
   onSetPassphrase: (passphrase: string | null) => Promise<void>;
+  onEnableAccountSync: (password: string) => Promise<void>;
   onLockNow: () => void;
   onExportPortableEnvelope: (passphrase: string) => Promise<EncryptedVaultEnvelope>;
   onImportEnvelope: (
@@ -144,6 +146,7 @@ export function VaultSecurityModal({
   isOpen,
   initialTab = "security",
   vaultMode,
+  vaultKeySource,
   serverVaultEnabled,
   hosts,
   sshKeys,
@@ -151,6 +154,7 @@ export function VaultSecurityModal({
   gatewaySettings,
   onClose,
   onSetPassphrase,
+  onEnableAccountSync,
   onLockNow,
   onExportPortableEnvelope,
   onImportEnvelope,
@@ -160,6 +164,7 @@ export function VaultSecurityModal({
   const [activeTab, setActiveTab] = useState<VaultModalTab>(initialTab);
 
   // Security / Encryption state
+  const [accountPass, setAccountPass] = useState("");
   const [newPass, setNewPass] = useState("");
   const [confirmPass, setConfirmPass] = useState("");
   const [importPass, setImportPass] = useState("");
@@ -219,6 +224,9 @@ export function VaultSecurityModal({
     setPendingImport(null);
     setPendingImportName("");
     setImportPass("");
+    setAccountPass("");
+    setNewPass("");
+    setConfirmPass("");
     setBackupPass("");
     setBackupConfirm("");
     setAnalyzingSqlite(false);
@@ -234,6 +242,25 @@ export function VaultSecurityModal({
   if (!isOpen) return null;
 
   // --- Security / Vault Handlers ---
+  const handleEnableAccountSync = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setStatus(null);
+    if (!accountPass) {
+      setStatus({ ok: false, msg: "Enter your account password." });
+      return;
+    }
+    setSaving(true);
+    try {
+      await onEnableAccountSync(accountPass);
+      setAccountPass("");
+      setStatus({ ok: true, msg: "Vault encrypted with your account password and saved for your other devices." });
+    } catch (error) {
+      setStatus({ ok: false, msg: error instanceof Error ? error.message : "Could not enable account sync." });
+    } finally {
+      setSaving(false);
+    }
+  };
+
   const handleApplyPassphrase = async (e: React.FormEvent) => {
     e.preventDefault();
     setStatus(null);
@@ -274,10 +301,11 @@ export function VaultSecurityModal({
     setSaving(true);
     setStatus(null);
     try {
+      if (serverVaultEnabled && !window.confirm("Device-key encryption cannot be unlocked on another device. Continue?")) return;
       await onSetPassphrase(null);
       setStatus({
         ok: true,
-        msg: "Switched to automatic device-bound AES-256-GCM encryption.",
+        msg: "Switched to automatic device-bound AES-256-GCM encryption. Other devices cannot unlock this vault.",
       });
     } catch (err) {
       setStatus({
@@ -439,18 +467,26 @@ export function VaultSecurityModal({
 
   const handleRemoveWhitelistedKey = async (id: string) => {
     const next = sshKeys.filter((k) => k.id !== id);
-    await onUpdateKeychain(next, enforceKeyWhitelist);
-    setStatus({ ok: true, msg: "Removed SSH key from whitelist." });
+    try {
+      await onUpdateKeychain(next, enforceKeyWhitelist);
+      setStatus({ ok: true, msg: "Removed SSH key from whitelist." });
+    } catch (error) {
+      setStatus({ ok: false, msg: error instanceof Error ? error.message : "Could not remove SSH key." });
+    }
   };
 
   const handleToggleEnforceWhitelist = async (checked: boolean) => {
-    await onUpdateKeychain(sshKeys, checked);
-    setStatus({
-      ok: true,
-      msg: checked
-        ? "Strict Private Key Whitelist enabled — SSH/SFTP hosts can only use approved keys."
-        : "Private Key Whitelist switched to permissive keychain mode.",
-    });
+    try {
+      await onUpdateKeychain(sshKeys, checked);
+      setStatus({
+        ok: true,
+        msg: checked
+          ? "Strict Private Key Whitelist enabled — SSH/SFTP hosts can only use approved keys."
+          : "Private Key Whitelist switched to permissive keychain mode.",
+      });
+    } catch (error) {
+      setStatus({ ok: false, msg: error instanceof Error ? error.message : "Could not update the key whitelist." });
+    }
   };
 
   // --- Termix Import / Export Handlers ---
@@ -1370,8 +1406,8 @@ export function VaultSecurityModal({
                   <span>
                     Protection Mode:{" "}
                     <strong className="text-white">
-                      {vaultMode === "passphrase"
-                        ? "Master Passphrase (PBKDF2)"
+                      {vaultKeySource === "account" ? "Account Password (PBKDF2)"
+                        : vaultMode === "passphrase" ? "Separate Master Passphrase (PBKDF2)"
                         : "Device Key (AES-256-GCM)"}
                     </strong>
                   </span>
@@ -1380,22 +1416,35 @@ export function VaultSecurityModal({
                   </span>
                 </div>
                 <div className="mt-1.5 text-[11px] text-slate-400">
-                  VPS Encrypted File Sync:{" "}
+                  Shared Encrypted Vault:{" "}
                   <span
                     className={
                       serverVaultEnabled ? "text-emerald-400" : "text-slate-500"
                     }
                   >
                     {serverVaultEnabled
-                      ? "Enabled (/data/vault.enc.json)"
-                      : "Browser Local Vault (Serverless mode)"}
+                      ? "Enabled"
+                      : "Not configured — browser only"}
                   </span>
                 </div>
               </div>
 
+              {serverVaultEnabled && (
+                <form onSubmit={handleEnableAccountSync} className="space-y-3 rounded-xl border border-emerald-500/25 bg-emerald-500/5 p-3.5">
+                  <label htmlFor="vault-account-password" className="block text-xs font-semibold uppercase tracking-wider text-emerald-200">
+                    Account password sync
+                  </label>
+                  <p className="text-[11px] text-slate-300">Encrypt saved hosts, passwords, keys and snippets with your account password, then open them on your other devices. Passkey sign-in or a browser reload still requires this password to unlock the vault.</p>
+                  <input id="vault-account-password" type="password" autoComplete="current-password" value={accountPass} onChange={(e) => setAccountPass(e.target.value)} placeholder="Current account password" className="w-full rounded-xl border border-white/10 bg-[#151a24] px-3.5 py-2 text-sm text-white placeholder-slate-500 focus:border-[#ff6b57] focus:outline-none" />
+                  <button type="submit" disabled={saving} className="rounded-xl bg-emerald-500/20 px-4 py-2 text-xs font-semibold text-emerald-100 hover:bg-emerald-500/30 disabled:opacity-50">
+                    {vaultKeySource === "account" ? "Update account-password encryption" : "Enable account-password sync"}
+                  </button>
+                </form>
+              )}
+
               <form onSubmit={handleApplyPassphrase} className="space-y-3">
                 <label className="block text-xs font-semibold uppercase tracking-wider text-slate-400">
-                  Set / Change Master Passphrase
+                  Optional: use a separate master passphrase
                 </label>
                 <input
                   type="password"

@@ -10,7 +10,7 @@ import {
   removeServerPasskey,
   removeWhitelistedKey,
   updateAdminCredentials,
-  verifyIncomingAuth,
+  verifyAdminSession,
   verifySignedAuthorizedKeyCertificates,
   verifySignedPasskeyCertificates,
 } from "@/lib/server/auth";
@@ -19,6 +19,7 @@ import {
   parseAuthorizedPublicKey,
 } from "@/lib/server/ssh-key-utils";
 import { getCorsHeaders } from "@/lib/server/security";
+import { isServerVaultEnabled, readStoredVault } from "@/lib/server/vault-store";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -32,7 +33,7 @@ export async function OPTIONS(req: NextRequest) {
 
 export async function POST(req: NextRequest) {
   const cors = getCorsHeaders(req.headers.get("origin"));
-  const auth = await verifyIncomingAuth(req.headers);
+  const auth = await verifyAdminSession(req.headers);
   if (!auth.ok) {
     return NextResponse.json(
       { ok: false, error: auth.error },
@@ -177,7 +178,7 @@ export async function POST(req: NextRequest) {
 
 export async function PUT(req: NextRequest) {
   const cors = getCorsHeaders(req.headers.get("origin"));
-  const auth = await verifyIncomingAuth(req.headers);
+  const auth = await verifyAdminSession(req.headers);
   if (!auth.ok) {
     return NextResponse.json(
       { ok: false, error: auth.error },
@@ -215,14 +216,27 @@ export async function PUT(req: NextRequest) {
       );
     }
 
+    // A password-bound vault must first be safely re-encrypted with the old
+    // password as an independent passphrase. Guard its exact revision during
+    // the account update, so a concurrent device cannot undo that preparation.
+    let vaultGuard: { raw: string | null } | undefined;
+    if (body.newPassword && isServerVaultEnabled()) {
+      const vault = await readStoredVault();
+      if (vault?.envelope.keySource === "account") {
+        return NextResponse.json({ ok: false, error: "Unlock the shared vault in the latest Sushi app before changing the account password." }, { status: 409, headers: cors });
+      }
+      vaultGuard = { raw: vault?.raw ?? null };
+    }
     const targetUser = (body.newUsername || cfg.username).trim();
     const updated = await updateAdminCredentials(
       cfg,
       targetUser,
-      body.newPassword
+      body.newPassword,
+      body.currentPassword,
+      vaultGuard
     );
 
-    const sessionToken = createSessionToken(targetUser, cfg.authSecret);
+    const sessionToken = createSessionToken(targetUser, cfg.authSecret, updated.sessionVersion);
 
     const res = NextResponse.json(
       {
@@ -252,7 +266,7 @@ export async function PUT(req: NextRequest) {
 
 export async function DELETE(req: NextRequest) {
   const cors = getCorsHeaders(req.headers.get("origin"));
-  const auth = await verifyIncomingAuth(req.headers);
+  const auth = await verifyAdminSession(req.headers);
   if (!auth.ok) {
     return NextResponse.json(
       { ok: false, error: auth.error },

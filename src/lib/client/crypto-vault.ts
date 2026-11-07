@@ -21,6 +21,9 @@ export interface VaultPlaintext {
 export interface EncryptedVaultEnvelope {
   version: 1;
   mode: "device" | "passphrase";
+  // Account-password vaults are still passphrase envelopes for compatibility
+  // with portable backups and older clients.
+  keySource?: "account" | "independent";
   salt?: string; // base64 (required when mode === 'passphrase')
   iv: string; // base64
   ciphertext: string; // base64
@@ -163,7 +166,9 @@ export async function decryptVaultEnvelope(
     }
     key = await derivePassphraseKey(passphrase, base64ToBytes(envelope.salt));
   } else {
-    key = await getOrCreateDeviceKey();
+    const existing = localStorage.getItem(DEVICE_KEY_STORAGE_KEY);
+    if (!existing) throw new Error("This device vault key is unavailable. Open the vault on its original browser.");
+    key = base64ToBytes(existing);
   }
 
   try {
@@ -193,9 +198,15 @@ export function loadLocalEnvelope(): EncryptedVaultEnvelope | null {
   try {
     const raw = localStorage.getItem(VAULT_STORAGE_KEY);
     if (!raw) return null;
-    return JSON.parse(raw) as EncryptedVaultEnvelope;
+    const envelope = JSON.parse(raw) as EncryptedVaultEnvelope;
+    if (!envelope || envelope.version !== 1 ||
+        (envelope.mode !== "device" && envelope.mode !== "passphrase") ||
+        typeof envelope.iv !== "string" || typeof envelope.ciphertext !== "string") {
+      throw new Error("Invalid local vault");
+    }
+    return envelope;
   } catch {
-    return null;
+    throw new Error("The local encrypted vault could not be read. It has not been reset or overwritten.");
   }
 }
 

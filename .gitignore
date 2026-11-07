@@ -12,6 +12,8 @@
 # Runtime & Vault local data
 /data/*.json
 /data/*.enc*
+/data/*.lock
+/data/*.tmp
 !.gitkeep
 
 # Environment files

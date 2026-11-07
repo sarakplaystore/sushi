@@ -158,7 +158,7 @@ export async function POST(req: NextRequest) {
         lastUsedAt: Date.now(),
       });
 
-      const sessionToken = createSessionToken(cfg.username, cfg.authSecret);
+      const sessionToken = createSessionToken(cfg.username, cfg.authSecret, cfg.sessionVersion);
       const res = NextResponse.json(
         {
           ok: true,

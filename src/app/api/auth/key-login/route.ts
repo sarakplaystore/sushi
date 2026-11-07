@@ -83,7 +83,7 @@ export async function POST(req: NextRequest) {
     }
 
     clearLoginFailures(clientIp);
-    const sessionToken = createSessionToken(cfg.username, cfg.authSecret);
+    const sessionToken = createSessionToken(cfg.username, cfg.authSecret, cfg.sessionVersion);
 
     const res = NextResponse.json(
       {

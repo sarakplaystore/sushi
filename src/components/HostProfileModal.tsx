@@ -330,10 +330,10 @@ export function HostProfileModal({
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4 backdrop-blur-sm">
-      <div className="flex max-h-[92vh] w-full max-w-2xl flex-col overflow-hidden rounded-2xl border border-white/10 bg-[#0f131b] shadow-2xl">
+    <div className="modal-safe-area fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4 backdrop-blur-sm">
+      <div className="flex max-h-full w-full max-w-2xl flex-col overflow-hidden rounded-2xl border border-white/10 bg-[#0f131b] shadow-2xl">
         {/* Header */}
-        <div className="flex items-center justify-between border-b border-white/8 px-6 py-4">
+        <div className="flex items-center justify-between gap-3 border-b border-white/8 px-4 py-4 sm:px-6">
           <div className="flex items-center gap-3">
             <span
               className="h-3 w-3 rounded-full"
@@ -355,7 +355,7 @@ export function HostProfileModal({
           </div>
           <button
             onClick={onClose}
-            className="rounded-lg p-1.5 text-slate-400 transition hover:bg-white/5 hover:text-white"
+            className="shrink-0 rounded-lg p-1.5 text-slate-400 transition hover:bg-white/5 hover:text-white"
             aria-label="Close modal"
           >
             <X className="h-4 w-4" />
@@ -363,7 +363,7 @@ export function HostProfileModal({
         </div>
 
         {/* Body */}
-        <div className="flex-1 space-y-5 overflow-y-auto px-6 py-5">
+        <div className="min-h-0 flex-1 space-y-5 overflow-y-auto px-4 py-5 sm:px-6">
           {/* Protocol selector */}
           <div className="grid grid-cols-3 gap-2.5">
             {(
@@ -398,7 +398,8 @@ export function HostProfileModal({
                   key={item.id}
                   type="button"
                   onClick={() => handleProtocolSwitch(item.id)}
-                  className={`flex items-center gap-3 rounded-xl border p-3 text-left transition ${
+                  aria-pressed={active}
+                  className={`flex min-w-0 flex-col items-center gap-1 rounded-xl border p-2 text-center transition sm:flex-row sm:gap-3 sm:p-3 sm:text-left ${
                     active
                       ? item.color
                       : "border-white/8 bg-[#151a24] text-slate-400 hover:border-white/15 hover:text-slate-200"
@@ -406,8 +407,8 @@ export function HostProfileModal({
                 >
                   <Icon className="h-5 w-5 shrink-0" />
                   <div className="min-w-0">
-                    <div className="text-sm font-medium leading-tight">{item.label}</div>
-                    <div className="truncate text-[11px] opacity-75">{item.sub}</div>
+                    <div className="text-xs font-medium leading-tight sm:text-sm">{item.label}</div>
+                    <div className="hidden truncate text-[11px] opacity-75 sm:block">{item.sub}</div>
                   </div>
                 </button>
               );
@@ -491,7 +492,7 @@ export function HostProfileModal({
           {/* Authentication */}
           {protocol !== "rdp" ? (
             <div className="space-y-3 rounded-xl border border-white/8 bg-[#131722] p-4">
-              <div className="flex items-center justify-between">
+              <div className="flex flex-wrap items-center justify-between gap-2">
                 <span className="text-xs font-medium text-slate-300">
                   Authentication Method
                 </span>
@@ -940,7 +941,7 @@ export function HostProfileModal({
         </div>
 
         {/* Footer */}
-        <div className="flex flex-wrap items-center justify-between gap-3 border-t border-white/8 bg-[#0b0e14] px-6 py-4">
+        <div className="grid grid-cols-2 gap-2 border-t border-white/8 bg-[#0b0e14] px-4 py-3 sm:flex sm:flex-wrap sm:items-center sm:justify-between sm:gap-3 sm:px-6 sm:py-4">
           {onQuickConnectOnly && !initialProfile?.id ? (
             <button
               type="button"
@@ -948,19 +949,21 @@ export function HostProfileModal({
                 const p = buildProfile();
                 if (p) onQuickConnectOnly(p);
               }}
-              className="rounded-xl border border-white/10 px-3.5 py-2 text-xs font-medium text-slate-300 transition hover:bg-white/5 hover:text-white"
+              aria-label="Connect without saving"
+              className="rounded-xl border border-white/10 px-2 py-2 text-xs font-medium text-slate-300 transition hover:bg-white/5 hover:text-white sm:px-3.5"
             >
-              Connect Ephemeral (Don&apos;t Save)
+              <span className="sm:hidden">Connect only</span>
+              <span className="hidden sm:inline">Connect Ephemeral (Don&apos;t Save)</span>
             </button>
           ) : (
-            <div />
+            <div className="hidden sm:block" />
           )}
 
-          <div className="flex items-center gap-2.5">
+          <div className="contents sm:flex sm:items-center sm:gap-2.5">
             <button
               type="button"
               onClick={onClose}
-              className="rounded-xl px-4 py-2 text-xs font-medium text-slate-400 transition hover:bg-white/5 hover:text-white"
+              className={`${onQuickConnectOnly && !initialProfile?.id ? "" : "col-span-2"} rounded-xl px-2 py-2 text-xs font-medium text-slate-400 transition hover:bg-white/5 hover:text-white sm:px-4`}
             >
               Cancel
             </button>
@@ -970,7 +973,7 @@ export function HostProfileModal({
                 const p = buildProfile();
                 if (p) onSave(p, false);
               }}
-              className="rounded-xl border border-white/15 bg-white/8 px-4 py-2 text-xs font-medium text-white transition hover:bg-white/14"
+              className="rounded-xl border border-white/15 bg-white/8 px-2 py-2 text-xs font-medium text-white transition hover:bg-white/14 sm:px-4"
             >
               Save to Vault
             </button>
@@ -980,7 +983,7 @@ export function HostProfileModal({
                 const p = buildProfile();
                 if (p) onSave(p, true);
               }}
-              className="flex items-center gap-1.5 rounded-xl bg-[#ff6b57] px-4 py-2 text-xs font-semibold text-white shadow-lg shadow-[#ff6b57]/20 transition hover:bg-[#ff7f6e]"
+              className="flex items-center justify-center gap-1 rounded-xl bg-[#ff6b57] px-2 py-2 text-xs font-semibold text-white shadow-lg shadow-[#ff6b57]/20 transition hover:bg-[#ff7f6e] sm:gap-1.5 sm:px-4"
             >
               <Play className="h-3.5 w-3.5 fill-current" />
               Save &amp; Connect

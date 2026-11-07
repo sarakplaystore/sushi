@@ -790,11 +790,14 @@ export function RdpDesktopSession({
       */}
       <div
         onPointerDown={() => setCaptured(false)}
-        className="flex h-11 shrink-0 items-center justify-between gap-2 border-b border-white/8 bg-[#0f131b] px-3"
+        className="flex h-11 shrink-0 items-center justify-between gap-1 border-b border-white/8 bg-[#0f131b] px-2 sm:gap-2 sm:px-3"
       >
         <div className="flex min-w-0 flex-1 items-center gap-2 overflow-hidden">
           <span
-            className={`inline-flex shrink-0 items-center gap-1.5 rounded-full px-2.5 py-0.5 text-[11px] font-medium ${
+            role="status"
+            title={toolbarChip}
+            aria-label={toolbarChip}
+            className={`inline-flex shrink-0 items-center gap-1.5 rounded-full px-1.5 py-0.5 text-[11px] font-medium sm:px-2.5 ${
               connState === "connected"
                 ? "bg-emerald-500/15 text-emerald-300"
                 : connState === "connecting" || connState === "reconnecting"
@@ -811,7 +814,9 @@ export function RdpDesktopSession({
                     : "bg-[#ff6b57]"
               }`}
             />
-            {toolbarChip}
+            <span className={connState === "connected" ? "hidden min-[420px]:inline" : ""}>
+              {toolbarChip}
+            </span>
           </span>
 
           <span className="font-mono-code hidden truncate text-xs text-slate-400 xl:inline">
@@ -896,7 +901,7 @@ export function RdpDesktopSession({
               </button>
 
               {/* Special Keys */}
-              <div className="relative">
+              <div className="xl:relative">
                 <button
                   type="button"
                   onClick={() => {
@@ -904,13 +909,14 @@ export function RdpDesktopSession({
                     setShowClipboard(false);
                     setShowSettings(false);
                   }}
-                  className="flex items-center gap-1 rounded-lg border border-white/10 bg-white/5 px-2.5 py-1 text-xs text-slate-200 hover:bg-white/10"
+                  aria-label="Special keys"
+                  className="flex items-center gap-1 rounded-lg border border-white/10 bg-white/5 px-1.5 py-1 text-xs text-slate-200 hover:bg-white/10 xl:px-2.5"
                 >
                   <KeyboardIcon className="h-3.5 w-3.5 text-[#ff6b57]" />
-                  <span className="hidden sm:inline">Keys</span>
+                  <span className="hidden xl:inline">Keys</span>
                 </button>
                 {showSpecialKeys && (
-                  <div className="absolute right-0 top-9 z-30 w-52 space-y-1 rounded-xl border border-white/12 bg-[#141924] p-1.5 shadow-2xl">
+                  <div className="absolute right-0 top-9 z-30 max-h-[calc(100dvh-7rem)] w-52 max-w-[calc(100vw-2rem)] overflow-y-auto space-y-1 rounded-xl border border-white/12 bg-[#141924] p-1.5 shadow-2xl">
                     <button
                       type="button"
                       onClick={() =>
@@ -963,7 +969,7 @@ export function RdpDesktopSession({
               </div>
 
               {/* Clipboard Sync */}
-              <div className="relative">
+              <div className="xl:relative">
                 <button
                   type="button"
                   onClick={() => {
@@ -972,14 +978,14 @@ export function RdpDesktopSession({
                     setShowSettings(false);
                     setClipboardTranslateOpen(false);
                   }}
-                  className="flex items-center gap-1 rounded-lg border border-white/10 bg-white/5 px-2.5 py-1 text-xs text-slate-200 hover:bg-white/10"
+                  className="flex items-center gap-1 rounded-lg border border-white/10 bg-white/5 px-1.5 py-1 text-xs text-slate-200 hover:bg-white/10 xl:px-2.5"
                   title="Clipboard: Ctrl+V in the desktop pastes your local clipboard"
                 >
                   <Clipboard className="h-3.5 w-3.5 text-sky-400" />
-                  <span className="hidden sm:inline">Clipboard</span>
+                  <span className="hidden xl:inline">Clipboard</span>
                 </button>
                 {showClipboard && (
-                  <div className="absolute right-0 top-9 z-30 w-80 space-y-2 rounded-xl border border-white/12 bg-[#141924] p-3 shadow-2xl">
+                  <div className="absolute right-0 top-9 z-30 max-h-[calc(100dvh-7rem)] w-80 max-w-[calc(100vw-2rem)] overflow-y-auto space-y-2 rounded-xl border border-white/12 bg-[#141924] p-3 shadow-2xl">
                     <div className="flex items-center justify-between text-xs font-medium text-white">
                       <span>Remote Clipboard Sync</span>
                       <button
@@ -1051,7 +1057,7 @@ export function RdpDesktopSession({
                 <button
                   type="button"
                   onClick={() => uploadInputRef.current?.click()}
-                  className="flex items-center gap-1 rounded-lg border border-white/10 bg-white/5 px-2.5 py-1 text-xs text-slate-200 hover:bg-white/10"
+                  className="flex items-center gap-1 rounded-lg border border-white/10 bg-white/5 px-1.5 py-1 text-xs text-slate-200 hover:bg-white/10 xl:px-2.5"
                   title={
                     driveLabel
                       ? `Upload a file into the session (drive "${driveLabel}")`
@@ -1059,7 +1065,7 @@ export function RdpDesktopSession({
                   }
                 >
                   <Upload className="h-3.5 w-3.5 text-emerald-400" />
-                  <span className="hidden sm:inline">Upload</span>
+                  <span className="hidden xl:inline">Upload</span>
                 </button>
               )}
 
@@ -1084,7 +1090,7 @@ export function RdpDesktopSession({
           )}
 
           {/* Session settings */}
-          <div className="relative">
+          <div className="xl:relative">
             <button
               type="button"
               onClick={() => {
@@ -1092,14 +1098,14 @@ export function RdpDesktopSession({
                 setShowSpecialKeys(false);
                 setShowClipboard(false);
               }}
-              className="flex items-center gap-1 rounded-lg border border-white/10 bg-white/5 px-2.5 py-1 text-xs text-slate-200 hover:bg-white/10"
+              className="flex items-center gap-1 rounded-lg border border-white/10 bg-white/5 px-1.5 py-1 text-xs text-slate-200 hover:bg-white/10 xl:px-2.5"
               title="Desktop quality, audio, view-only and upload settings"
             >
               <SlidersHorizontal className="h-3.5 w-3.5 text-[#ff6b57]" />
-              <span className="hidden md:inline">{performanceLabel}</span>
+              <span className="hidden xl:inline">{performanceLabel}</span>
             </button>
             {showSettings && (
-              <div className="absolute right-0 top-9 z-30 w-72 space-y-3 rounded-xl border border-white/12 bg-[#141924] p-3 shadow-2xl">
+              <div className="absolute right-0 top-9 z-30 max-h-[calc(100dvh-7rem)] w-72 max-w-[calc(100vw-2rem)] overflow-y-auto space-y-3 rounded-xl border border-white/12 bg-[#141924] p-3 shadow-2xl">
                 <div className="flex items-center justify-between text-xs font-medium text-white">
                   <span>Desktop settings</span>
                   <button
@@ -1206,7 +1212,7 @@ export function RdpDesktopSession({
           <button
             type="button"
             onClick={onEditCredentials}
-            className="flex items-center gap-1 rounded-lg border border-white/10 bg-white/5 px-2.5 py-1 text-xs text-slate-200 hover:bg-white/10"
+            className="flex items-center gap-1 rounded-lg border border-white/10 bg-white/5 px-1.5 py-1 text-xs text-slate-200 hover:bg-white/10 xl:px-2.5"
             title="Edit the desktop username, domain, port and password"
           >
             <UserRound className="h-3.5 w-3.5 text-[#ff6b57]" />
@@ -1216,7 +1222,7 @@ export function RdpDesktopSession({
           <button
             type="button"
             onClick={reconnectNow}
-            className="flex items-center gap-1 rounded-lg border border-white/10 bg-white/5 px-2.5 py-1 text-xs text-slate-200 hover:bg-white/10"
+            className="flex items-center gap-1 rounded-lg border border-white/10 bg-white/5 px-1.5 py-1 text-xs text-slate-200 hover:bg-white/10 xl:px-2.5"
             title="Reconnect the desktop session"
           >
             <RotateCw className="h-3.5 w-3.5" />
@@ -1252,10 +1258,12 @@ export function RdpDesktopSession({
           }
           void uploadFiles(Array.from(event.dataTransfer.files));
         }}
-        className={`relative flex min-h-0 flex-1 items-center justify-center bg-[#07090d] outline-none ring-inset transition ${
-          // Fit-window must never grow scrollbars: a scrollbar shrinks the pane, the
-          // pane asks for a smaller desktop, the scrollbar disappears — a resize loop.
-          prefs.fitWindow ? "overflow-hidden" : "overflow-auto"
+        className={`relative flex min-h-0 flex-1 justify-center bg-[#07090d] outline-none ring-inset transition ${
+          showDiagnosticsPanel ? "items-start" : "items-center"
+        } ${
+          // A live fit-window desktop must never grow scrollbars: they can trigger a
+          // resize loop. The disconnected diagnostics panel, however, must scroll.
+          prefs.fitWindow && !showDiagnosticsPanel ? "overflow-hidden" : "overflow-auto"
         } ${keyboardCaptured && connState === "connected" ? "ring-1 ring-emerald-500/25" : ""}`}
       >
         {/* Guacamole HTML5 Canvas Container */}
@@ -1331,8 +1339,8 @@ export function RdpDesktopSession({
 
         {/* Diagnostics & Hybrid Launcher View (when guacd isn't active or stream errored) */}
         {showDiagnosticsPanel && (
-          <div className="mx-auto w-full max-w-2xl space-y-5 p-6">
-            <div className="rounded-2xl border border-white/10 bg-[#111621] p-6 shadow-2xl">
+          <div className="m-auto w-full max-w-2xl space-y-5 p-4 sm:p-6">
+            <div className="rounded-2xl border border-white/10 bg-[#111621] p-4 shadow-2xl sm:p-6">
               <div className="flex items-start justify-between gap-4">
                 <div className="flex items-center gap-3">
                   <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-[#ff6b57]/15 text-[#ff6b57]">

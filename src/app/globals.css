@@ -40,6 +40,52 @@ body {
   -moz-osx-font-smoothing: grayscale;
 }
 
+/* Standalone iOS web apps can extend behind the notch and home indicator. */
+.app-safe-area {
+  height: 100%;
+  height: 100dvh;
+  padding: env(safe-area-inset-top) env(safe-area-inset-right)
+    env(safe-area-inset-bottom) env(safe-area-inset-left);
+}
+
+/* Fixed overlays do not inherit the body's safe-area padding. */
+.modal-safe-area {
+  padding: max(1rem, env(safe-area-inset-top)) max(1rem, env(safe-area-inset-right))
+    max(1rem, env(safe-area-inset-bottom)) max(1rem, env(safe-area-inset-left));
+}
+
+@media (max-width: 767px) and (max-height: 400px) {
+  /* In short landscape windows, let the whole drawer scroll to its footer. */
+  .workspace-sidebar {
+    overflow-y: auto;
+  }
+
+  .workspace-sidebar-hosts {
+    flex: none;
+    overflow: visible;
+  }
+}
+
+@media (hover: none) {
+  /* File actions stay usable on touch tablets as well as narrow phones. */
+  .sftp-touch-more {
+    display: inline-flex;
+  }
+
+  .sftp-row-actions {
+    display: none;
+  }
+}
+
+@media (max-width: 767px) {
+  /* Avoid Safari's automatic page zoom when editing smaller controls. */
+  input:not([type="checkbox"]):not([type="radio"]):not([type="file"]),
+  select,
+  textarea:not(.xterm-helper-textarea) {
+    font-size: 16px;
+  }
+}
+
 .font-mono-code {
   font-family:
     "JetBrains Mono",

@@ -13,7 +13,8 @@
     "start": "NODE_ENV=production tsx server.ts",
     "gateway": "NODE_ENV=production GATEWAY_ONLY=true tsx server.ts",
     "typecheck": "tsc --noEmit",
-    "test": "npm run test:imports && tsx tests/e2e-protocols.test.ts",
+    "test": "npm run test:home-screen && npm run test:imports && tsx tests/e2e-protocols.test.ts",
+    "test:home-screen": "tsx tests/home-screen.test.ts",
     "test:imports": "tsx tests/import-clients.test.ts && tsx tests/import-xml.test.ts"
   },
   "dependencies": {

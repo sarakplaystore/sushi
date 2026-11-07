@@ -2,7 +2,6 @@
 
 import React, { useState, useEffect } from "react";
 import {
-  Terminal,
   Fingerprint,
   Lock,
   User,
@@ -434,8 +433,8 @@ export function AuthGateScreen({
   // Post-bootstrap step: Download generated Master Key and/or Enroll Passkey
   if (justBootstrappedUser) {
     return (
-      <div className="flex h-full w-full items-center justify-center bg-[#090b10] p-4">
-        <div className="w-full max-w-md space-y-5 rounded-2xl border border-white/10 bg-[#0f131b] p-7 shadow-2xl">
+      <div className="flex h-full w-full overflow-y-auto bg-[#090b10] p-4">
+        <div className="m-auto w-full max-w-md shrink-0 space-y-5 rounded-2xl border border-white/10 bg-[#0f131b] p-5 shadow-2xl sm:p-7">
           <div className="flex items-center gap-3">
             <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-emerald-500/15 text-emerald-400">
               <ShieldCheck className="h-6 w-6" />
@@ -528,15 +527,13 @@ export function AuthGateScreen({
   // First-Run Interactive Setup (Works identically on BOTH VPS and Vercel!)
   if (!authStatus.initialized) {
     return (
-      <div className="flex h-full w-full items-center justify-center bg-[#090b10] p-4">
+      <div className="flex h-full w-full overflow-y-auto bg-[#090b10] p-4">
         <form
           onSubmit={handleBootstrapSubmit}
-          className="w-full max-w-md space-y-4 rounded-2xl border border-white/10 bg-[#0f131b] p-7 shadow-2xl"
+          className="m-auto w-full max-w-md shrink-0 space-y-4 rounded-2xl border border-white/10 bg-[#0f131b] p-5 shadow-2xl sm:p-7"
         >
           <div className="flex items-center gap-3">
-            <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-gradient-to-br from-[#ff6b57] to-[#e14b37] text-white shadow-lg shadow-[#ff6b57]/25">
-              <Terminal className="h-5 w-5" />
-            </div>
+            <img src="/sushi-icon.svg" alt="" width={44} height={44} className="h-11 w-11 shrink-0 rounded-xl shadow-lg shadow-[#ff6b57]/25" />
             <div>
               <h1 className="text-base font-semibold text-white">
                 Create Sushi Admin Account
@@ -684,12 +681,10 @@ export function AuthGateScreen({
   );
 
   return (
-    <div className="flex h-full w-full items-center justify-center bg-[#090b10] p-4">
-      <div className="w-full max-w-md space-y-5 rounded-2xl border border-white/10 bg-[#0f131b] p-7 shadow-2xl">
+    <div className="flex h-full w-full overflow-y-auto bg-[#090b10] p-4">
+      <div className="m-auto w-full max-w-md shrink-0 space-y-5 rounded-2xl border border-white/10 bg-[#0f131b] p-5 shadow-2xl sm:p-7">
         <div className="flex items-center gap-3">
-          <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-gradient-to-br from-[#ff6b57] to-[#e14b37] text-white shadow-lg shadow-[#ff6b57]/25">
-            <Terminal className="h-5 w-5" />
-          </div>
+          <img src="/sushi-icon.svg" alt="" width={44} height={44} className="h-11 w-11 shrink-0 rounded-xl shadow-lg shadow-[#ff6b57]/25" />
           <div>
             <h1 className="text-base font-semibold text-white">
               Sign in to Sushi

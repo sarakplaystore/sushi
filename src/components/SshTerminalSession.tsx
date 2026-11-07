@@ -1760,7 +1760,7 @@ export function SshTerminalSession({
     >
       {/* Session Toolbar */}
       <div className="flex flex-wrap items-center justify-between gap-2 border-b border-white/8 bg-[#0f131b] px-4 py-2">
-        <div className="flex flex-wrap items-center gap-2.5">
+        <div className="flex min-w-0 max-w-full flex-wrap items-center gap-2.5">
           <span
             className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-0.5 text-[11px] font-medium ${
               status === "connected"
@@ -1786,7 +1786,7 @@ export function SshTerminalSession({
               : status}
           </span>
 
-          <span className="font-mono-code text-xs text-slate-400">
+          <span className="font-mono-code max-w-full truncate text-xs text-slate-400">
             {profile.username}@{profile.host}:{profile.port}
           </span>
 
@@ -1896,7 +1896,7 @@ export function SshTerminalSession({
           )}
         </div>
 
-        <div className="relative flex items-center gap-1.5">
+        <div className="relative flex w-full max-w-full flex-wrap items-center gap-1.5 xl:w-auto">
           {/* Open Companion SFTP */}
           <button
             type="button"
@@ -1920,7 +1920,7 @@ export function SshTerminalSession({
           </button>
 
           {/* Snippets Popover */}
-          <div className="relative">
+          <div className="xl:relative">
             <button
               type="button"
               onClick={() => {
@@ -1928,12 +1928,13 @@ export function SshTerminalSession({
                 setShowThemes(false);
               }}
               className="flex items-center gap-1 rounded-lg border border-white/10 bg-white/5 px-2.5 py-1 text-xs text-slate-200 transition hover:bg-white/10"
+              aria-label="Open snippets"
             >
               <Sparkles className="h-3.5 w-3.5 text-amber-400" />
               <span className="hidden sm:inline">Snippets</span>
             </button>
             {showSnippets && (
-              <div className="absolute right-0 top-9 z-30 w-72 rounded-xl border border-white/12 bg-[#141924] p-2 shadow-2xl">
+              <div className="absolute top-full right-0 z-30 mt-2 max-h-[calc(100dvh-9rem)] w-72 max-w-[calc(100vw-2rem)] overflow-y-auto rounded-xl border border-white/12 bg-[#141924] p-2 shadow-2xl xl:top-9 xl:mt-0">
                 <div className="px-2 py-1 text-[11px] font-semibold uppercase tracking-wider text-slate-400">
                   Run Quick Command
                 </div>
@@ -1981,7 +1982,7 @@ export function SshTerminalSession({
           </button>
 
           {/* Theme Picker */}
-          <div className="relative">
+          <div className="xl:relative">
             <button
               type="button"
               onClick={() => {
@@ -1994,7 +1995,7 @@ export function SshTerminalSession({
               <Palette className="h-3.5 w-3.5" />
             </button>
             {showThemes && (
-              <div className="absolute right-0 top-9 z-30 w-44 rounded-xl border border-white/12 bg-[#141924] p-1.5 shadow-2xl">
+              <div className="absolute top-full right-0 z-30 mt-2 max-h-[calc(100dvh-9rem)] w-44 max-w-[calc(100vw-2rem)] overflow-y-auto rounded-xl border border-white/12 bg-[#141924] p-1.5 shadow-2xl xl:top-9 xl:mt-0">
                 {Object.entries(TERMINAL_THEMES).map(([k, t]) => (
                   <button
                     key={k}

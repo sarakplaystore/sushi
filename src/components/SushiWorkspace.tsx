@@ -122,6 +122,7 @@ export function SushiWorkspace() {
 
   // Navigation & Tabs
   const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const [protocolFilter, setProtocolFilter] = useState<"all" | ProtocolType>("all");
   const [hostSearch, setHostSearch] = useState("");
   const [quickConnectInput, setQuickConnectInput] = useState("");
@@ -142,6 +143,52 @@ export function SushiWorkspace() {
     useState<VaultModalTab>("security");
 
   const searchInputRef = useRef<HTMLInputElement | null>(null);
+  const mobileMenuButtonRef = useRef<HTMLButtonElement | null>(null);
+  const mobileMenuCloseRef = useRef<HTMLButtonElement | null>(null);
+  const sidebarRef = useRef<HTMLElement | null>(null);
+
+  const closeMobileNavigation = useCallback(() => {
+    setMobileSidebarOpen(false);
+    window.requestAnimationFrame(() => mobileMenuButtonRef.current?.focus());
+  }, []);
+
+  useEffect(() => {
+    const handleResize = () => {
+      if (window.innerWidth >= 768) setMobileSidebarOpen(false);
+    };
+    window.addEventListener("resize", handleResize);
+    return () => window.removeEventListener("resize", handleResize);
+  }, []);
+
+  useEffect(() => {
+    if (!mobileSidebarOpen) return;
+    mobileMenuCloseRef.current?.focus();
+    const handleKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeMobileNavigation();
+        return;
+      }
+      if (event.key !== "Tab" || !sidebarRef.current) return;
+      const focusable = Array.from(
+        sidebarRef.current.querySelectorAll<HTMLElement>(
+          'button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), a[href], [tabindex]:not([tabindex="-1"])'
+        )
+      ).filter((element) => element.getClientRects().length > 0);
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (!first || !last) return;
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    window.addEventListener("keydown", handleKey);
+    return () => window.removeEventListener("keydown", handleKey);
+  }, [mobileSidebarOpen, closeMobileNavigation]);
 
   // Keyboard shortcut Cmd/Ctrl + K to focus host search
   useEffect(() => {
@@ -150,7 +197,9 @@ export function SushiWorkspace() {
         // Avoid stealing from active SSH/RDP sessions unless on launchpad
         if (activeTabId === "launchpad") {
           e.preventDefault();
-          searchInputRef.current?.focus();
+          if (window.innerWidth < 768) setMobileSidebarOpen(true);
+          else setSidebarOpen(true);
+          window.setTimeout(() => searchInputRef.current?.focus(), 0);
         }
       }
     };
@@ -349,6 +398,7 @@ export function SushiWorkspace() {
       overrideInitialPath?: string,
       overrideTitle?: string
     ) => {
+      setMobileSidebarOpen(false);
       const proto = overrideProtocol || profile.protocol;
       const resolved = resolveProfileWithKeychain(
         { ...profile, protocol: proto },
@@ -385,6 +435,7 @@ export function SushiWorkspace() {
    */
   const openRdpCompanion = useCallback(
     (source: HostProfile) => {
+      setMobileSidebarOpen(false);
       if (source.protocol === "rdp") {
         openSessionTab(source);
         return;
@@ -599,10 +650,10 @@ export function SushiWorkspace() {
   // Vault Unlock Gate
   if (vaultLocked) {
     return (
-      <div className="flex h-full w-full items-center justify-center bg-[#090b10] p-4">
+      <div className="flex h-full w-full overflow-y-auto bg-[#090b10] p-4">
         <form
           onSubmit={handleUnlockVault}
-          className="w-full max-w-md space-y-5 rounded-2xl border border-white/10 bg-[#0f131b] p-7 shadow-2xl"
+          className="m-auto w-full max-w-md shrink-0 space-y-5 rounded-2xl border border-white/10 bg-[#0f131b] p-5 shadow-2xl sm:p-7"
         >
           <div className="flex items-center gap-3">
             <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-[#ff6b57]/15 text-[#ff6b57]">
@@ -673,19 +724,43 @@ export function SushiWorkspace() {
 
   return (
     <div className="flex h-full w-full overflow-hidden bg-[#090b10] text-slate-100">
-      {/* Left Collapsible Host Sidebar */}
-      {sidebarOpen && (
-        <aside className="flex h-full w-68 shrink-0 flex-col border-r border-white/8 bg-[#0d1118]">
+      {/* Mobile navigation overlays the workspace; the desktop sidebar remains collapsible. */}
+      {mobileSidebarOpen && (
+        <button
+          type="button"
+          aria-label="Close navigation"
+          tabIndex={-1}
+          onClick={closeMobileNavigation}
+          className="fixed inset-0 z-40 bg-black/70 md:hidden"
+        />
+      )}
+      <aside
+        ref={sidebarRef}
+        id="workspace-sidebar"
+        role={mobileSidebarOpen ? "dialog" : undefined}
+        aria-modal={mobileSidebarOpen || undefined}
+        aria-label="Host navigation"
+        className={`workspace-sidebar fixed inset-y-0 left-0 z-50 flex w-[min(20rem,calc(100vw-3rem))] shrink-0 flex-col border-r border-white/8 bg-[#0d1118] pt-[env(safe-area-inset-top)] pb-[env(safe-area-inset-bottom)] pl-[env(safe-area-inset-left)] transition-transform duration-200 motion-reduce:transition-none md:relative md:inset-auto md:z-auto md:h-full md:w-68 md:translate-x-0 md:p-0 ${
+          mobileSidebarOpen ? "translate-x-0" : "invisible -translate-x-full md:visible"
+        } ${sidebarOpen ? "md:flex" : "md:hidden"}`}
+      >
           {/* Brand Header */}
           <div className="flex items-center justify-between border-b border-white/8 px-4 py-3.5">
             <button
               type="button"
-              onClick={() => setActiveTabId("launchpad")}
+              onClick={() => {
+                setActiveTabId("launchpad");
+                setMobileSidebarOpen(false);
+              }}
               className="flex items-center gap-2.5 text-left"
             >
-              <div className="flex h-8 w-8 items-center justify-center rounded-xl bg-gradient-to-br from-[#ff6b57] to-[#e14935] text-white shadow-md shadow-[#ff6b57]/20">
-                <Terminal className="h-4 w-4 stroke-[2.5]" />
-              </div>
+              <img
+                src="/sushi-icon.svg"
+                alt=""
+                width={32}
+                height={32}
+                className="h-8 w-8 rounded-xl shadow-md shadow-[#ff6b57]/20"
+              />
               <div>
                 <div className="flex items-center gap-1.5">
                   <span className="text-sm font-bold tracking-tight text-white">
@@ -704,9 +779,19 @@ export function SushiWorkspace() {
             </button>
 
             <button
+              ref={mobileMenuCloseRef}
+              type="button"
+              onClick={closeMobileNavigation}
+              className="rounded-lg p-2 text-slate-400 hover:bg-white/5 hover:text-white md:hidden"
+              aria-label="Close navigation"
+            >
+              <PanelLeftClose className="h-5 w-5" />
+            </button>
+            <button
               type="button"
               onClick={() => setSidebarOpen(false)}
-              className="rounded-lg p-1.5 text-slate-400 hover:bg-white/5 hover:text-white"
+              className="hidden rounded-lg p-1.5 text-slate-400 hover:bg-white/5 hover:text-white md:block"
+              aria-label="Collapse sidebar"
               title="Collapse sidebar"
             >
               <PanelLeftClose className="h-4 w-4" />
@@ -733,6 +818,7 @@ export function SushiWorkspace() {
                   setEditingProfile(null);
                   setHostModalIntent(null);
                   setHostModalOpen(true);
+                  setMobileSidebarOpen(false);
                 }}
                 className="flex h-8 w-8 shrink-0 items-center justify-center rounded-xl bg-[#ff6b57] text-white transition hover:bg-[#ff7f6e]"
                 title="Add new remote host"
@@ -761,7 +847,7 @@ export function SushiWorkspace() {
           </div>
 
           {/* Saved Hosts List */}
-          <div className="min-h-0 flex-1 space-y-4 overflow-y-auto px-3 py-1">
+          <div className="workspace-sidebar-hosts min-h-0 flex-1 space-y-4 overflow-y-auto px-3 py-1">
             {filteredHosts.length === 0 ? (
               <div className="rounded-xl border border-dashed border-white/10 bg-white/[0.015] p-4 text-center">
                 <p className="text-xs font-medium text-slate-300">
@@ -776,6 +862,7 @@ export function SushiWorkspace() {
                     setEditingProfile(null);
                     setHostModalIntent(null);
                     setHostModalOpen(true);
+                    setMobileSidebarOpen(false);
                   }}
                   className="mt-3 inline-flex items-center gap-1 rounded-lg bg-white/8 px-3 py-1.5 text-xs font-medium text-white hover:bg-white/14"
                 >
@@ -799,10 +886,13 @@ export function SushiWorkspace() {
                     return (
                       <div
                         key={h.id}
-                        onClick={() => openSessionTab(h)}
-                        className="group flex cursor-pointer items-center justify-between rounded-xl px-2.5 py-2 transition hover:bg-white/[0.06]"
+                        className="group flex items-center justify-between rounded-xl px-2.5 py-2 transition hover:bg-white/[0.06]"
                       >
-                        <div className="flex min-w-0 items-center gap-2.5">
+                        <button
+                          type="button"
+                          onClick={() => openSessionTab(h)}
+                          className="flex min-w-0 flex-1 items-center gap-2.5 text-left"
+                        >
                           <span
                             className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-white/[0.04]"
                             style={{
@@ -819,7 +909,7 @@ export function SushiWorkspace() {
                               {h.username}@{h.host}:{h.port}
                             </div>
                           </div>
-                        </div>
+                        </button>
 
                         <div className="flex shrink-0 items-center gap-0.5">
                           {/* Always visible so the desktop is one click away */}
@@ -830,7 +920,7 @@ export function SushiWorkspace() {
                                 e.stopPropagation();
                                 openRdpCompanion(h);
                               }}
-                              className="rounded p-1 text-[#ff6b57]/75 transition hover:bg-[#ff6b57]/20 hover:text-[#ff9587]"
+                              className="rounded p-2 text-[#ff6b57]/75 transition hover:bg-[#ff6b57]/20 hover:text-[#ff9587] md:p-1"
                               title="Open desktop via RDP"
                               aria-label={`Open ${h.name} via RDP`}
                             >
@@ -838,7 +928,7 @@ export function SushiWorkspace() {
                             </button>
                           )}
 
-                          <div className="hidden items-center gap-0.5 group-hover:flex">
+                          <div className="hidden items-center gap-0.5 group-hover:flex group-focus-within:flex [@media(hover:none)]:flex">
                             {h.protocol !== "rdp" && (
                               <button
                                 type="button"
@@ -849,7 +939,8 @@ export function SushiWorkspace() {
                                     h.protocol === "ssh" ? "sftp" : "ssh"
                                   );
                                 }}
-                                className="rounded p-1 text-slate-400 hover:bg-white/10 hover:text-sky-300"
+                                className="rounded p-2 text-slate-400 hover:bg-white/10 hover:text-sky-300 md:p-1"
+                                aria-label={`Open ${h.name} as ${h.protocol === "ssh" ? "SFTP" : "SSH"}`}
                                 title={
                                   h.protocol === "ssh"
                                     ? "Open as SFTP"
@@ -870,8 +961,10 @@ export function SushiWorkspace() {
                                 setEditingProfile(h);
                                 setHostModalIntent(null);
                                 setHostModalOpen(true);
+                                setMobileSidebarOpen(false);
                               }}
-                              className="rounded p-1 text-slate-400 hover:bg-white/10 hover:text-white"
+                              className="rounded p-2 text-slate-400 hover:bg-white/10 hover:text-white md:p-1"
+                              aria-label={`Edit ${h.name}`}
                               title="Edit host"
                             >
                               <Pencil className="h-3 w-3" />
@@ -879,7 +972,8 @@ export function SushiWorkspace() {
                             <button
                               type="button"
                               onClick={(e) => void handleDeleteHost(h.id, e)}
-                              className="rounded p-1 text-slate-400 hover:bg-rose-500/20 hover:text-rose-400"
+                              className="rounded p-2 text-slate-400 hover:bg-rose-500/20 hover:text-rose-400 md:p-1"
+                              aria-label={`Delete ${h.name}`}
                               title="Delete host"
                             >
                               <Trash2 className="h-3 w-3" />
@@ -898,7 +992,10 @@ export function SushiWorkspace() {
           <div className="space-y-1.5 border-t border-white/8 p-3">
             <button
               type="button"
-              onClick={() => setAccountModalOpen(true)}
+              onClick={() => {
+                setAccountModalOpen(true);
+                setMobileSidebarOpen(false);
+              }}
               className="flex w-full items-center justify-between rounded-xl border border-white/8 bg-[#131823] px-3 py-2 text-xs font-medium text-slate-200 transition hover:border-white/18 hover:bg-white/8"
             >
               <span className="flex min-w-0 items-center gap-2 truncate">
@@ -916,6 +1013,7 @@ export function SushiWorkspace() {
                 onClick={() => {
                   setVaultModalTab("termix");
                   setVaultModalOpen(true);
+                  setMobileSidebarOpen(false);
                 }}
                 className="flex items-center justify-center gap-1 rounded-xl border border-white/8 bg-[#131823] px-2 py-2 text-[11px] font-medium text-slate-200 transition hover:border-white/18 hover:bg-white/8"
                 title="Import SSH client exports or restore an encrypted backup"
@@ -928,6 +1026,7 @@ export function SushiWorkspace() {
                 onClick={() => {
                   setVaultModalTab("keys");
                   setVaultModalOpen(true);
+                  setMobileSidebarOpen(false);
                 }}
                 className="flex items-center justify-center gap-1 rounded-xl border border-white/8 bg-[#131823] px-2 py-2 text-[11px] font-medium text-slate-200 transition hover:border-white/18 hover:bg-white/8"
                 title="Whitelisted SSH Keys & Vault"
@@ -937,7 +1036,10 @@ export function SushiWorkspace() {
               </button>
               <button
                 type="button"
-                onClick={() => setGatewayModalOpen(true)}
+                onClick={() => {
+                  setGatewayModalOpen(true);
+                  setMobileSidebarOpen(false);
+                }}
                 className="flex items-center justify-center gap-1 rounded-xl border border-white/8 bg-[#131823] px-2 py-2 text-[11px] font-medium text-slate-200 transition hover:border-white/18 hover:bg-white/8"
               >
                 <Radio className="h-3.5 w-3.5 text-sky-400" />
@@ -945,24 +1047,38 @@ export function SushiWorkspace() {
               </button>
             </div>
           </div>
-        </aside>
-      )}
+      </aside>
 
       {/* Right Main Workspace */}
-      <main className="flex min-w-0 flex-1 flex-col overflow-hidden">
+      <main inert={mobileSidebarOpen || undefined} className="flex min-w-0 flex-1 flex-col overflow-hidden">
         {/* Multi-Tab Bar */}
-        <header className="flex h-11 shrink-0 items-center gap-1 overflow-x-auto border-b border-white/8 bg-[#0c1017] px-2">
+        <header className="flex h-11 shrink-0 items-center gap-1 border-b border-white/8 bg-[#0c1017] px-2">
+          <button
+            ref={mobileMenuButtonRef}
+            type="button"
+            onClick={() => setMobileSidebarOpen(true)}
+            className="shrink-0 rounded-lg p-2 text-slate-300 hover:bg-white/5 hover:text-white md:hidden"
+            aria-label="Open navigation"
+            aria-controls="workspace-sidebar"
+            aria-expanded={mobileSidebarOpen}
+          >
+            <PanelLeftOpen className="h-5 w-5" />
+          </button>
           {!sidebarOpen && (
             <button
               type="button"
               onClick={() => setSidebarOpen(true)}
-              className="mr-1 rounded-lg p-1.5 text-slate-400 hover:bg-white/5 hover:text-white"
+              className="mr-1 hidden shrink-0 rounded-lg p-1.5 text-slate-400 hover:bg-white/5 hover:text-white md:block"
+              aria-label="Open sidebar"
+              aria-controls="workspace-sidebar"
+              aria-expanded={false}
               title="Open sidebar"
             >
               <PanelLeftOpen className="h-4 w-4" />
             </button>
           )}
 
+          <div className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto">
           {/* Launchpad Tab */}
           <button
             type="button"
@@ -996,18 +1112,24 @@ export function SushiWorkspace() {
             return (
               <div
                 key={tab.id}
-                onClick={() => setActiveTabId(tab.id)}
-                className={`group flex max-w-[220px] shrink-0 cursor-pointer items-center gap-2 rounded-lg border px-3 py-1.5 text-xs transition ${
+                className={`group flex max-w-[220px] shrink-0 items-center gap-2 rounded-lg border px-3 py-1.5 text-xs transition ${
                   active
                     ? "border-white/12 bg-[#171d2b] text-white"
                     : "border-transparent text-slate-400 hover:bg-white/[0.04] hover:text-slate-200"
                 }`}
               >
-                <Icon className={`h-3.5 w-3.5 shrink-0 ${iconColor}`} />
-                <span className="truncate font-medium">{tab.title}</span>
-                <span className="font-mono-code text-[10px] uppercase opacity-60">
-                  {tab.protocol}
-                </span>
+                <button
+                  type="button"
+                  onClick={() => setActiveTabId(tab.id)}
+                  aria-current={active ? "page" : undefined}
+                  className="flex min-w-0 items-center gap-2 text-left"
+                >
+                  <Icon className={`h-3.5 w-3.5 shrink-0 ${iconColor}`} />
+                  <span className="truncate font-medium">{tab.title}</span>
+                  <span className="font-mono-code text-[10px] uppercase opacity-60">
+                    {tab.protocol}
+                  </span>
+                </button>
                 <button
                   type="button"
                   onClick={(e) => closeSessionTab(tab.id, e)}
@@ -1032,6 +1154,7 @@ export function SushiWorkspace() {
           >
             <Plus className="h-4 w-4" />
           </button>
+          </div>
         </header>
 
         {/* Workspace Stage */}
@@ -1040,7 +1163,7 @@ export function SushiWorkspace() {
           <div
             className={
               activeTabId === "launchpad"
-                ? "h-full w-full overflow-y-auto p-6 sm:p-8"
+                ? "h-full w-full overflow-y-auto p-4 sm:p-8"
                 : "hidden"
             }
           >
@@ -1077,7 +1200,7 @@ export function SushiWorkspace() {
               )}
 
               {whitelistBannerError && (
-                <div className="flex items-center justify-between gap-3 rounded-xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-xs text-rose-200">
+                <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-xs text-rose-200">
                   <span className="flex items-center gap-2">
                     <AlertCircle className="h-4 w-4 shrink-0 text-rose-400" />
                     {whitelistBannerError}
@@ -1097,7 +1220,7 @@ export function SushiWorkspace() {
               )}
 
               {/* Hero & Quick Connect Command Bar */}
-              <div className="rounded-2xl border border-white/10 bg-gradient-to-b from-[#131824] to-[#0e121b] p-6 shadow-xl sm:p-7">
+              <div className="rounded-2xl border border-white/10 bg-gradient-to-b from-[#131824] to-[#0e121b] p-4 shadow-xl sm:p-7">
                 <div className="flex flex-wrap items-center justify-between gap-4">
                   <div>
                     <h1 className="text-xl font-bold tracking-tight text-white sm:text-2xl">
@@ -1324,8 +1447,8 @@ export function SushiWorkspace() {
                             </span>
                           </div>
 
-                          <div className="mt-4 flex items-center justify-between gap-2 border-t border-white/6 pt-3">
-                            <div className="flex items-center gap-1.5">
+                          <div className="mt-4 flex flex-wrap items-center justify-between gap-2 border-t border-white/6 pt-3">
+                            <div className="flex flex-wrap items-center gap-1.5">
                               <button
                                 type="button"
                                 onClick={() => openSessionTab(h)}

@@ -134,9 +134,9 @@ export function GatewaySetupModal({
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4 backdrop-blur-sm">
-      <div className="flex max-h-[90vh] w-full max-w-2xl flex-col overflow-hidden rounded-2xl border border-white/10 bg-[#0f131b] shadow-2xl">
-        <div className="flex items-center justify-between border-b border-white/8 px-6 py-4">
+    <div className="modal-safe-area fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4 backdrop-blur-sm">
+      <div className="flex max-h-full w-full max-w-2xl flex-col overflow-hidden rounded-2xl border border-white/10 bg-[#0f131b] shadow-2xl">
+        <div className="flex items-center justify-between gap-3 border-b border-white/8 px-4 py-4 sm:px-6">
           <div className="flex items-center gap-2.5">
             <Radio className="h-4 w-4 text-[#ff6b57]" />
             <h2 className="text-base font-semibold text-white">
@@ -145,13 +145,14 @@ export function GatewaySetupModal({
           </div>
           <button
             onClick={onClose}
-            className="rounded-lg p-1.5 text-slate-400 transition hover:bg-white/5 hover:text-white"
+            aria-label="Close gateway settings"
+            className="shrink-0 rounded-lg p-1.5 text-slate-400 transition hover:bg-white/5 hover:text-white"
           >
             <X className="h-4 w-4" />
           </button>
         </div>
 
-        <div className="flex-1 space-y-5 overflow-y-auto px-6 py-5">
+        <div className="min-h-0 flex-1 space-y-5 overflow-y-auto px-4 py-5 sm:px-6">
           {/* Current Runtime Matrix */}
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
             <div className="rounded-xl border border-white/8 bg-[#141923] p-3.5">
@@ -338,7 +339,7 @@ export function GatewaySetupModal({
           </div>
         </div>
 
-        <div className="flex items-center justify-end gap-2.5 border-t border-white/8 bg-[#0b0e14] px-6 py-4">
+        <div className="flex flex-wrap items-center justify-end gap-2.5 border-t border-white/8 bg-[#0b0e14] px-4 py-3 sm:px-6 sm:py-4">
           <button
             type="button"
             onClick={onClose}

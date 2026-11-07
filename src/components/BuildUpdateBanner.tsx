@@ -48,7 +48,7 @@ export default function BuildUpdateBanner() {
   if (!staleBuildId) return null;
 
   return (
-    <div className="fixed bottom-4 left-1/2 z-[70] flex -translate-x-1/2 items-center gap-3 rounded-xl border border-sky-400/40 bg-[#0e1725] px-4 py-2.5 text-xs text-sky-100 shadow-2xl">
+    <div className="fixed right-[max(1rem,env(safe-area-inset-right))] bottom-[max(1rem,env(safe-area-inset-bottom))] left-[max(1rem,env(safe-area-inset-left))] z-[70] flex items-center gap-3 rounded-xl border border-sky-400/40 bg-[#0e1725] px-4 py-2.5 text-xs text-sky-100 shadow-2xl sm:right-auto sm:left-1/2 sm:w-[min(36rem,calc(100%-2rem))] sm:-translate-x-1/2">
       <Rocket className="h-4 w-4 shrink-0 text-sky-300" />
       <span>
         A newer version of Sushi was deployed. This tab is still running the old one —

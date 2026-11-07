@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <defs>
+    <linearGradient id="sushi" x1="0" y1="0" x2="512" y2="512" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#ff8b77"/>
+      <stop offset="0.48" stop-color="#ff6b57"/>
+      <stop offset="1" stop-color="#df4936"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" fill="url(#sushi)"/>
+  <path d="M139 157 232 250 139 343M269 343h104" fill="none" stroke="#9c3027" stroke-linecap="round" stroke-linejoin="round" stroke-width="34" opacity=".18" transform="translate(0 6)"/>
+  <path d="M139 157 232 250 139 343M269 343h104" fill="none" stroke="#fff" stroke-linecap="round" stroke-linejoin="round" stroke-width="34"/>
+</svg>

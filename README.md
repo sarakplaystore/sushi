@@ -46,6 +46,25 @@ It is designed around a **Hybrid VPS + Serverless Architecture**:
 
 ---
 
+## Add Sushi to an iPhone or iPad Home Screen
+
+1. Open your Sushi URL over **HTTPS** in Safari, tap **Share**, and choose
+   **Add to Home Screen**. Confirm the name and tap **Add**. Sushi has a dedicated
+   Home Screen icon and opens as a standalone web app.
+2. Use the navigation button at the top left to access saved hosts and settings
+   on a phone. Sessions still require a network connection; installing the icon
+   does not make SSH, SFTP, or RDP work offline.
+
+The Home Screen app may have separate login and browser storage from Safari,
+including the local device key used to encrypt a device-key vault. You may need
+to sign in again, unlock a synced master-passphrase vault, or restore a portable
+backup. **Before switching, create and verify a passphrase-protected portable
+backup in the original browser** (see below); do not reset an unreadable vault
+until you have a working backup. The icon does not automatically sync vaults or
+keys between Safari and the installed app.
+
+---
+
 ## Importing SSH clients and iCloud Drive files
 
 Open **Import / Export** on the dashboard or in the sidebar. Choose files, or on

@@ -31,6 +31,7 @@ import {
   ShieldCheck,
   ListChecks,
   Monitor,
+  MoreHorizontal,
 } from "lucide-react";
 import type { HostProfile, SftpEntry } from "@/types/connection";
 import { type GatewaySettings, getAuthHeaders } from "@/lib/client/gateway";
@@ -686,7 +687,7 @@ export function SftpBrowserSession({
       <div className="space-y-2 border-b border-white/8 bg-[#0f131b] px-4 py-2.5">
         <div className="flex flex-wrap items-center justify-between gap-2">
           {/* Navigation & Breadcrumbs */}
-          <div className="flex min-w-0 flex-1 items-center gap-1.5">
+          <div className="flex w-full min-w-0 items-center gap-1.5 sm:w-auto sm:flex-1">
             <button
               type="button"
               onClick={navigateParent}
@@ -779,7 +780,7 @@ export function SftpBrowserSession({
               type="button"
               onClick={() => void handleDownloadFolder(null)}
               disabled={Boolean(zipJob)}
-              className="flex items-center gap-1.5 rounded-lg border border-sky-500/30 bg-sky-500/10 px-2.5 py-1.5 text-xs font-medium text-sky-300 transition hover:bg-sky-500/20 disabled:opacity-50"
+              className="flex items-center gap-1.5 rounded-lg border border-sky-500/30 bg-sky-500/10 px-1.5 py-1.5 text-xs sm:px-2.5 font-medium text-sky-300 transition hover:bg-sky-500/20 disabled:opacity-50"
               title="Download the current folder as a .zip archive"
             >
               <FolderDown className="h-3.5 w-3.5" />
@@ -803,7 +804,9 @@ export function SftpBrowserSession({
             <button
               type="button"
               onClick={() => setMkdirName("")}
-              className="flex items-center gap-1 rounded-lg border border-white/10 bg-white/5 px-2.5 py-1.5 text-xs text-slate-200 transition hover:bg-white/10"
+              aria-label="New folder"
+              title="New folder"
+              className="flex items-center gap-1 rounded-lg border border-white/10 bg-white/5 px-1.5 py-1.5 text-xs sm:px-2.5 text-slate-200 transition hover:bg-white/10"
             >
               <FolderPlus className="h-3.5 w-3.5 text-sky-400" />
               <span className="hidden sm:inline">New Folder</span>
@@ -812,7 +815,9 @@ export function SftpBrowserSession({
             <button
               type="button"
               onClick={() => setNewFileName("")}
-              className="flex items-center gap-1 rounded-lg border border-white/10 bg-white/5 px-2.5 py-1.5 text-xs text-slate-200 transition hover:bg-white/10"
+              aria-label="New file"
+              title="New file"
+              className="flex items-center gap-1 rounded-lg border border-white/10 bg-white/5 px-1.5 py-1.5 text-xs sm:px-2.5 text-slate-200 transition hover:bg-white/10"
             >
               <FilePlus2 className="h-3.5 w-3.5 text-emerald-400" />
               <span className="hidden sm:inline">New File</span>
@@ -821,7 +826,7 @@ export function SftpBrowserSession({
             <button
               type="button"
               onClick={() => onOpenCompanionSsh(cwd)}
-              className="flex items-center gap-1 rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-2.5 py-1.5 text-xs font-medium text-emerald-300 transition hover:bg-emerald-500/20"
+              className="flex items-center gap-1 rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-1.5 py-1.5 text-xs sm:px-2.5 font-medium text-emerald-300 transition hover:bg-emerald-500/20"
               title="Open SSH terminal in this folder"
             >
               <Terminal className="h-3.5 w-3.5" />
@@ -831,7 +836,7 @@ export function SftpBrowserSession({
             <button
               type="button"
               onClick={onOpenRdp}
-              className="flex items-center gap-1 rounded-lg border border-[#ff6b57]/35 bg-[#ff6b57]/10 px-2.5 py-1.5 text-xs font-medium text-[#ff9587] transition hover:bg-[#ff6b57]/20"
+              className="flex items-center gap-1 rounded-lg border border-[#ff6b57]/35 bg-[#ff6b57]/10 px-1.5 py-1.5 text-xs sm:px-2.5 font-medium text-[#ff9587] transition hover:bg-[#ff6b57]/20"
               title="Open this server's desktop via RDP (port 3389)"
             >
               <Monitor className="h-3.5 w-3.5" />
@@ -842,7 +847,7 @@ export function SftpBrowserSession({
 
         {/* Filter & Hidden Toggle */}
         <div className="flex items-center justify-between gap-3">
-          <div className="relative flex-1 max-w-xs">
+          <div className="relative min-w-0 max-w-xs flex-1">
             <Search className="pointer-events-none absolute left-2.5 top-2 h-3.5 w-3.5 text-slate-500" />
             <input
               type="text"
@@ -857,10 +862,10 @@ export function SftpBrowserSession({
             {/* Right-click row menu: keeps folder download one click away */}
             {rowMenu && (
               <div
-                className="fixed z-50 w-56 overflow-hidden rounded-xl border border-white/12 bg-[#141924] py-1 shadow-2xl"
+                className="fixed z-50 max-h-[calc(100dvh-1rem-env(safe-area-inset-top)-env(safe-area-inset-bottom))] w-56 max-w-[calc(100vw-2rem)] overflow-y-auto rounded-xl border border-white/12 bg-[#141924] py-1 shadow-2xl"
                 style={{
-                  left: Math.min(rowMenu.x, window.innerWidth - 240),
-                  top: Math.min(rowMenu.y, window.innerHeight - 300),
+                  left: `max(calc(8px + env(safe-area-inset-left)), min(${rowMenu.x}px, calc(100vw - 14rem - 8px - env(safe-area-inset-right))))`,
+                  top: `max(calc(8px + env(safe-area-inset-top)), min(${rowMenu.y}px, calc(100dvh - 300px - env(safe-area-inset-bottom))))`,
                 }}
                 onClick={(e) => e.stopPropagation()}
               >
@@ -1193,7 +1198,7 @@ export function SftpBrowserSession({
               <th className="hidden px-3 py-2.5 text-right sm:table-cell">Size</th>
               <th className="hidden px-3 py-2.5 md:table-cell">Permissions</th>
               <th className="hidden px-3 py-2.5 lg:table-cell">Modified</th>
-              <th className="py-2.5 pl-3 pr-4 text-right">Actions</th>
+              <th className="w-20 py-2.5 pl-3 pr-4 text-right sm:w-auto">Actions</th>
             </tr>
           </thead>
           <tbody className="divide-y divide-white/[0.04]">
@@ -1286,7 +1291,7 @@ export function SftpBrowserSession({
                             void openRemoteFileEditor(entry);
                           }
                         }}
-                        className="flex max-w-full items-center gap-2.5 text-left"
+                        className="flex max-w-[calc(100vw-9rem)] items-center gap-2.5 text-left sm:max-w-full"
                       >
                         {isDir ? (
                           <Folder className="h-4 w-4 shrink-0 fill-sky-400/20 text-sky-400" />
@@ -1325,7 +1330,28 @@ export function SftpBrowserSession({
                     </td>
 
                     <td className="py-2 pl-3 pr-4 text-right">
-                      <div className="inline-flex items-center justify-end gap-1 opacity-80 transition group-hover:opacity-100">
+                      <button
+                        type="button"
+                        aria-label={`More actions for ${entry.name}`}
+                        aria-expanded={rowMenu?.entry.path === entry.path}
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          if (!selectedSet.has(entry.path)) {
+                            setSelectedPaths([entry.path]);
+                            selectionAnchorRef.current = entry.path;
+                          }
+                          const rect = event.currentTarget.getBoundingClientRect();
+                          setRowMenu((current) =>
+                            current?.entry.path === entry.path
+                              ? null
+                              : { entry, x: rect.right - 224, y: rect.bottom }
+                          );
+                        }}
+                        className="sftp-touch-more inline-flex rounded-lg p-2 text-slate-300 hover:bg-white/8 hover:text-white sm:hidden"
+                      >
+                        <MoreHorizontal className="h-4 w-4" />
+                      </button>
+                      <div className="sftp-row-actions hidden items-center justify-end gap-1 opacity-80 transition group-hover:opacity-100 sm:inline-flex">
                         {isDir && (
                           <button
                             type="button"
@@ -1401,7 +1427,7 @@ export function SftpBrowserSession({
 
       {/* Rename Modal */}
       {renameTarget && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
+        <div className="modal-safe-area fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
           <form
             onSubmit={(e) => {
               e.preventDefault();
@@ -1419,7 +1445,7 @@ export function SftpBrowserSession({
                 `Renamed to ${next}`
               );
             }}
-            className="w-full max-w-md space-y-4 rounded-2xl border border-white/10 bg-[#121722] p-5 shadow-2xl"
+            className="max-h-full w-full max-w-md space-y-4 overflow-y-auto rounded-2xl border border-white/10 bg-[#121722] p-5 shadow-2xl"
           >
             <h3 className="text-sm font-semibold text-white">Rename Item</h3>
             <input
@@ -1452,8 +1478,8 @@ export function SftpBrowserSession({
 
       {/* Chmod Modal with interactive matrix */}
       {chmodTarget && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
-          <div className="w-full max-w-md space-y-4 rounded-2xl border border-white/10 bg-[#121722] p-5 shadow-2xl">
+        <div className="modal-safe-area fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
+          <div className="max-h-full w-full max-w-md space-y-4 overflow-y-auto rounded-2xl border border-white/10 bg-[#121722] p-5 shadow-2xl">
             <div className="flex items-center justify-between">
               <h3 className="text-sm font-semibold text-white">
                 Permissions (chmod) — {chmodTarget.entry.name}
@@ -1557,14 +1583,14 @@ export function SftpBrowserSession({
 
       {/* Delete Confirmation */}
       {deleteTarget && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
-          <div className="w-full max-w-md space-y-4 rounded-2xl border border-rose-500/25 bg-[#121722] p-5 shadow-2xl">
+        <div className="modal-safe-area fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
+          <div className="max-h-full w-full max-w-md space-y-4 overflow-y-auto rounded-2xl border border-rose-500/25 bg-[#121722] p-5 shadow-2xl">
             <h3 className="text-sm font-semibold text-white">
               Delete {deleteTarget.type === "directory" ? "Folder" : "File"}?
             </h3>
             <p className="text-xs leading-relaxed text-slate-300">
               Permanently remove{" "}
-              <code className="font-mono-code rounded bg-white/8 px-1.5 py-0.5 text-rose-300">
+              <code className="font-mono-code break-all rounded bg-white/8 px-1.5 py-0.5 text-rose-300">
                 {deleteTarget.path}
               </code>
               {deleteTarget.type === "directory"
@@ -1601,7 +1627,7 @@ export function SftpBrowserSession({
 
       {/* Remote File Code Editor Drawer */}
       {editorFile && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-3 sm:p-6">
+        <div className="modal-safe-area fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4">
           <div className="flex h-full w-full max-w-5xl flex-col overflow-hidden rounded-2xl border border-white/12 bg-[#0d1118] shadow-2xl">
             <div className="flex items-center justify-between border-b border-white/8 bg-[#121722] px-4 py-3">
               <div className="flex min-w-0 items-center gap-2.5">
@@ -1610,12 +1636,12 @@ export function SftpBrowserSession({
                   {editorFile.path}
                 </span>
                 {editorFile.content !== editorFile.originalContent && (
-                  <span className="rounded-full bg-amber-500/20 px-2 py-0.5 text-[10px] font-medium text-amber-300">
+                  <span className="hidden shrink-0 rounded-full bg-amber-500/20 px-2 py-0.5 text-[10px] font-medium text-amber-300 sm:inline">
                     Unsaved changes
                   </span>
                 )}
               </div>
-              <div className="flex items-center gap-2">
+              <div className="flex shrink-0 items-center gap-2">
                 <button
                   type="button"
                   onClick={() => void saveEditorFile()}
@@ -1627,11 +1653,13 @@ export function SftpBrowserSession({
                   ) : (
                     <Save className="h-3.5 w-3.5" />
                   )}
-                  Save over SFTP (⌘S)
+                  <span className="sm:hidden">Save</span>
+                  <span className="hidden sm:inline">Save over SFTP (⌘S)</span>
                 </button>
                 <button
                   type="button"
                   onClick={() => setEditorFile(null)}
+                  aria-label="Close editor"
                   className="rounded-lg p-1.5 text-slate-400 hover:bg-white/5 hover:text-white"
                 >
                   <X className="h-4 w-4" />

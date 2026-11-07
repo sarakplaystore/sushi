@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   X,
   Shield,
@@ -32,13 +32,12 @@ import type {
 import type { EncryptedVaultEnvelope } from "@/lib/client/crypto-vault";
 import {
   exportToTermixFile,
-  importFromTermixContent,
   type TermixImportSummary,
 } from "@/lib/client/termix-porter";
+import { prepareSshImport } from "@/lib/client/ssh-import-batch";
+import { MAX_IMPORT_FILE_BYTES, MAX_IMPORT_FILES } from "@/lib/client/ssh-import-files";
 import {
   importTermixSqliteDatabase,
-  isTermixMetadataJson,
-  looksLikeTermixDatabaseFile,
   parseTermixEnvSecrets,
   type TermixSqliteImportResult,
   type TermixSqliteUserInfo,
@@ -61,6 +60,7 @@ interface SqliteImportSource {
   size: number;
   bytes: Uint8Array;
   metaJson?: string;
+  warnings?: string[];
 }
 
 function Mono({ children }: { children: React.ReactNode }) {
@@ -111,7 +111,7 @@ interface VaultSecurityModalProps {
   onClose: () => void;
   onSetPassphrase: (passphrase: string | null) => Promise<void>;
   onLockNow: () => void;
-  onExportEnvelope: () => EncryptedVaultEnvelope | null;
+  onExportPortableEnvelope: (passphrase: string) => Promise<EncryptedVaultEnvelope>;
   onImportEnvelope: (
     envelope: EncryptedVaultEnvelope,
     passphrase?: string
@@ -152,7 +152,7 @@ export function VaultSecurityModal({
   onClose,
   onSetPassphrase,
   onLockNow,
-  onExportEnvelope,
+  onExportPortableEnvelope,
   onImportEnvelope,
   onUpdateKeychain,
   onApplyTermixImport,
@@ -165,7 +165,15 @@ export function VaultSecurityModal({
   const [importPass, setImportPass] = useState("");
   const [pendingImport, setPendingImport] =
     useState<EncryptedVaultEnvelope | null>(null);
+  const [pendingImportName, setPendingImportName] = useState("");
+  const [backupPass, setBackupPass] = useState("");
+  const [backupConfirm, setBackupConfirm] = useState("");
+  const [exportingBackup, setExportingBackup] = useState(false);
+  const [restoringBackup, setRestoringBackup] = useState(false);
   const [saving, setSaving] = useState(false);
+  const fileRequest = useRef(0);
+  const sqliteRequest = useRef(0);
+  const envRequest = useRef(0);
 
   // SSH Key Whitelist state
   const [keyName, setKeyName] = useState("");
@@ -204,8 +212,16 @@ export function VaultSecurityModal({
       setActiveTab(initialTab);
       setStatus(null);
     }
-    // Drop any pending Termix import — including pasted Termix master keys —
-    // whenever the modal opens or closes.
+    // Drop pending imports and secrets, and invalidate in-flight reads on close.
+    fileRequest.current++;
+    sqliteRequest.current++;
+    envRequest.current++;
+    setPendingImport(null);
+    setPendingImportName("");
+    setImportPass("");
+    setBackupPass("");
+    setBackupConfirm("");
+    setAnalyzingSqlite(false);
     setTermixPreview(null);
     setTermixFilename(null);
     setSqliteSource(null);
@@ -273,50 +289,41 @@ export function VaultSecurityModal({
     }
   };
 
-  const handleExportSushiEnvelope = () => {
-    const env = onExportEnvelope();
-    if (!env) {
-      setStatus({ ok: false, msg: "Vault is empty; save a host or key first." });
+  const handleExportSushiEnvelope = async () => {
+    setStatus(null);
+    if (backupPass.length < 8) {
+      setStatus({ ok: false, msg: "Choose a backup passphrase of at least 8 characters." });
       return;
     }
-    downloadJsonOrText(
-      `sushi-vault-${new Date().toISOString().slice(0, 10)}.enc.json`,
-      JSON.stringify(env, null, 2)
-    );
-    setStatus({ ok: true, msg: "Encrypted Sushi vault backup downloaded." });
+    if (backupPass !== backupConfirm) {
+      setStatus({ ok: false, msg: "Backup passphrases do not match." });
+      return;
+    }
+    setExportingBackup(true);
+    try {
+      // A separate passphrase makes this backup restorable on any device even
+      // when the current vault uses a device-bound key. It does not change the vault.
+      const env = await onExportPortableEnvelope(backupPass);
+      downloadJsonOrText(
+        `sushi-vault-${new Date().toISOString().slice(0, 10)}.enc.json`,
+        JSON.stringify(env, null, 2)
+      );
+      setBackupPass("");
+      setBackupConfirm("");
+      setStatus({ ok: true, msg: "Portable encrypted backup downloaded. Save or move it to iCloud Drive if you wish." });
+    } catch (err) {
+      setStatus({ ok: false, msg: err instanceof Error ? err.message : "Could not export the backup." });
+    } finally {
+      setExportingBackup(false);
+    }
   };
 
   const handleImportSushiEnvelopeFile = async (
     e: React.ChangeEvent<HTMLInputElement>
   ) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    setStatus(null);
-    try {
-      const raw = await file.text();
-      const parsed = JSON.parse(raw) as EncryptedVaultEnvelope;
-      if (!parsed.ciphertext || !parsed.iv) {
-        throw new Error(
-          "Not an encrypted Sushi Vault (.enc.json). For Termix JSON files, use the Termix Import / Export tab."
-        );
-      }
-      if (parsed.mode === "passphrase") {
-        setPendingImport(parsed);
-        setStatus({
-          ok: true,
-          msg: "Enter the backup's master passphrase below to decrypt and import.",
-        });
-      } else {
-        await onImportEnvelope(parsed);
-        setStatus({ ok: true, msg: "Sushi Vault backup imported!" });
-      }
-    } catch (err) {
-      setStatus({
-        ok: false,
-        msg:
-          err instanceof Error ? err.message : "Failed to import vault file.",
-      });
-    }
+    const files = Array.from(e.target.files ?? []);
+    e.target.value = "";
+    await processTermixFiles(files);
   };
 
   // --- SSH Key Whitelist Handlers ---
@@ -448,6 +455,9 @@ export function VaultSecurityModal({
 
   // --- Termix Import / Export Handlers ---
   const resetSqliteImport = () => {
+    sqliteRequest.current++;
+    envRequest.current++;
+    setAnalyzingSqlite(false);
     setSqliteSource(null);
     setSqliteResult(null);
     setSqliteEnv("");
@@ -457,19 +467,23 @@ export function VaultSecurityModal({
 
   const runSqliteAnalysis = async (
     source: SqliteImportSource | null = sqliteSource,
-    userFilter: string = sqliteUserFilter
+    userFilter: string = sqliteUserFilter,
+    envOverride?: string,
+    passwordOverride?: string
   ) => {
     if (!source) return;
+    const request = ++sqliteRequest.current;
     setAnalyzingSqlite(true);
     setStatus(null);
     try {
       const result = await importTermixSqliteDatabase(source.bytes, {
-        termixEnv: sqliteEnv,
-        termixPassword: sqlitePassword,
+        termixEnv: envOverride ?? sqliteEnv,
+        termixPassword: passwordOverride ?? sqlitePassword,
         metaJson: source.metaJson,
         onlyUserId: userFilter || undefined,
         existingSshKeys: sshKeys,
       });
+      if (request !== sqliteRequest.current) return;
       setSqliteResult(result);
       setTermixPreview(
         result.status === "ok"
@@ -478,11 +492,12 @@ export function VaultSecurityModal({
               sshKeys: result.sshKeys,
               snippets: result.snippets,
               detectedFormat: "termix-sqlite",
-              warnings: result.warnings,
+              warnings: [...(source.warnings ?? []), ...result.warnings],
             }
           : null
       );
     } catch (err) {
+      if (request !== sqliteRequest.current) return;
       setSqliteResult(null);
       setTermixPreview(null);
       setStatus({
@@ -493,71 +508,61 @@ export function VaultSecurityModal({
             : "Could not read the Termix SQLite database.",
       });
     } finally {
-      setAnalyzingSqlite(false);
+      if (request === sqliteRequest.current) setAnalyzingSqlite(false);
     }
   };
 
   const processTermixFiles = async (files: File[]) => {
     if (files.length === 0) return;
+    const request = ++fileRequest.current;
     setStatus(null);
+    setTermixPreview(null);
+    setTermixFilename(null);
+    setPendingImport(null);
+    setPendingImportName("");
+    setImportPass("");
+    resetSqliteImport();
     try {
-      let dbFile: { file: File; bytes: Uint8Array } | null = null;
-      let metaJson: string | undefined;
-      let textFile: { file: File; bytes: Uint8Array } | null = null;
-      const decoder = new TextDecoder();
-
-      for (const file of files) {
-        const bytes = new Uint8Array(await file.arrayBuffer());
-        if (
-          /\.meta$/i.test(file.name) ||
-          (bytes.length < 8192 && isTermixMetadataJson(decoder.decode(bytes)))
-        ) {
-          metaJson = decoder.decode(bytes);
-        } else if (!dbFile && looksLikeTermixDatabaseFile(bytes, file.name)) {
-          dbFile = { file, bytes };
-        } else if (!textFile) {
-          textFile = { file, bytes };
-        }
+      if (files.length > MAX_IMPORT_FILES) throw new Error(`Select at most ${MAX_IMPORT_FILES} files at once.`);
+      if (files.some((file) => file.size > MAX_IMPORT_FILE_BYTES)) throw new Error("Each import file must be 50 MB or smaller.");
+      if (files.reduce((total, file) => total + file.size, 0) > MAX_IMPORT_FILE_BYTES) throw new Error("Selected files must total at most 50 MB.");
+      const selected = [];
+      for (const file of files) selected.push({ name: file.name, bytes: new Uint8Array(await file.arrayBuffer()) });
+      if (request !== fileRequest.current) return;
+      const prepared = prepareSshImport(selected, sshKeys);
+      if (prepared.kind === "vault") {
+        setPendingImport(prepared.envelope);
+        setPendingImportName(prepared.name);
+        setActiveTab("security");
+        const restoreMessage = prepared.envelope.mode === "passphrase"
+          ? "Enter the backup passphrase to restore. This replaces the current vault."
+          : "This older backup uses a device key and can only be restored on the device that created it. Restoring replaces the current vault.";
+        setStatus({ ok: true, msg: [restoreMessage, ...prepared.warnings].join(" ") });
+        return;
       }
-
-      if (dbFile) {
+      setActiveTab("termix");
+      if (prepared.kind === "termix-sqlite") {
         const source: SqliteImportSource = {
-          name: dbFile.file.name,
-          size: dbFile.file.size,
-          bytes: dbFile.bytes,
-          metaJson,
+          name: prepared.file.name,
+          size: prepared.file.bytes.length,
+          bytes: prepared.file.bytes,
+          metaJson: prepared.metaJson,
+          warnings: prepared.warnings,
         };
         setSqliteSource(source);
         setSqliteResult(null);
         setSqliteUserFilter("");
-        setTermixPreview(null);
+        setSqliteEnv(prepared.envText || "");
         setTermixFilename(source.name);
-        await runSqliteAnalysis(source, "");
+        await runSqliteAnalysis(source, "", prepared.envText || "", "");
         return;
       }
-
-      if (!textFile) {
-        throw new Error(
-          "That looks like a db.sqlite.encrypted.meta file on its own — select it together with db.sqlite.encrypted."
-        );
-      }
-
-      const summary = importFromTermixContent(
-        decoder.decode(textFile.bytes),
-        sshKeys
-      );
-      resetSqliteImport();
-      setTermixPreview(summary);
-      setTermixFilename(textFile.file.name);
+      setTermixPreview(prepared.summary);
+      setTermixFilename(prepared.name);
     } catch (err) {
+      if (request !== fileRequest.current) return;
       setTermixPreview(null);
-      setStatus({
-        ok: false,
-        msg:
-          err instanceof Error
-            ? err.message
-            : "Could not parse Termix import file.",
-      });
+      setStatus({ ok: false, msg: err instanceof Error ? err.message : "Could not read the selected import files." });
     }
   };
 
@@ -583,11 +588,21 @@ export function VaultSecurityModal({
       setStatus({ ok: false, msg: "That file is too large to be a Termix .env file." });
       return;
     }
-    setSqliteEnv(await file.text());
+    const request = ++envRequest.current;
+    try {
+      const text = await file.text();
+      if (request === envRequest.current) setSqliteEnv(text);
+    } catch (err) {
+      if (request === envRequest.current) {
+        setStatus({ ok: false, msg: err instanceof Error ? err.message : "Could not read the Termix .env file." });
+      }
+    }
   };
 
   const handleConfirmTermixImport = async (replaceExisting: boolean) => {
     if (!termixPreview) return;
+    if (replaceExisting && !termixPreview.hosts.length) return;
+    if (replaceExisting && hosts.length && !window.confirm(`Replace all ${hosts.length} existing hosts with the imported hosts? Keys and snippets will be kept.`)) return;
     setImportingTermix(true);
     setStatus(null);
     try {
@@ -610,14 +625,14 @@ export function VaultSecurityModal({
           : "";
       setStatus({
         ok: true,
-        msg: `Imported ${parts.join(", ")} from ${termixFilename || "Termix file"}!${skippedNote}`,
+        msg: `Imported ${parts.join(", ")} from ${termixFilename || "selected file"}!${skippedNote}`,
       });
       setTermixPreview(null);
       resetSqliteImport();
     } catch (err) {
       setStatus({
         ok: false,
-        msg: err instanceof Error ? err.message : "Termix import failed.",
+        msg: err instanceof Error ? err.message : "Import failed.",
       });
     } finally {
       setImportingTermix(false);
@@ -655,11 +670,12 @@ export function VaultSecurityModal({
           <div className="flex items-center gap-2.5">
             <Shield className="h-4 w-4 text-emerald-400" />
             <h2 className="text-base font-semibold text-white">
-              Vault, SSH Key Whitelist &amp; Termix Sync
+              Vault, SSH Keys &amp; Import
             </h2>
           </div>
           <button
             onClick={onClose}
+            aria-label="Close vault modal"
             className="rounded-lg p-1.5 text-slate-400 hover:bg-white/5 hover:text-white"
           >
             <X className="h-4 w-4" />
@@ -681,7 +697,7 @@ export function VaultSecurityModal({
             }`}
           >
             <ArrowLeftRight className="h-3.5 w-3.5" />
-            Termix Import / Export
+            Import / Export
           </button>
           <button
             type="button"
@@ -734,23 +750,22 @@ export function VaultSecurityModal({
           )}
 
           {/* ============================================================== */}
-          {/* TAB 1: TERMIX IMPORT & EXPORT                                   */}
+          {/* TAB 1: SSH CLIENT IMPORT & TERMIX EXPORT                         */}
           {/* ============================================================== */}
           {activeTab === "termix" && (
             <div className="space-y-5">
-              {/* Import from Termix */}
+              {/* Import SSH client exports */}
               <div className="rounded-xl border border-white/8 bg-[#141923] p-4 space-y-3.5">
                 <div className="flex items-start justify-between gap-3">
                   <div>
                     <h3 className="text-xs font-semibold text-white">
-                      Import from Termix
+                      Import SSH Client Exports
                     </h3>
                     <p className="mt-0.5 text-[11px] text-slate-400">
-                      Supports the Termix SQLite database (<Mono>db.sqlite</Mono>{" "}
-                      or encrypted <Mono>db.sqlite.encrypted</Mono>), Termix Host
-                      Export (<Mono>.json</Mono>), Share Export, v2.0 User Data
-                      Export, and OpenSSH <Mono>~/.ssh/config</Mono>. Embedded SSH
-                      keys are automatically added to your Key Whitelist.
+                      Import Termix, OpenSSH config, Termius-compatible CSV, PuTTY
+                      registry exports, MobaXterm, WinSCP, Tabby, Xshell, SecureCRT,
+                      SSHBorg, 7 Term, or a supported SSH host JSON. Select private key files with the
+                      export to add and match them. Preview warnings before importing.
                     </p>
                   </div>
                 </div>
@@ -773,19 +788,18 @@ export function VaultSecurityModal({
                     <FileJson className="h-6 w-6 text-slate-400" />
                   </div>
                   <div className="text-xs font-semibold text-white">
-                    Choose a Termix database, Termix JSON export, or SSH config
+                    Choose SSH exports or an encrypted Sushi backup
                   </div>
                   <div className="text-[11px] text-slate-500">
-                    Click or drop <Mono>db.sqlite</Mono> /{" "}
-                    <Mono>db.sqlite.encrypted</Mono>, <Mono>.json</Mono>, or{" "}
-                    <Mono>config</Mono>. For the legacy two-file format, select{" "}
-                    <Mono>db.sqlite.encrypted</Mono> together with its{" "}
-                    <Mono>.meta</Mono> file.
+                    Select files from your device or iCloud Drive, including a{" "}
+                    <Mono>.zip</Mono> of supported exports. For Termix&apos;s legacy
+                    encrypted database, select the <Mono>.meta</Mono> too. Files
+                    are read locally; no iCloud account is connected.
                   </div>
                   <input
                     type="file"
                     multiple
-                    accept=".sqlite,.sqlite3,.db,.encrypted,.meta,.json,.txt,.cfg,.conf,*"
+                    accept=".sqlite,.sqlite3,.db,.encrypted,.meta,.json,.txt,.cfg,.conf,.csv,.reg,.ini,.mxtsessions,.moba,.xsh,.yaml,.yml,.pem,.key,.ppk,.priv,.privkey,.openssh,.zip,*"
                     onChange={handleSelectTermixFile}
                     className="hidden"
                   />
@@ -854,7 +868,7 @@ export function VaultSecurityModal({
                       <textarea
                         id="termix-env"
                         value={sqliteEnv}
-                        onChange={(e) => setSqliteEnv(e.target.value)}
+                        onChange={(e) => { envRequest.current++; setSqliteEnv(e.target.value); }}
                         rows={3}
                         spellCheck={false}
                         autoComplete="off"
@@ -1104,12 +1118,11 @@ export function VaultSecurityModal({
                         {importingTermix && (
                           <Loader2 className="h-3.5 w-3.5 animate-spin" />
                         )}
-                        Merge into Sushi ({hosts.length + termixPreview.hosts.length}{" "}
-                        total)
+                        Merge into Sushi
                       </button>
                       <button
                         type="button"
-                        disabled={importingTermix}
+                        disabled={importingTermix || termixPreview.hosts.length === 0}
                         onClick={() => handleConfirmTermixImport(true)}
                         className="inline-flex items-center gap-1.5 rounded-xl border border-white/12 bg-white/5 px-3.5 py-2 text-xs font-medium text-slate-200 transition hover:bg-white/10 disabled:opacity-50"
                       >
@@ -1429,25 +1442,54 @@ export function VaultSecurityModal({
                 </div>
               </form>
 
-              <div className="space-y-2.5 border-t border-white/8 pt-4">
+              <div className="space-y-3 border-t border-white/8 pt-4">
                 <span className="block text-xs font-semibold uppercase tracking-wider text-slate-400">
-                  Encrypted Sushi Backup (.enc.json)
+                  Portable Encrypted Sushi Backup
                 </span>
+                <p className="text-[11px] leading-relaxed text-slate-400">
+                  Choose a backup passphrase to restore on another device. It does
+                  not change your vault passphrase. Save the downloaded file to
+                  iCloud Drive or another location you control; Sushi does not sign
+                  in to iCloud or read Apple device backups directly.
+                </p>
+                <div className="grid gap-2 sm:grid-cols-2">
+                  <label className="sr-only" htmlFor="backup-passphrase">Backup passphrase</label>
+                  <input
+                    id="backup-passphrase"
+                    type="password"
+                    value={backupPass}
+                    onChange={(e) => setBackupPass(e.target.value)}
+                    autoComplete="new-password"
+                    placeholder="Backup passphrase (min 8 chars)"
+                    className="w-full rounded-xl border border-white/10 bg-[#151a24] px-3 py-2 text-xs text-white placeholder-slate-500 focus:border-[#ff6b57] focus:outline-none"
+                  />
+                  <label className="sr-only" htmlFor="backup-confirm">Confirm backup passphrase</label>
+                  <input
+                    id="backup-confirm"
+                    type="password"
+                    value={backupConfirm}
+                    onChange={(e) => setBackupConfirm(e.target.value)}
+                    autoComplete="new-password"
+                    placeholder="Confirm backup passphrase"
+                    className="w-full rounded-xl border border-white/10 bg-[#151a24] px-3 py-2 text-xs text-white placeholder-slate-500 focus:border-[#ff6b57] focus:outline-none"
+                  />
+                </div>
                 <div className="flex flex-wrap gap-2">
                   <button
                     type="button"
-                    onClick={handleExportSushiEnvelope}
-                    className="inline-flex items-center gap-1.5 rounded-xl border border-white/10 bg-[#151a24] px-3.5 py-2 text-xs font-medium text-slate-200 hover:bg-white/10"
+                    disabled={exportingBackup}
+                    onClick={() => void handleExportSushiEnvelope()}
+                    className="inline-flex items-center gap-1.5 rounded-xl border border-white/10 bg-[#151a24] px-3.5 py-2 text-xs font-medium text-slate-200 hover:bg-white/10 disabled:opacity-50"
                   >
-                    <Download className="h-3.5 w-3.5" />
-                    Export Encrypted Vault
+                    {exportingBackup ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Download className="h-3.5 w-3.5" />}
+                    Download Portable Backup
                   </button>
                   <label className="inline-flex cursor-pointer items-center gap-1.5 rounded-xl border border-white/10 bg-[#151a24] px-3.5 py-2 text-xs font-medium text-slate-200 hover:bg-white/10">
                     <Upload className="h-3.5 w-3.5" />
-                    Import Encrypted Vault
+                    Choose Backup to Restore
                     <input
                       type="file"
-                      accept=".json"
+                      accept=".json,.zip,*"
                       onChange={handleImportSushiEnvelopeFile}
                       className="hidden"
                     />
@@ -1456,38 +1498,54 @@ export function VaultSecurityModal({
 
                 {pendingImport && (
                   <div className="mt-3 space-y-2 rounded-xl border border-amber-500/30 bg-amber-500/10 p-3">
-                    <input
-                      type="password"
-                      value={importPass}
-                      onChange={(e) => setImportPass(e.target.value)}
-                      placeholder="Enter backup master passphrase"
-                      className="w-full rounded-lg border border-white/10 bg-[#0d1118] px-3 py-1.5 text-xs text-white focus:outline-none"
-                    />
-                    <button
-                      type="button"
-                      onClick={async () => {
-                        try {
-                          await onImportEnvelope(pendingImport, importPass);
-                          setPendingImport(null);
-                          setImportPass("");
-                          setStatus({
-                            ok: true,
-                            msg: "Encrypted backup unlocked & imported!",
-                          });
-                        } catch (err) {
-                          setStatus({
-                            ok: false,
-                            msg:
-                              err instanceof Error
-                                ? err.message
-                                : "Incorrect passphrase.",
-                          });
-                        }
-                      }}
-                      className="rounded-lg bg-amber-500 px-3 py-1.5 text-xs font-semibold text-black hover:bg-amber-400"
-                    >
-                      Unlock &amp; Import Backup
-                    </button>
+                    <div className="text-xs text-amber-100">
+                      Restore <strong>{pendingImportName}</strong>? This replaces all current hosts, keys, and snippets.
+                    </div>
+                    {pendingImport.mode === "passphrase" ? (
+                      <input
+                        type="password"
+                        value={importPass}
+                        onChange={(e) => setImportPass(e.target.value)}
+                        placeholder="Enter backup passphrase"
+                        autoComplete="current-password"
+                        aria-label="Backup passphrase to restore"
+                        className="w-full rounded-lg border border-white/10 bg-[#0d1118] px-3 py-1.5 text-xs text-white focus:outline-none"
+                      />
+                    ) : (
+                      <p className="text-[11px] text-amber-200">Device-key backups can only be opened by their original browser.</p>
+                    )}
+                    <div className="flex gap-2">
+                      <button
+                        type="button"
+                        disabled={restoringBackup}
+                        onClick={async () => {
+                          if (!window.confirm("Replace the current vault with this backup? Existing hosts, keys, and snippets will be overwritten.")) return;
+                          setRestoringBackup(true);
+                          try {
+                            await onImportEnvelope(pendingImport, importPass);
+                            setPendingImport(null);
+                            setPendingImportName("");
+                            setImportPass("");
+                            setStatus({ ok: true, msg: "Encrypted backup restored." });
+                          } catch (err) {
+                            setStatus({ ok: false, msg: err instanceof Error ? err.message : "Could not restore backup." });
+                          } finally {
+                            setRestoringBackup(false);
+                          }
+                        }}
+                        className="rounded-lg bg-amber-500 px-3 py-1.5 text-xs font-semibold text-black hover:bg-amber-400 disabled:opacity-50"
+                      >
+                        {restoringBackup ? "Restoring…" : "Restore and Replace Vault"}
+                      </button>
+                      <button
+                        type="button"
+                        disabled={restoringBackup}
+                        onClick={() => { setPendingImport(null); setPendingImportName(""); setImportPass(""); }}
+                        className="rounded-lg border border-white/10 px-3 py-1.5 text-xs text-slate-200 hover:bg-white/10"
+                      >
+                        Cancel
+                      </button>
+                    </div>
                   </div>
                 )}
               </div>

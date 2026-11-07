@@ -5,6 +5,7 @@ import type {
   RdpSecurityMode,
   WhitelistedSshKey,
 } from "@/types/connection";
+import { isEncryptionFlag, isUnavailableSecret } from "./import-secrets";
 import { randomUUID } from "./web-crypto";
 
 /**
@@ -73,12 +74,26 @@ export interface TermixImportSummary {
   sshKeys: WhitelistedSshKey[];
   /** Command snippets (Termix SQLite databases include the `snippets` table). */
   snippets?: CommandSnippet[];
+  /** Local key references, used only to match explicitly selected key files. */
+  keyReferences?: Record<string, string>;
   detectedFormat:
     | "termix-host-export"
     | "termix-user-data-v2"
     | "termix-sqlite"
     | "ssh-config"
-    | "sushi-hosts";
+    | "sushi-hosts"
+    | "ssh-csv"
+    | "ssh-json"
+    | "putty-reg"
+    | "winscp-ini"
+    | "mobaxterm"
+    | "tabby"
+    | "xshell"
+    | "securecrt"
+    | "sshborg"
+    | "seven-term"
+    | "ssh-keys"
+    | "multiple-files";
   warnings: string[];
 }
 
@@ -91,7 +106,7 @@ function asValidPort(v: unknown): number | undefined {
     typeof v === "number"
       ? v
       : typeof v === "string"
-        ? Number.parseInt(v, 10)
+        ? Number(v)
         : NaN;
   return Number.isInteger(num) && num >= 1 && num <= 65535 ? num : undefined;
 }
@@ -105,6 +120,13 @@ function asBool(v: unknown, fallback = false): boolean {
     if (["false", "0", "no", "off"].includes(s)) return false;
   }
   return fallback;
+}
+
+function hasSetting(value: unknown): boolean {
+  if (Array.isArray(value)) return value.length > 0;
+  if (value && typeof value === "object") return Object.keys(value).length > 0;
+  if (typeof value === "string") return !["", "0", "false", "none", "[]"].includes(value.trim().toLowerCase());
+  return Boolean(value);
 }
 
 function normalizeTags(v: unknown): string[] {
@@ -224,6 +246,7 @@ export function importFromTermixContent(
   }
 
   const warnings: string[] = [];
+  let encryptedSecrets = false;
   let rawHosts: Record<string, unknown>[] = [];
   let rawCredentials: Record<string, unknown>[] = [];
   let detectedFormat: TermixImportSummary["detectedFormat"] =
@@ -243,16 +266,18 @@ export function importFromTermixContent(
       );
     }
 
+    const meta = (obj.metadata && typeof obj.metadata === "object" ? obj.metadata : {}) as Record<string, unknown>;
+    if (isEncryptionFlag(obj.encrypted) || isEncryptionFlag(meta.encrypted)) {
+      encryptedSecrets = true;
+      warnings.push(
+        "This Termix export is marked encrypted. Host addresses were imported, but re-export plaintext from Termix to include passwords and private keys."
+      );
+    }
+
     // Format A: Termix User Data Export v2.0 (`userData.sshHosts` + `userData.sshCredentials`)
     if (obj.userData && typeof obj.userData === "object") {
       detectedFormat = "termix-user-data-v2";
       const ud = obj.userData as Record<string, unknown>;
-      const meta = (obj.metadata as Record<string, unknown> | undefined) || {};
-      if (meta.encrypted === true) {
-        warnings.push(
-          "This Termix v2.0 User Data file was exported with 'encrypted: true' (sealed with Termix's internal DB key). Host addresses were imported, but re-export from Termix Hosts Export (plaintext) to include passwords and private keys."
-        );
-      }
       if (Array.isArray(ud.sshHosts)) {
         rawHosts = ud.sshHosts.filter(
           (x): x is Record<string, unknown> => Boolean(x && typeof x === "object")
@@ -281,6 +306,23 @@ export function importFromTermixContent(
     throw new Error("No hosts or SSH credentials found in the Termix file.");
   }
 
+  if (rawHosts.length > 10000 || rawCredentials.length > 10000) throw new Error("Termix exports are limited to 10,000 hosts and credentials per file.");
+
+  const unavailableWarning = "Some credentials are encrypted or reference another secret store and were not imported. Enter them in Sushi after import.";
+  const plaintextSecret = (value: unknown, flagged = false): string | undefined => {
+    const text = asCleanString(value);
+    if (!text) return undefined;
+    if (encryptedSecrets || flagged || isUnavailableSecret(value)) {
+      if (!encryptedSecrets && !warnings.includes(unavailableWarning)) warnings.push(unavailableWarning);
+      return undefined;
+    }
+    return text;
+  };
+
+  const isPrivateKeyMaterial = (value: string | undefined) => Boolean(value && (/-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----/.test(value) || /^PuTTY-User-Key-File-\d+:/i.test(value)));
+  const keyReferences: Record<string, string> = Object.create(null);
+  const missingKeyWarning = "Some hosts reference a private key or SSH agent that cannot be read from the export. Add the key to Sushi and select it for those hosts.";
+
   // 1. Import Termix reusable credentials into Sushi's Whitelisted SSH Keychain
   const newSshKeys: WhitelistedSshKey[] = [];
   const credByIdOrAlias = new Map<
@@ -289,6 +331,7 @@ export function importFromTermixContent(
       username?: string;
       password?: string;
       privateKey?: string;
+      keyReference?: string;
       passphrase?: string;
       sshKeyId?: string;
       authType: "password" | "key";
@@ -325,17 +368,20 @@ export function importFromTermixContent(
       asCleanString(cred.name) ||
       `Termix Key ${newSshKeys.length + 1}`;
     const credId = cred.id !== undefined && cred.id !== null ? String(cred.id) : undefined;
-    const privKey =
-      asCleanString(cred.key) || asCleanString(cred.privateKey);
-    const keyPass =
-      asCleanString(cred.keyPassword) || asCleanString(cred.passphrase);
-    const pass = asCleanString(cred.password);
+    const allSealed = isEncryptionFlag(cred.encrypted) || isEncryptionFlag(cred.isEncrypted) || isEncryptionFlag(cred.secretsEncrypted);
+    const rawKey = plaintextSecret(cred.key, allSealed || isEncryptionFlag(cred.privateKeyEncrypted)) ||
+      plaintextSecret(cred.privateKey, allSealed || isEncryptionFlag(cred.privateKeyEncrypted));
+    const privKey = isPrivateKeyMaterial(rawKey) ? rawKey : undefined;
+    const keyReference = !privKey ? rawKey || asCleanString(cred.privateKeyPath) || asCleanString(cred.identityFile) : undefined;
+    const keyPass = plaintextSecret(cred.keyPassword, allSealed || isEncryptionFlag(cred.passphraseEncrypted)) ||
+      plaintextSecret(cred.passphrase, allSealed || isEncryptionFlag(cred.passphraseEncrypted));
+    const pass = plaintextSecret(cred.password, allSealed || isEncryptionFlag(cred.passwordEncrypted));
     const user = asCleanString(cred.username);
     const authType =
-      cred.authType === "key" || Boolean(privKey) ? "key" : "password";
+      ["key", "privatekey"].includes((asCleanString(cred.authType) || "").toLowerCase()) || Boolean(privKey || keyReference) ? "key" : "password";
 
     let sshKeyId: string | undefined;
-    if (privKey && privKey.includes(" PRIVATE KEY")) {
+    if (privKey) {
       sshKeyId = findOrRegisterWhitelistedKey(
         privKey,
         alias,
@@ -348,6 +394,7 @@ export function importFromTermixContent(
       username: user,
       password: pass,
       privateKey: privKey,
+      keyReference,
       passphrase: keyPass,
       sshKeyId,
       authType: authType as "password" | "key",
@@ -377,6 +424,11 @@ export function importFromTermixContent(
       continue;
     }
 
+    if (/[\s/\\?#*%$]/.test(hostname) || hostname.includes("://")) {
+      warnings.push(`Skipped host "${asCleanString(row.name) || "Unnamed"}": invalid address.`);
+      continue;
+    }
+
     // Determine protocol from Termix connectionType or legacy enable<Proto> flags
     const rawConnType = (
       asCleanString(row.connectionType) ||
@@ -386,18 +438,27 @@ export function importFromTermixContent(
       "ssh"
     ).toLowerCase();
 
-    let protocol: ProtocolType = "ssh";
+    let protocol: ProtocolType;
     if (rawConnType.includes("rdp")) {
       protocol = "rdp";
     } else if (rawConnType.includes("sftp") || rawConnType.includes("file")) {
       protocol = "sftp";
+    } else if (rawConnType === "ssh" || rawConnType === "ssh2" || rawConnType === "scp") {
+      protocol = "ssh";
+      if (rawConnType === "scp" && !warnings.includes("SCP entries are imported as SSH; Sushi's file browser requires SFTP on the server.")) {
+        warnings.push("SCP entries are imported as SSH; Sushi's file browser requires SFTP on the server.");
+      }
+    } else {
+      warnings.push(`Skipped host "${asCleanString(row.name) || hostname}": its protocol is not SSH, SFTP, SCP, or RDP.`);
+      continue;
     }
 
-    const port =
-      asValidPort(row.port) ||
-      (protocol === "rdp"
-        ? asValidPort(row.rdpPort) || 3389
-        : asValidPort(row.sshPort) || 22);
+    const suppliedPort = row.port ?? (protocol === "rdp" ? row.rdpPort : row.sshPort);
+    if (suppliedPort !== undefined && suppliedPort !== null && suppliedPort !== "" && !asValidPort(suppliedPort)) {
+      warnings.push(`Skipped host "${asCleanString(row.name) || hostname}": invalid port.`);
+      continue;
+    }
+    const port = asValidPort(suppliedPort) || (protocol === "rdp" ? 3389 : 22);
 
     // Check linked Termix credential (`credentialId` or `credentialAlias`)
     const credLookup =
@@ -428,17 +489,24 @@ export function importFromTermixContent(
       (protocol === "rdp" ? asCleanString(rdpProtoAuth.username) : undefined) ||
       credLookup?.username ||
       asCleanString(row.username) ||
-      asCleanString(row.user) ||
-      (protocol === "rdp" ? "Administrator" : "root");
+      asCleanString(row.user) || "";
+    if (!username && !warnings.includes("Some hosts have no username in the export. Edit them before connecting.")) warnings.push("Some hosts have no username in the export. Edit them before connecting.");
 
-    const inlineKey =
-      asCleanString(row.key) || asCleanString(row.privateKey);
-    const inlineKeyPass =
-      asCleanString(row.keyPassword) || asCleanString(row.passphrase);
-    const inlinePassword =
-      (protocol === "rdp" ? asCleanString(rdpProtoAuth.password) : undefined) ||
-      asCleanString(row.password) ||
-      credLookup?.password;
+    const allSealed = isEncryptionFlag(row.encrypted) || isEncryptionFlag(row.isEncrypted) || isEncryptionFlag(row.secretsEncrypted);
+    const keyFlagged = allSealed || isEncryptionFlag(row.privateKeyEncrypted);
+    const inlineKeyBlocked = [row.key, row.privateKey].some((value) => Boolean(asCleanString(value)) && (keyFlagged || isUnavailableSecret(value)));
+    const inlineRawKey = plaintextSecret(row.key, keyFlagged) || plaintextSecret(row.privateKey, keyFlagged);
+    const inlineKey = isPrivateKeyMaterial(inlineRawKey) ? inlineRawKey : undefined;
+    const inlineKeyReference = !inlineKey ? inlineRawKey || asCleanString(row.privateKeyPath) || asCleanString(row.identityFile) : undefined;
+    const keyPassFlagged = allSealed || isEncryptionFlag(row.passphraseEncrypted);
+    const inlinePassBlocked = [row.keyPassword, row.passphrase].some((value) => Boolean(asCleanString(value)) && (keyPassFlagged || isUnavailableSecret(value)));
+    const inlineKeyPass = plaintextSecret(row.keyPassword, keyPassFlagged) || plaintextSecret(row.passphrase, keyPassFlagged);
+    const passwordFlagged = allSealed || isEncryptionFlag(row.passwordEncrypted);
+    const rdpPasswordFlagged = allSealed || isEncryptionFlag(rdpProtoAuth.encrypted) || isEncryptionFlag(rdpProtoAuth.passwordEncrypted);
+    const inlinePasswordBlocked = (Boolean(asCleanString(row.password)) && (passwordFlagged || isUnavailableSecret(row.password))) ||
+      (protocol === "rdp" && Boolean(asCleanString(rdpProtoAuth.password)) && (rdpPasswordFlagged || isUnavailableSecret(rdpProtoAuth.password)));
+    const inlinePassword = (protocol === "rdp" ? plaintextSecret(rdpProtoAuth.password, rdpPasswordFlagged) : undefined) ||
+      plaintextSecret(row.password, passwordFlagged) || (!inlinePasswordBlocked ? credLookup?.password : undefined);
 
     const rawAuthType = (
       asCleanString(row.authType) ||
@@ -450,20 +518,29 @@ export function importFromTermixContent(
       protocol !== "rdp" &&
       (rawAuthType === "key" ||
         rawAuthType === "privatekey" ||
-        Boolean(inlineKey) ||
+        Boolean(inlineKey || inlineKeyReference || inlineKeyBlocked) ||
         credLookup?.authType === "key");
 
-    const effectiveKey = inlineKey || credLookup?.privateKey;
-    const effectivePassphrase = inlineKeyPass || credLookup?.passphrase;
-    let sshKeyId = credLookup?.sshKeyId;
+    const hasInlineKey = Boolean(inlineKey || inlineKeyReference || inlineKeyBlocked);
+    const effectiveKey = inlineKey || (!hasInlineKey ? credLookup?.privateKey : undefined);
+    const effectiveReference = inlineKeyReference || (!hasInlineKey ? credLookup?.keyReference : undefined);
+    const effectivePassphrase = inlineKeyPass || (!inlinePassBlocked ? credLookup?.passphrase : undefined);
+    let sshKeyId = inlineKeyBlocked || inlineKeyReference || (inlineKey && inlineKey !== credLookup?.privateKey) ? undefined : credLookup?.sshKeyId;
 
     const displayName =
       asCleanString(row.name) ||
       asCleanString(row.label) ||
       `${username}@${hostname}`;
+    const hasRoute = [row.proxyJump, row.jumpHost, row.jumpHostId, row.jumpHosts, row.proxyCommand,
+      row.proxyHost, row.proxy, row.gateway, row.socks5Host, row.useSocks5].some(hasSetting);
+    const routeWarning = "Some hosts use a proxy or jump host. Sushi does not import that route; review the host before connecting directly.";
+    if (hasRoute && !warnings.includes(routeWarning)) warnings.push(routeWarning);
+    const hasForwards = [row.forwardedPorts, row.portForwardings, row.localForward, row.remoteForward, row.dynamicForward, row.tunnels].some(hasSetting);
+    const forwardWarning = "Some port forwards or tunnels were not imported.";
+    if (hasForwards && !warnings.includes(forwardWarning)) warnings.push(forwardWarning);
 
     // Automatically register inline private keys in Whitelisted Keychain so whitelist mode works seamlessly
-    if (usesKey && effectiveKey && effectiveKey.includes(" PRIVATE KEY") && !sshKeyId) {
+    if (usesKey && effectiveKey && !sshKeyId) {
       sshKeyId = findOrRegisterWhitelistedKey(
         effectiveKey,
         `${displayName} Key`,
@@ -483,8 +560,14 @@ export function importFromTermixContent(
       ? (rdpSecRaw as RdpSecurityMode)
       : "any";
 
+    const hostId = randomUUID();
+    if (usesKey && !effectiveKey) {
+      keyReferences[hostId] = effectiveReference || "";
+      if (!warnings.includes(missingKeyWarning)) warnings.push(missingKeyWarning);
+    }
+    if (effectiveKey?.startsWith("PuTTY-User-Key-File-") && !warnings.includes("PuTTY keys are supported only for .ppk v2 RSA. Convert other .ppk keys to OpenSSH with PuTTYgen.")) warnings.push("PuTTY keys are supported only for .ppk v2 RSA. Convert other .ppk keys to OpenSSH with PuTTYgen.");
     importedHosts.push({
-      id: randomUUID(),
+      id: hostId,
       name: displayName,
       protocol,
       host: hostname,
@@ -515,7 +598,8 @@ export function importFromTermixContent(
       tags: normalizeTags(row.tags),
       accentColor:
         asCleanString(row.accentColor) || defaultColorForProtocol(protocol),
-      notes: asCleanString(row.notes),
+      notes: [asCleanString(row.notes), effectiveReference ? `Original key reference: ${effectiveReference}` : undefined, hasRoute ? "Proxy/jump settings were not imported. Review the connection route." : undefined]
+        .filter(Boolean).join("\n") || undefined,
       createdAt: now,
       updatedAt: now,
     });
@@ -524,6 +608,7 @@ export function importFromTermixContent(
   return {
     hosts: importedHosts,
     sshKeys: newSshKeys,
+    keyReferences,
     detectedFormat,
     warnings,
   };

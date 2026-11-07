@@ -636,19 +636,26 @@ export function HostProfileModal({
                         placeholder="-----BEGIN OPENSSH PRIVATE KEY-----&#10;..."
                         className="font-mono-code w-full rounded-xl border border-white/10 bg-[#0b0e14] p-3 text-xs text-slate-200 placeholder-slate-600 outline-none focus:border-white/25"
                       />
-                      <div>
-                        <label className="mb-1 block text-xs text-slate-400">
-                          Key Passphrase (optional)
-                        </label>
-                        <input
-                          type="password"
-                          value={passphrase}
-                          onChange={(e) => setPassphrase(e.target.value)}
-                          placeholder="Leave empty if unencrypted"
-                          className="w-full rounded-xl border border-white/10 bg-[#0b0e14] px-3.5 py-2 text-sm text-white placeholder-slate-500 outline-none focus:border-white/25"
-                        />
-                      </div>
                     </>
+                  )}
+                  {(!sshKeyId || !sshKeys.find((key) => key.id === sshKeyId)?.passphrase) && (
+                    <div>
+                      <label className="mb-1 block text-xs text-slate-400">
+                        Key Passphrase (optional)
+                      </label>
+                      <input
+                        type="password"
+                        value={passphrase}
+                        onChange={(e) => setPassphrase(e.target.value)}
+                        placeholder="Leave empty if unencrypted"
+                        className="w-full rounded-xl border border-white/10 bg-[#0b0e14] px-3.5 py-2 text-sm text-white placeholder-slate-500 outline-none focus:border-white/25"
+                      />
+                      {sshKeyId && (
+                        <p className="mt-1 text-[11px] text-slate-500">
+                          Used for this host when the selected key has no saved passphrase.
+                        </p>
+                      )}
+                    </div>
                   )}
                 </div>
               )}

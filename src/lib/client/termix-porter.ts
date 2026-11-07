@@ -90,6 +90,8 @@ export interface TermixImportSummary {
     | "tabby"
     | "xshell"
     | "securecrt"
+    | "securecrt-xml"
+    | "mremoteng"
     | "sshborg"
     | "seven-term"
     | "ssh-keys"

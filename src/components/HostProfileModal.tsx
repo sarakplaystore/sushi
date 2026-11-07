@@ -89,6 +89,7 @@ export function HostProfileModal({
   // "auto" = keep whatever the browser's last RDP session used.
   const [rdpQuality, setRdpQuality] = useState<"auto" | RdpPerformance>("auto");
   const [rdpAudio, setRdpAudio] = useState(true);
+  const [rdpDrive, setRdpDrive] = useState<"auto" | "on" | "off">("auto");
   const [initialPath, setInitialPath] = useState("");
   const [group, setGroup] = useState("Production");
   const [accentColor, setAccentColor] = useState("#34d399");
@@ -121,6 +122,7 @@ export function HostProfileModal({
     setRdpHeight(initialProfile?.rdpHeight || 720);
     setRdpQuality(initialProfile?.rdpPerformance || "auto");
     setRdpAudio(initialProfile?.rdpAudio !== false);
+    setRdpDrive(initialProfile?.rdpDrive === undefined ? "auto" : initialProfile.rdpDrive ? "on" : "off");
     setInitialPath(initialProfile?.initialPath || "");
     setGroup(initialProfile?.group || "Production");
     setAccentColor(
@@ -232,6 +234,7 @@ export function HostProfileModal({
       rdpHeight: protocol === "rdp" ? rdpHeight : undefined,
       rdpPerformance: protocol === "rdp" && rdpQuality !== "auto" ? rdpQuality : undefined,
       rdpAudio: protocol === "rdp" ? rdpAudio : undefined,
+      rdpDrive: protocol === "rdp" && rdpDrive !== "auto" ? rdpDrive === "on" : undefined,
       initialPath: protocol === "sftp" ? initialPath.trim() : undefined,
       group: group.trim() || "Servers",
       accentColor,
@@ -775,6 +778,24 @@ export function HostProfileModal({
                     Play the desktop&apos;s audio in the browser
                   </label>
                 </div>
+              </div>
+              <div>
+                <label htmlFor="rdp-drive-setting" className="mb-1 block text-xs text-slate-400">
+                  File-transfer drive
+                </label>
+                <select
+                  id="rdp-drive-setting"
+                  value={rdpDrive}
+                  onChange={(e) => setRdpDrive(e.target.value as "auto" | "on" | "off")}
+                  className="w-full rounded-xl border border-white/10 bg-[#0b0e14] px-3 py-2 text-sm text-white outline-none focus:border-white/25"
+                >
+                  <option value="auto">Auto (last used in this browser)</option>
+                  <option value="on">Enabled</option>
+                  <option value="off">Disabled</option>
+                </select>
+                <p className="mt-1 text-[11px] text-slate-500">
+                  Controls the Sushi transfer drive exposed to the remote desktop.
+                </p>
               </div>
             </div>
           )}

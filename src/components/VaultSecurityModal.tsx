@@ -764,7 +764,7 @@ export function VaultSecurityModal({
                     <p className="mt-0.5 text-[11px] text-slate-400">
                       Import Termix, OpenSSH config, Termius-compatible CSV, PuTTY
                       registry exports, MobaXterm, WinSCP, Tabby, Xshell, SecureCRT,
-                      SSHBorg, 7 Term, or a supported SSH host JSON. Select private key files with the
+                      mRemoteNG, SSHBorg, 7 Term, or a supported SSH host JSON. Select private key files with the
                       export to add and match them. Preview warnings before importing.
                     </p>
                   </div>
@@ -799,7 +799,7 @@ export function VaultSecurityModal({
                   <input
                     type="file"
                     multiple
-                    accept=".sqlite,.sqlite3,.db,.encrypted,.meta,.json,.txt,.cfg,.conf,.csv,.reg,.ini,.mxtsessions,.moba,.xsh,.yaml,.yml,.pem,.key,.ppk,.priv,.privkey,.openssh,.zip,*"
+                    accept=".sqlite,.sqlite3,.db,.encrypted,.meta,.json,.xml,.txt,.cfg,.conf,.csv,.reg,.ini,.mxtsessions,.moba,.xsh,.yaml,.yml,.pem,.key,.ppk,.priv,.privkey,.openssh,.zip,*"
                     onChange={handleSelectTermixFile}
                     className="hidden"
                   />

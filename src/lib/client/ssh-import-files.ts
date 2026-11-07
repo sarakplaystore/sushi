@@ -32,7 +32,7 @@ export function isZipFile(file: SelectedImportFile): boolean {
 
 function looksLikeImportEntry(name: string): boolean {
   const base = name.split(/[\\/]/).pop() || "";
-  return /\.(json|csv|reg|ini|mxtsessions|moba|xsh|yaml|yml|cfg|conf|txt|sqlite3?|db|encrypted|meta|pem|key|ppk|priv|privkey|openssh)$/i.test(base) ||
+  return /\.(json|xml|csv|reg|ini|mxtsessions|moba|xsh|yaml|yml|cfg|conf|txt|sqlite3?|db|encrypted|meta|pem|key|ppk|priv|privkey|openssh)$/i.test(base) ||
     /^(?:\.env|termix\.env)$/i.test(base) ||
     // OpenSSH configs and private keys can have arbitrary extensionless names.
     Boolean(base && !base.includes("."));

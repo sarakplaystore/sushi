@@ -2,6 +2,7 @@ import { parse as parseYaml } from "yaml";
 import type { HostProfile, ProtocolType, WhitelistedSshKey } from "@/types/connection";
 import { importFromTermixContent, type TermixImportSummary } from "./termix-porter";
 import { isEncryptionFlag, isUnavailableSecret } from "./import-secrets";
+import { parseClientXml } from "./ssh-import-xml";
 import { randomUUID } from "./web-crypto";
 
 /** Importers read only the files the user picks. They never run commands or follow paths. */
@@ -27,6 +28,8 @@ interface ImportRow {
   notes?: unknown;
   initialPath?: unknown;
   domain?: unknown;
+  ignoreCert?: boolean;
+  rdpDrive?: boolean;
   route?: boolean;
   forwards?: boolean;
   agent?: boolean;
@@ -217,6 +220,8 @@ class ImportBuilder {
       passphrase: usesKey ? passphrase : undefined, sshKeyId: usesKey ? sshKeyId : undefined,
       group: group || "Imported", tags: list(row.tags), notes: notes || undefined,
       domain: protocol === "rdp" ? clean(row.domain) : undefined,
+      ignoreCert: protocol === "rdp" ? row.ignoreCert : undefined,
+      rdpDrive: protocol === "rdp" ? row.rdpDrive : undefined,
       initialPath: protocol === "sftp" ? clean(row.initialPath) : undefined,
       accentColor: protocol === "rdp" ? "#ff6b57" : protocol === "sftp" ? "#38bdf8" : "#34d399",
       createdAt: now, updatedAt: now,
@@ -609,6 +614,18 @@ function importJson(parsed: unknown, raw: string, existingKeys: WhitelistedSshKe
 export function importSshClientText(text: string, filename = "", existingKeys: WhitelistedSshKey[] = []): TermixImportSummary {
   const trimmed = text.replace(/^\uFEFF/, "").trim();
   if (!trimmed) throw new Error("The selected import file is empty.");
+  // Older mRemoteNG full-file encryption can replace the entire XML with base64,
+  // rather than leaving a Connections element with FullFileEncryption="True".
+  if (/\.xml$/i.test(filename) && trimmed.length >= 128 && /^[a-z0-9+/=\s]+$/i.test(trimmed)) {
+    throw new Error("This file is not plaintext XML and may be a fully encrypted mRemoteNG connection file. Open it in mRemoteNG and export unencrypted connection settings first.");
+  }
+  if (trimmed.startsWith("<")) {
+    const parsed = parseClientXml(trimmed);
+    const builder = new ImportBuilder(existingKeys);
+    for (const warning of parsed.warnings) builder.warn(warning);
+    for (const row of parsed.rows) builder.add(row);
+    return builder.result(parsed.format);
+  }
   if (/^Windows Registry Editor|^REGEDIT4|\[HKEY_[^\]]*\\PuTTY\\Sessions\\/im.test(trimmed)) return importPutty(trimmed, existingKeys);
   if (/^\[Bookmarks(?:_\d+)?\]/im.test(trimmed) || /\.moba$/i.test(filename)) return importMoba(trimmed, existingKeys);
   if (/^\[Sessions\\/im.test(trimmed)) return importWinScp(trimmed, existingKeys);
@@ -628,5 +645,5 @@ export function importSshClientText(text: string, filename = "", existingKeys: W
   }
   if (/\.csv$/i.test(filename) || /^(?:groups?|name|label|hostname(?:\/ip)?|host|address|ip)(?:,|\s*,)/i.test(trimmed)) return importCsv(text, existingKeys);
   if (/^\s*Host(?:\s+|\s*=)/im.test(trimmed)) return importOpenSsh(trimmed, existingKeys);
-  throw new Error("Unrecognized SSH client export. Use a supported CSV, JSON, OpenSSH config, PuTTY, MobaXterm, WinSCP, Tabby, Xshell, or SecureCRT file.");
+  throw new Error("Unrecognized SSH client export. Use a supported CSV, JSON, OpenSSH config, PuTTY, MobaXterm, WinSCP, Tabby, Xshell, SecureCRT, or mRemoteNG file.");
 }

@@ -15,7 +15,7 @@ It is designed around a **Hybrid VPS + Serverless Architecture**:
   - **Whitelisted Private Key Login & SSH Keychain**: Sign in to Sushi using an `ed25519` / `rsa` / `ecdsa` private key verified via cryptographic challenge signature against whitelisted public keys, and optionally enforce a strict **Vault SSH Key Whitelist** across all SSH/SFTP server connections
   - **FIDO2 / WebAuthn Passkeys** (`@simplewebauthn/server` & `@simplewebauthn/browser`) for Touch ID, Face ID, Windows Hello, and YubiKey
 - **SSH Client Import & Export**
-  - Import OpenSSH config, Termius-compatible CSV, PuTTY registry exports, MobaXterm, WinSCP, Tabby, Xshell, SecureCRT sessions, SSHBorg and 7 Term backups, and simple SSH-host JSON, plus Termix (`Termix-SSH/Termix`) JSON and SQLite databases
+  - Import OpenSSH config, Termius-compatible CSV, PuTTY registry exports, MobaXterm, WinSCP, Tabby, Xshell, SecureCRT sessions, mRemoteNG connections, SSHBorg and 7 Term backups, and simple SSH-host JSON, plus Termix (`Termix-SSH/Termix`) JSON and SQLite databases
   - Select files or supported ZIPs from the device or iCloud Drive, review warnings, then merge or replace hosts. Export to Termix JSON with or without secrets.
 - **SSH Terminal (`@xterm/xterm` + `ssh2`)**
   - Live bidirectional **WebSocket PTY** (`/ws/ssh`) on VPS/Gateway (`vim`, `htop`, `tmux`, resize, 256-color ANSI)
@@ -65,7 +65,8 @@ keeping existing keys and snippets.
 | WinSCP | `WinSCP.ini` SFTP or SCP session sections. SCP-only entries become SSH profiles; Sushi's file browser needs SFTP. |
 | Tabby | Unencrypted `config.yaml` SSH profiles and `profileDefaults.ssh`. |
 | Xshell | `.xsh` SSH/SFTP session files (select multiple files together). |
-| SecureCRT | Per-session typed `.ini` files (SSH2 only). Passwords are encrypted and are not imported; XML settings exports are not supported. |
+| SecureCRT | Per-session typed `.ini` files, or **Tools → Export Settings → Sessions** XML (SSH2 sessions only). Folder names, usernames, ports, and key-file references are imported; stored passwords and global settings are not. |
+| mRemoteNG | Plaintext connection-settings XML, such as `confCons.xml` (SSH2 and RDP only), including supported folder inheritance. Full-file encrypted XML must first be opened and exported without full-file encryption in mRemoteNG. Encrypted passwords and PuTTY session settings are not imported. |
 | SSHBorg for iOS / Android | Host-backup JSON (`hosts`, `groups`, `exported_at`). Backups omit credentials and host keys; key labels, jumps and forwards need manual attention. |
 | 7 Term for macOS | Version 1 `7term-backup.json`; SSH hosts only. Keychain passwords and private key contents are omitted; serial profiles are skipped. |
 | Termix | Host/Share JSON, v2 user data JSON, and the Termix SQLite database described below. This is **Termix-SSH/Termix**, not an unrelated iOS app with the same name. |
@@ -85,9 +86,15 @@ other apps' keychains. You can select actual private key files alongside an
 export (or include them in the selected ZIP); uniquely matching filenames are
 linked to the host. Ambiguous or missing matches must be selected manually in
 the host editor. If an imported key is passphrase-protected, enter its passphrase
-in the host editor. PuTTY, MobaXterm, WinSCP, Xshell, and Tabby do not
-provide portable plaintext passwords in the supported exports; re-enter the
-missing secrets. Secrets marked encrypted, or using an `enc:`, `encrypted:`,
+in the host editor. PuTTY, MobaXterm, WinSCP, Xshell, Tabby, SecureCRT, and
+mRemoteNG do not provide portable plaintext passwords in the supported exports;
+re-enter the missing secrets. mRemoteNG's PuTTY sessions can contain keys or
+proxy settings, so review SSH routes and authentication even for its default
+session. Imported mRemoteNG RDP profiles do not ignore TLS certificate errors
+and start with Sushi's file-transfer drive disabled; change these in the host
+editor if needed.
+XML imports reject DTDs and entity definitions and have bounded nesting
+and complexity. Secrets marked encrypted, or using an `enc:`, `encrypted:`,
 `vault://`, or `keychain://` prefix, are not imported as plaintext; re-enter them
 if a legitimate password uses one of those prefixes. Proxy/jump hosts, tunnels, agent forwarding,
 commands, host-key trust and unsupported protocols are not migrated; the preview

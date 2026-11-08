@@ -102,6 +102,7 @@ function describeUnlock(user: TermixSqliteUserInfo): string {
 interface VaultSecurityModalProps {
   isOpen: boolean;
   initialTab?: VaultModalTab;
+  initialSection?: "backup";
   vaultMode: "device" | "passphrase";
   vaultKeySource: "account" | "independent";
   serverVaultEnabled: boolean;
@@ -145,6 +146,7 @@ function downloadJsonOrText(filename: string, content: string, mime = "applicati
 export function VaultSecurityModal({
   isOpen,
   initialTab = "security",
+  initialSection,
   vaultMode,
   vaultKeySource,
   serverVaultEnabled,
@@ -177,6 +179,9 @@ export function VaultSecurityModal({
   const [restoringBackup, setRestoringBackup] = useState(false);
   const [saving, setSaving] = useState(false);
   const fileRequest = useRef(0);
+  const backupSectionRef = useRef<HTMLDivElement | null>(null);
+  const backupFileRef = useRef<HTMLInputElement | null>(null);
+  const shouldFocusBackup = useRef(false);
   const sqliteRequest = useRef(0);
   const envRequest = useRef(0);
 
@@ -238,6 +243,20 @@ export function VaultSecurityModal({
     setSqlitePassword("");
     setSqliteUserFilter("");
   }, [isOpen, initialTab]);
+
+  useEffect(() => {
+    shouldFocusBackup.current = isOpen && initialSection === "backup";
+  }, [isOpen, initialSection]);
+
+  useEffect(() => {
+    if (!isOpen || activeTab !== "security" || !shouldFocusBackup.current) return;
+    const frame = window.requestAnimationFrame(() => {
+      backupSectionRef.current?.scrollIntoView({ block: "start" });
+      backupSectionRef.current?.focus({ preventScroll: true });
+      shouldFocusBackup.current = false;
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [isOpen, activeTab, initialSection]);
 
   if (!isOpen) return null;
 
@@ -1491,15 +1510,15 @@ export function VaultSecurityModal({
                 </div>
               </form>
 
-              <div className="space-y-3 border-t border-white/8 pt-4">
+              <div ref={backupSectionRef} tabIndex={-1} className="space-y-3 border-t border-white/8 pt-4 focus:outline-none">
                 <span className="block text-xs font-semibold uppercase tracking-wider text-slate-400">
                   Portable Encrypted Sushi Backup
                 </span>
                 <p className="text-[11px] leading-relaxed text-slate-400">
                   Choose a backup passphrase to restore on another device. It does
                   not change your vault passphrase. Save the downloaded file to
-                  iCloud Drive or another location you control; Sushi does not sign
-                  in to iCloud or read Apple device backups directly.
+                  iCloud Drive or another location you control. This is manual, not
+                  automatic iCloud sync; Sushi cannot read Apple device backups.
                 </p>
                 <div className="grid gap-2 sm:grid-cols-2">
                   <label className="sr-only" htmlFor="backup-passphrase">Backup passphrase</label>
@@ -1533,16 +1552,18 @@ export function VaultSecurityModal({
                     {exportingBackup ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Download className="h-3.5 w-3.5" />}
                     Download Portable Backup
                   </button>
-                  <label className="inline-flex cursor-pointer items-center gap-1.5 rounded-xl border border-white/10 bg-[#151a24] px-3.5 py-2 text-xs font-medium text-slate-200 hover:bg-white/10">
+                  <button type="button" onClick={() => backupFileRef.current?.click()} className="inline-flex items-center gap-1.5 rounded-xl border border-white/10 bg-[#151a24] px-3.5 py-2 text-xs font-medium text-slate-200 hover:bg-white/10">
                     <Upload className="h-3.5 w-3.5" />
                     Choose Backup to Restore
-                    <input
-                      type="file"
-                      accept=".json,.zip,*"
-                      onChange={handleImportSushiEnvelopeFile}
-                      className="hidden"
-                    />
-                  </label>
+                  </button>
+                  <input
+                    ref={backupFileRef}
+                    type="file"
+                    accept=".json,.zip,*"
+                    onChange={handleImportSushiEnvelopeFile}
+                    className="hidden"
+                    aria-label="Choose encrypted Sushi backup"
+                  />
                 </div>
 
                 {pendingImport && (

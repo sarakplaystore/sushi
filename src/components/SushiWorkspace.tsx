@@ -24,6 +24,10 @@ import {
   Loader2,
   ArrowLeftRight,
   KeyRound,
+  Settings,
+  HardDriveDownload,
+  RefreshCw,
+  ChevronUp,
   AlertCircle,
   ShieldAlert,
 } from "lucide-react";
@@ -190,6 +194,8 @@ export function SushiWorkspace() {
   const [vaultModalOpen, setVaultModalOpen] = useState(false);
   const [vaultModalTab, setVaultModalTab] =
     useState<VaultModalTab>("security");
+  const [vaultModalFocusBackup, setVaultModalFocusBackup] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
   // Do not replace in-memory data while a form is being edited or a vault is locked.
   syncEligibleRef.current = vaultReady && !vaultLocked && !hostModalOpen &&
     !vaultModalOpen && !accountModalOpen && !gatewayModalOpen;
@@ -198,8 +204,12 @@ export function SushiWorkspace() {
   const mobileMenuButtonRef = useRef<HTMLButtonElement | null>(null);
   const mobileMenuCloseRef = useRef<HTMLButtonElement | null>(null);
   const sidebarRef = useRef<HTMLElement | null>(null);
+  const settingsContainerRef = useRef<HTMLDivElement | null>(null);
+  const settingsButtonRef = useRef<HTMLButtonElement | null>(null);
+  const settingsFirstActionRef = useRef<HTMLButtonElement | null>(null);
 
   const closeMobileNavigation = useCallback(() => {
+    setSettingsOpen(false);
     setMobileSidebarOpen(false);
     window.requestAnimationFrame(() => mobileMenuButtonRef.current?.focus());
   }, []);
@@ -211,6 +221,23 @@ export function SushiWorkspace() {
     window.addEventListener("resize", handleResize);
     return () => window.removeEventListener("resize", handleResize);
   }, []);
+
+  useEffect(() => {
+    if (!sidebarOpen) setSettingsOpen(false);
+  }, [sidebarOpen]);
+
+  useEffect(() => {
+    if (!settingsOpen) return;
+    const frame = window.requestAnimationFrame(() => settingsFirstActionRef.current?.focus());
+    const handleOutside = (event: PointerEvent) => {
+      if (!settingsContainerRef.current?.contains(event.target as Node)) setSettingsOpen(false);
+    };
+    document.addEventListener("pointerdown", handleOutside);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      document.removeEventListener("pointerdown", handleOutside);
+    };
+  }, [settingsOpen]);
 
   useEffect(() => {
     if (!mobileSidebarOpen) return;
@@ -1436,48 +1463,70 @@ export function SushiWorkspace() {
               </span>
             </button>
 
-            {localCaps && (
-              <button type="button" onClick={() => void refreshVault()} className="flex w-full items-center justify-center gap-1.5 rounded-xl border border-white/8 bg-[#131823] px-3 py-1.5 text-[11px] text-slate-300 hover:bg-white/8" title={localCaps.serverVault ? "Check for saved connections from other devices" : "Check for changes from other tabs in this browser"}>
-                <Cloud className="h-3.5 w-3.5 text-emerald-400" /> {localCaps.serverVault ? "Sync saved connections" : "Refresh saved connections"}
-              </button>
-            )}
-            <div className="grid grid-cols-3 gap-1.5">
-              <button
-                type="button"
-                onClick={() => {
-                  setVaultModalTab("termix");
-                  setVaultModalOpen(true);
-                  setMobileSidebarOpen(false);
-                }}
-                className="flex items-center justify-center gap-1 rounded-xl border border-white/8 bg-[#131823] px-2 py-2 text-[11px] font-medium text-slate-200 transition hover:border-white/18 hover:bg-white/8"
-                title="Import SSH client exports or restore an encrypted backup"
-              >
-                <ArrowLeftRight className="h-3.5 w-3.5 text-[#ff6b57]" />
-                Import
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  setVaultModalTab("keys");
-                  setVaultModalOpen(true);
-                  setMobileSidebarOpen(false);
-                }}
-                className="flex items-center justify-center gap-1 rounded-xl border border-white/8 bg-[#131823] px-2 py-2 text-[11px] font-medium text-slate-200 transition hover:border-white/18 hover:bg-white/8"
-                title="Whitelisted SSH Keys & Vault"
-              >
-                <KeyRound className="h-3.5 w-3.5 text-emerald-400" />
-                Keys
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  setGatewayModalOpen(true);
-                  setMobileSidebarOpen(false);
-                }}
-                className="flex items-center justify-center gap-1 rounded-xl border border-white/8 bg-[#131823] px-2 py-2 text-[11px] font-medium text-slate-200 transition hover:border-white/18 hover:bg-white/8"
-              >
-                <Radio className="h-3.5 w-3.5 text-sky-400" />
-                Gateway
+            <div ref={settingsContainerRef} className="relative" onKeyDown={(event) => {
+              if (event.key !== "Escape" || !settingsOpen) return;
+              event.preventDefault();
+              event.stopPropagation();
+              setSettingsOpen(false);
+              settingsButtonRef.current?.focus();
+            }}>
+              {settingsOpen && (
+                <div id="workspace-settings" role="dialog" aria-label="Settings" className="absolute bottom-[calc(100%+0.5rem)] left-0 right-0 z-50 max-h-[min(70dvh,32rem)] overflow-y-auto rounded-2xl border border-white/12 bg-[#151b26] p-2 shadow-2xl shadow-black/60">
+                  <div className="px-2.5 pb-2 pt-1.5">
+                    <div className="text-xs font-semibold text-white">Settings</div>
+                    <p className="mt-0.5 text-[11px] text-slate-400">Connections, security &amp; storage</p>
+                  </div>
+                  <div className="mb-1.5 rounded-xl border border-white/8 bg-[#0d121b] px-2.5 py-2">
+                    <div className="flex items-center justify-between gap-2 text-[11px] font-medium text-slate-200">
+                      <span className="flex items-center gap-1.5"><Cloud className="h-3.5 w-3.5 text-sky-400" /> Google Cloud Firestore</span>
+                      <span className={localCaps?.storageBackend === "firestore" ? "text-emerald-400" : "text-slate-400"}>
+                        {localCaps?.storageBackend === "firestore" ? "Configured" : "Not active"}
+                      </span>
+                    </div>
+                    <p className="mt-1 text-[10px] leading-relaxed text-slate-400">
+                      {localCaps?.storageBackend === "firestore"
+                        ? localCaps.serverVault ? "Encrypted vault sync is enabled for this deployment." : "Firestore is configured, but vault sync is disabled."
+                        : localCaps?.serverVault
+                          ? `Current vault storage: ${localCaps.storageBackend === "redis" ? "Redis" : localCaps.storageBackend === "disk" ? "server disk" : "shared storage"}. Configure Firestore in your hosting environment.`
+                          : "Vault sync is disabled. Configure Firestore in your hosting environment."}
+                    </p>
+                    {localCaps?.storageBackend !== "firestore" && (
+                      <a href="https://github.com/sarakplaystore/sushi#google-cloud-firestore" target="_blank" rel="noreferrer" className="mt-1 inline-block text-[10px] font-medium text-sky-300 underline decoration-sky-300/40 underline-offset-2 hover:text-sky-200">Firestore setup guide</a>
+                    )}
+                  </div>
+                  <button ref={settingsFirstActionRef} type="button" onClick={() => {
+                    setSettingsOpen(false);
+                    settingsButtonRef.current?.focus();
+                    void refreshVault();
+                  }} className="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-xs text-slate-200 hover:bg-white/8 focus-visible:outline-2 focus-visible:outline-[#ff6b57]">
+                    <RefreshCw className="h-4 w-4 shrink-0 text-emerald-400" /> Refresh saved connections
+                  </button>
+                  <button type="button" onClick={() => {
+                    setSettingsOpen(false); setVaultModalTab("termix"); setVaultModalOpen(true); setMobileSidebarOpen(false);
+                  }} className="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-xs text-slate-200 hover:bg-white/8 focus-visible:outline-2 focus-visible:outline-[#ff6b57]">
+                    <ArrowLeftRight className="h-4 w-4 shrink-0 text-[#ff6b57]" /> Import / Export
+                  </button>
+                  <button type="button" onClick={() => {
+                    setSettingsOpen(false); setVaultModalTab("keys"); setVaultModalOpen(true); setMobileSidebarOpen(false);
+                  }} className="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-xs text-slate-200 hover:bg-white/8 focus-visible:outline-2 focus-visible:outline-[#ff6b57]">
+                    <KeyRound className="h-4 w-4 shrink-0 text-emerald-400" /> SSH Keys
+                  </button>
+                  <button type="button" onClick={() => {
+                    setSettingsOpen(false); setGatewayModalOpen(true); setMobileSidebarOpen(false);
+                  }} className="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-xs text-slate-200 hover:bg-white/8 focus-visible:outline-2 focus-visible:outline-[#ff6b57]">
+                    <Radio className="h-4 w-4 shrink-0 text-sky-400" /> Gateway
+                  </button>
+                  <button type="button" onClick={() => {
+                    setSettingsOpen(false); setVaultModalFocusBackup(true); setVaultModalTab("security"); setVaultModalOpen(true); setMobileSidebarOpen(false);
+                  }} className="flex w-full items-start gap-2.5 rounded-lg px-2.5 py-2 text-left text-xs text-slate-200 hover:bg-white/8 focus-visible:outline-2 focus-visible:outline-[#ff6b57]">
+                    <HardDriveDownload className="mt-0.5 h-4 w-4 shrink-0 text-amber-300" />
+                    <span>Vault &amp; iCloud Drive backup <span className="mt-0.5 block text-[10px] text-slate-400">Manual encrypted file backup / restore</span></span>
+                  </button>
+                </div>
+              )}
+              <button ref={settingsButtonRef} type="button" onClick={() => setSettingsOpen((open) => !open)} aria-haspopup="dialog" aria-expanded={settingsOpen} aria-controls="workspace-settings" className="flex w-full items-center justify-between rounded-xl border border-white/8 bg-[#131823] px-3 py-2.5 text-xs font-medium text-slate-200 transition hover:border-white/18 hover:bg-white/8 focus-visible:outline-2 focus-visible:outline-[#ff6b57]">
+                <span className="flex items-center gap-2"><Settings className="h-4 w-4 text-slate-400" /> Settings</span>
+                <ChevronUp className={`h-3.5 w-3.5 text-slate-500 transition-transform ${settingsOpen ? "rotate-180" : ""}`} />
               </button>
             </div>
           </div>
@@ -2079,6 +2128,7 @@ export function SushiWorkspace() {
       <VaultSecurityModal
         isOpen={vaultModalOpen}
         initialTab={vaultModalTab}
+        initialSection={vaultModalFocusBackup ? "backup" : undefined}
         vaultMode={vaultMode}
         vaultKeySource={vaultKeySource}
         serverVaultEnabled={Boolean(localCaps?.serverVault)}
@@ -2086,7 +2136,7 @@ export function SushiWorkspace() {
         sshKeys={sshKeys}
         enforceKeyWhitelist={enforceKeyWhitelist}
         gatewaySettings={gatewaySettings}
-        onClose={() => setVaultModalOpen(false)}
+        onClose={() => { setVaultModalOpen(false); setVaultModalFocusBackup(false); }}
         onSetPassphrase={async (pass) => {
           if (pass) {
             await persistVault(hosts, snippets, pass, "passphrase", undefined, undefined, "independent");

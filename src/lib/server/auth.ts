@@ -452,7 +452,7 @@ export async function getEffectiveAuthConfig(
   );
 
   if (verifiedProfile) {
-    if (getStateStoreKind() === "redis") {
+    if (getStateStoreKind() === "redis" || getStateStoreKind() === "firestore") {
       if (!verifiedProfile.passwordSalt || !verifiedProfile.passwordHash) {
         throw new Error("The existing browser account cannot be migrated without its password profile.");
       }

@@ -11,7 +11,7 @@ const nextConfig: NextConfig = {
   env: {
     NEXT_PUBLIC_SUSHI_BUILD_ID: buildId,
   },
-  serverExternalPackages: ["ssh2", "ws", "@simplewebauthn/server"],
+  serverExternalPackages: ["ssh2", "ws", "@simplewebauthn/server", "@google-cloud/firestore"],
   allowedDevOrigins: ["*.e2b.app", "*.vercel.app"],
   reactStrictMode: true,
   poweredByHeader: false,

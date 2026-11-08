@@ -3,10 +3,50 @@ import fs from "node:fs/promises";
 import path from "node:path";
 
 /** Small durable store for the single admin account and encrypted vault.
- * Vercel's filesystem is ephemeral; a Redis REST store is required there.
+ * Vercel's filesystem is ephemeral; Redis or Firestore is required there.
  */
 type RecordName = "auth" | "vault";
-type StoreKind = "disk" | "redis" | "none";
+export type StoreKind = "disk" | "redis" | "firestore" | "none";
+
+function storagePrefix(): string {
+  const fallback = [
+    "sushi",
+    process.env.VERCEL_PROJECT_ID?.trim() || "default",
+    process.env.VERCEL_ENV?.trim() || "default",
+  ].join(":");
+  const prefix = process.env.SUSHI_STORAGE_PREFIX?.trim() || fallback;
+  if (!/^[a-zA-Z0-9:_-]{1,160}$/.test(prefix)) {
+    throw new Error("SUSHI_STORAGE_PREFIX must contain only letters, numbers, colons, underscores, or hyphens.");
+  }
+  return prefix;
+}
+
+function firestoreConfig() {
+  const projectId = process.env.SUSHI_FIRESTORE_PROJECT_ID?.trim() || "";
+  const databaseId = process.env.SUSHI_FIRESTORE_DATABASE_ID?.trim() || "(default)";
+  if (!/^[a-z][a-z0-9-]{4,28}[a-z0-9]$/.test(projectId)) {
+    throw new Error("Firestore is misconfigured: set a valid SUSHI_FIRESTORE_PROJECT_ID on the server.");
+  }
+  if (!/^(\(default\)|[a-zA-Z0-9._-]{1,100})$/.test(databaseId)) {
+    throw new Error("Firestore is misconfigured: the database ID is invalid.");
+  }
+  const json = process.env.SUSHI_FIRESTORE_CREDENTIALS_JSON?.trim();
+  let credentials: { client_email: string; private_key: string } | undefined;
+  if (json) {
+    try {
+      const parsed: unknown = JSON.parse(json);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error();
+      const data = parsed as Record<string, unknown>;
+      if (data.type !== "service_account" || typeof data.client_email !== "string" || !data.client_email.trim() ||
+          typeof data.private_key !== "string" || !data.private_key.trim()) throw new Error();
+      credentials = { client_email: data.client_email, private_key: data.private_key };
+    } catch {
+      // Never include the JSON or private key in an error returned to a browser.
+      throw new Error("Firestore is misconfigured: provide valid server-side service-account JSON, or use Application Default Credentials.");
+    }
+  }
+  return { projectId, databaseId, prefix: storagePrefix(), ...(credentials ? { credentials } : {}) };
+}
 
 interface RedisConfig {
   url: string;
@@ -38,27 +78,47 @@ function redisConfig(): RedisConfig | null {
     if ((parsed.protocol !== "https:" && !localHttp) || parsed.username || parsed.password || parsed.search || parsed.hash) {
       throw new Error("Shared storage requires an HTTPS Redis REST URL without embedded credentials.");
     }
-    const fallback = [
-      "sushi",
-      process.env.VERCEL_PROJECT_ID?.trim() || "default",
-      process.env.VERCEL_ENV?.trim() || "default",
-    ].join(":");
-    const prefix = process.env.SUSHI_STORAGE_PREFIX?.trim() || fallback;
-    if (!/^[a-zA-Z0-9:_-]{1,160}$/.test(prefix)) {
-      throw new Error("SUSHI_STORAGE_PREFIX must contain only letters, numbers, colons, underscores, or hyphens.");
-    }
-    return { url: url.replace(/\/+$/, ""), token, prefix };
+    return { url: url.replace(/\/+$/, ""), token, prefix: storagePrefix() };
   }
   return null;
 }
 
 export function getStateStoreKind(): StoreKind {
+  const selected = process.env.SUSHI_STORAGE_BACKEND?.trim().toLowerCase() || "auto";
+  if (selected === "firestore") {
+    firestoreConfig();
+    return "firestore";
+  }
+  if (selected === "redis") {
+    if (!redisConfig()) throw new Error("Shared storage is misconfigured: Redis REST URL and token are required.");
+    return "redis";
+  }
+  if (selected === "disk") {
+    if (process.env.VERCEL === "1") throw new Error("Disk storage is ephemeral on Vercel; configure Firestore or Redis instead.");
+    return "disk";
+  }
+  if (selected !== "auto") throw new Error("SUSHI_STORAGE_BACKEND must be auto, disk, redis, or firestore.");
+  if (process.env.SUSHI_FIRESTORE_PROJECT_ID?.trim() || process.env.SUSHI_FIRESTORE_DATABASE_ID?.trim() || process.env.SUSHI_FIRESTORE_CREDENTIALS_JSON?.trim()) {
+    throw new Error("Select SUSHI_STORAGE_BACKEND=firestore to enable the configured Firestore database.");
+  }
   if (redisConfig()) return "redis";
   return process.env.VERCEL === "1" ? "none" : "disk";
 }
 
+async function firestoreStore() {
+  // Load the Google SDK only when this backend is selected.
+  const { getFirestoreStateStore } = await import("./firestore-store");
+  return getFirestoreStateStore(firestoreConfig());
+}
+
 export function hasPersistentStateStore(): boolean {
   return getStateStoreKind() !== "none";
+}
+
+/** Used by the offline migration command; never overwrites a target namespace. */
+export async function initializeEmptyFirestore(auth: string | null, vault: string | null): Promise<boolean> {
+  if (getStateStoreKind() !== "firestore") throw new Error("Select Firestore storage before migrating.");
+  return (await firestoreStore()).initializeEmpty(auth, vault);
 }
 
 function recordPath(name: RecordName): string {
@@ -111,14 +171,16 @@ async function readDiskFile(name: RecordName): Promise<string | null> {
 }
 
 export async function readStateRecord(name: RecordName): Promise<string | null> {
-  const config = redisConfig();
-  if (config) {
+  const kind = getStateStoreKind();
+  if (kind === "firestore") return (await firestoreStore()).read(name);
+  if (kind === "redis") {
+    const config = redisConfig()!;
     const result = await command(config, ["GET", redisKey(config, name)]);
     if (result === null) return null;
     if (typeof result !== "string") throw new Error("Shared storage returned invalid Sushi data.");
     return result;
   }
-  return getStateStoreKind() === "disk" ? readDiskFile(name) : null;
+  return kind === "disk" ? readDiskFile(name) : null;
 }
 
 // A lock file coordinates separate Node processes on the same persistent disk.
@@ -164,8 +226,12 @@ export async function compareAndSwapAuthWithVaultGuard(
   nextAuth: string,
   expectedVault: string | null
 ): Promise<boolean> {
-  const config = redisConfig();
-  if (config) {
+  const kind = getStateStoreKind();
+  if (kind === "firestore") {
+    return (await firestoreStore()).compareAndSwapAuthWithVaultGuard(expectedAuth, nextAuth, expectedVault);
+  }
+  if (kind === "redis") {
+    const config = redisConfig()!;
     const script = `
       local auth = redis.call('GET', KEYS[1])
       local vault = redis.call('GET', KEYS[2])
@@ -182,7 +248,7 @@ export async function compareAndSwapAuthWithVaultGuard(
     if (result !== 0 && result !== 1) throw new Error("Shared storage returned an invalid write result.");
     return result === 1;
   }
-  if (getStateStoreKind() !== "disk") throw new Error("Persistent storage is not configured.");
+  if (kind !== "disk") throw new Error("Persistent storage is not configured.");
   // All multi-record mutations acquire auth before vault. Ordinary vault writes
   // take only the vault lock, so the guard and the account write are atomic.
   return withDiskLock("auth", () => withDiskLock("vault", async () => {
@@ -200,8 +266,10 @@ export async function compareAndSwapStateRecord(
   expected: string | null,
   next: string
 ): Promise<boolean> {
-  const config = redisConfig();
-  if (config) {
+  const kind = getStateStoreKind();
+  if (kind === "firestore") return (await firestoreStore()).compareAndSwap(name, expected, next);
+  if (kind === "redis") {
+    const config = redisConfig()!;
     const script = `
       local current = redis.call('GET', KEYS[1])
       if ARGV[1] == 'missing' then
@@ -219,7 +287,7 @@ export async function compareAndSwapStateRecord(
     if (result !== 0 && result !== 1) throw new Error("Shared storage returned an invalid write result.");
     return result === 1;
   }
-  if (getStateStoreKind() !== "disk") throw new Error("Persistent storage is not configured.");
+  if (kind !== "disk") throw new Error("Persistent storage is not configured.");
   return withDiskLock(name, async () => {
     const current = await readDiskFile(name);
     if (current !== expected) return false;

@@ -3,6 +3,7 @@ import type { SystemCapabilities } from "@/types/connection";
 import { checkGuacdAvailable, getGuacdConfig } from "@/lib/server/guacd-bridge";
 import { getCorsHeaders } from "@/lib/server/security";
 import { isServerVaultEnabled } from "@/lib/server/vault-store";
+import { getStateStoreKind } from "@/lib/server/state-store";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -32,6 +33,7 @@ export async function GET(req: NextRequest) {
     rdpGuacd: guacdOk,
     rdpProbe: true,
     serverVault: isServerVaultEnabled(),
+    storageBackend: getStateStoreKind(),
     requiresGatewayToken: Boolean(process.env.SUSHI_GATEWAY_TOKEN?.trim()),
     guacdHost: `${guacdCfg.host}:${guacdCfg.port}`,
     nodeVersion: process.version,

@@ -30,7 +30,7 @@ export interface EncryptedVaultEnvelope {
   updatedAt: number;
 }
 
-const VAULT_STORAGE_KEY = "sushi_encrypted_vault_v1";
+export const VAULT_STORAGE_KEY = "sushi_encrypted_vault_v1";
 const DEVICE_KEY_STORAGE_KEY = "sushi_device_aes_key_v1";
 
 export const DEFAULT_SNIPPETS: CommandSnippet[] = [

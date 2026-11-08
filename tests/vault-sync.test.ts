@@ -14,7 +14,7 @@ import { GET as getVault, POST as postVault } from "../src/app/api/vault/route";
 import { bootstrapAdminAccount, createSessionToken, getEffectiveAuthConfig, saveServerPasskey, verifyIncomingAuth } from "../src/lib/server/auth";
 import { compareAndSwapAuthWithVaultGuard, readStateRecord } from "../src/lib/server/state-store";
 import { decryptVaultEnvelope, encryptVaultData, type EncryptedVaultEnvelope, type VaultPlaintext } from "../src/lib/client/crypto-vault";
-import { cacheSyncedVault, getLocalSyncMetadata, sameVaultEnvelope } from "../src/lib/client/vault-sync";
+import { cacheSyncedVault, cacheSyncedVaultIfUnchanged, getLocalSyncMetadata, sameVaultEnvelope, saveLocalVaultIfUnchanged, subscribeVaultChanges } from "../src/lib/client/vault-sync";
 
 const envKeys = [
   "DATA_DIR", "VERCEL", "VERCEL_PROJECT_ID", "VERCEL_ENV", "SUSHI_AUTH_USERNAME", "SUSHI_AUTH_PASSWORD",
@@ -218,8 +218,76 @@ async function main() {
     assert(!Array.from(local.values()).join("").includes(originalPassword));
     assert(!Array.from(local.values()).join("").includes("ssh-private-password"));
     assert(!Array.from(local.values()).join("").includes("SSH-PRIVATE-KEY-SECRET"));
+
+    // Simulate two tabs contending for the same Web Lock. Exactly one stale
+    // write may win, and a remote-cache refresh must not clobber a newer local
+    // encrypted copy either.
+    const savedNavigator = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+    let lockTail: Promise<void> = Promise.resolve();
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: { locks: {
+      request: async (_name: string, action: () => unknown) => {
+        const previous = lockTail;
+        let release!: () => void;
+        lockTail = new Promise<void>((resolve) => { release = resolve; });
+        await previous;
+        try { return await action(); } finally { release(); }
+      },
+    } } });
+    const localA = await envelope();
+    const localB = await envelope();
+    const writes = await Promise.allSettled([
+      saveLocalVaultIfUnchanged(cachedEnvelope, localA),
+      saveLocalVaultIfUnchanged(cachedEnvelope, localB),
+    ]);
+    assert.equal(writes.filter((result) => result.status === "fulfilled").length, 1);
+    assert.equal(writes.filter((result) => result.status === "rejected").length, 1);
+    const winner = JSON.parse(local.get("sushi_encrypted_vault_v1")!) as EncryptedVaultEnvelope;
+    assert(sameVaultEnvelope(winner, localA) || sameVaultEnvelope(winner, localB));
+    assert.equal(await cacheSyncedVaultIfUnchanged(cachedEnvelope, await envelope(), "stale-revision"), false);
+    assert(sameVaultEnvelope(JSON.parse(local.get("sushi_encrypted_vault_v1")!), winner));
+    assert.equal(getLocalSyncMetadata(), null);
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: {} });
+    await assert.rejects(saveLocalVaultIfUnchanged(winner, await envelope()), /safely coordinate vault writes/);
+    assert(sameVaultEnvelope(JSON.parse(local.get("sushi_encrypted_vault_v1")!), winner));
+    if (savedNavigator) Object.defineProperty(globalThis, "navigator", savedNavigator);
+    else delete (globalThis as { navigator?: unknown }).navigator;
     delete (globalThis as { window?: unknown }).window;
     delete (globalThis as { localStorage?: unknown }).localStorage;
+
+    // Same-origin tab changes should refresh immediately; focus and the timer
+    // only refresh a visible document, and unsubscribing removes all listeners.
+    const fakeWindow = new EventTarget() as EventTarget & { setInterval: (callback: () => void, ms: number) => number; clearInterval: (id: number) => void };
+    const fakeDocument = new EventTarget() as EventTarget & { visibilityState: string };
+    fakeDocument.visibilityState = "visible";
+    let tick = () => {};
+    let timerCleared = false;
+    fakeWindow.setInterval = (callback, ms) => { assert.equal(ms, 15000); tick = callback; return 42; };
+    fakeWindow.clearInterval = (id) => { assert.equal(id, 42); timerCleared = true; };
+    Object.defineProperty(globalThis, "window", { configurable: true, value: fakeWindow });
+    Object.defineProperty(globalThis, "document", { configurable: true, value: fakeDocument });
+    let refreshes = 0;
+    const unsubscribe = subscribeVaultChanges(() => { refreshes++; });
+    const storageEvent = (key: string | null) => Object.assign(new Event("storage"), { key });
+    fakeWindow.dispatchEvent(storageEvent("unrelated"));
+    assert.equal(refreshes, 0);
+    fakeWindow.dispatchEvent(storageEvent("sushi_encrypted_vault_v1"));
+    fakeWindow.dispatchEvent(storageEvent(null));
+    assert.equal(refreshes, 2);
+    fakeDocument.visibilityState = "hidden";
+    fakeWindow.dispatchEvent(new Event("focus"));
+    tick();
+    assert.equal(refreshes, 2);
+    fakeDocument.visibilityState = "visible";
+    fakeDocument.dispatchEvent(new Event("visibilitychange"));
+    fakeWindow.dispatchEvent(new Event("focus"));
+    tick();
+    assert.equal(refreshes, 5);
+    unsubscribe();
+    assert.equal(timerCleared, true);
+    fakeWindow.dispatchEvent(storageEvent("sushi_encrypted_vault_v1"));
+    assert.equal(refreshes, 5);
+    delete (globalThis as { window?: unknown }).window;
+    delete (globalThis as { document?: unknown }).document;
 
     process.env.DATA_DIR = path.join(temp, "disk");
     await runBackendSuite("disk");

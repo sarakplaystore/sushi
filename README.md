@@ -55,10 +55,17 @@ It is designed around a **Hybrid VPS + Serverless Architecture**:
    with the same account. Saved SSH/SFTP/RDP profiles, passwords, private keys,
    whitelist settings and snippets are stored in the encrypted shared vault.
    Open terminal/RDP sessions and gateway settings are not transferred.
-3. Sushi checks for shared changes when the page regains focus and periodically
-   while it is visible and no editor is open. **Sync saved connections** checks
+3. Other tabs in the same browser pick up saved changes promptly. Sushi also
+   checks for shared changes when the page regains focus and periodically while
+   it is visible and no editor is open. **Sync saved connections** checks
    manually. A conflicting save is rejected rather than overwriting another
-   device; keep your unsaved edits, reload the latest vault and reapply them.
+   tab or device; keep your unsaved edits, reload the latest vault and reapply them.
+
+If shared storage is disabled or not configured, only tabs using the same browser
+profile and exact origin share the local vault. Other devices, private browsing,
+and different Sushi hostnames cannot see it. On Vercel, connect Redis REST storage
+before expecting cross-device sync; keep the original browser's data until the
+migration is complete.
 
 New shared vaults use the **account password** in the browser for PBKDF2 and
 AES-256-GCM. It is kept in memory while unlocked, not stored as plaintext in
@@ -72,11 +79,14 @@ server and storage provider. The shared store contains the account password
 hash/session signing secret, public login keys/passkeys, and encrypted vault—not
 plaintext saved SSH passwords or private keys.
 
-**Existing vaults:** On the original browser, unlock the old device-key or master
-passphrase vault and choose **Vault Encryption → Account password sync** if it is
-not already migrated. Verify it on a second device before removing the original
-browser's data. Device-key vaults and older device-key backups cannot be opened on
-another browser: keep the original device key and make a portable backup first.
+**Existing vaults:** After enabling shared storage, open the **original browser
+first** so its existing account and vault can migrate. Unlock an old master
+passphrase vault if necessary, then enter the current account password when
+prompted to upload its encrypted contents. If a vault already exists in shared
+storage, use **Vault Encryption → Account password sync** when appropriate.
+Verify it on a second device before removing the original browser's data.
+Device-key vaults and older device-key backups cannot be opened on another
+browser: keep the original device key and make a portable backup first.
 If the browser has a different local vault from the shared vault, Sushi asks you
 to download its encrypted copy before opening the shared one; it does not merge
 conflicting vaults automatically. Restoring a backup replaces the current vault.

@@ -25,6 +25,7 @@ It is designed around a **Hybrid VPS + Serverless Architecture**:
   - **Distro & cloud badge on connect**: the header names the machine you are on — `Ubuntu 24.04.1 LTS · Oracle Cloud`, `Debian 12 · KVM VPS`, `Rocky Linux 9.4 · AWS EC2` — read in one non-root exec (`/etc/os-release`, cloud-init's `cloud-id`, DMI strings) and cached for five minutes; the **Test SSH Auth** card in *New Connection* shows the same OS, hosting platform and vCPU/RAM before you connect
   - SHA-256 host key fingerprint verification, quick command snippets, scrollback search, and terminal themes
 - Commands survive a closed tab (No timeout + resume prompt) and recently connected hosts are remembered
+- One merged entry per machine in the sidebar and launchpad, plus `/hosts` and `GET /api/hosts` with SSH/SFTP/RDP links for every host
   - **Translate selected text**: highlight any text in the terminal and hit the **Translate** button — the translation appears in a panel above the terminal (Chinese by default, 14 target languages, remembered per browser). Translates through Sushi's own `/api/translate` (see *Translating text* below)
 - **SFTP File Manager (`/api/sftp/*`)**
   - Works identically on **Vercel Serverless** and **VPS**
@@ -111,6 +112,47 @@ confirm no writer is active before removing the **lock file only**; never remove
 the `.json` files to clear a lock. Firestore and Vercel vault snapshots are
 limited to 4 MiB; self-hosted disk/Redis snapshots are limited to 32 MiB. Firestore
 splits larger records into sub-1 MiB documents and updates them transactionally.
+
+## One URL for every host (SSH + SFTP + RDP merged)
+
+A server is usually saved more than once — an SSH entry, maybe an SFTP one, maybe an
+RDP one — because each protocol has its own settings. Sushi now **merges those
+profiles into one entry per machine + account**, everywhere hosts are listed, and gives
+each entry a single URL:
+
+- **Sidebar and launchpad**: one row per machine, with `SSH`/`SFTP`/`RDP` badges for
+  every way in and one click for each (a host saved only for SSH still offers the SFTP
+  action, and a desktop through the derived RDP companion on 3389). Search and the
+  protocol filter work on the merged entries, so “SSH” lists an SFTP-saved host too.
+- **`/hosts`** — one page listing every host with its protocols and ports, plus the
+  exact link for each. **`/hosts?format=json`** returns the same thing as JSON.
+- **`GET /api/hosts`** — the machine-readable half: one entry per machine with `id`,
+  `accessUrl`, `protocols`, `counts`, and `links[]` holding `ssh://…`, `sftp://…` and
+  `rdp://…` (each labelled `saved` or `derived`). Protected by the normal Sushi session
+  (`x-sushi-session`), like every other API — there is no second, weaker secret.
+- **One link per machine**: `/hosts?host=<id>` (or `/hosts?host=<id>&protocol=rdp`)
+  opens that machine in the workspace, which unlocks the vault and starts the session.
+  `?host=` also accepts `user@host` for hand-written links. Links never carry
+  credentials.
+
+**Why the single URL is an index, not a dump of your servers.** Sushi's vault is
+end-to-end encrypted: the server stores `{iv, ciphertext}` and has no key, so it cannot
+read host names or passwords, and returning them in clear would mean storing them in
+clear. `/api/hosts` therefore reports the structure honestly — one entry per machine,
+its protocols, ports and access URLs, with `encrypted: true` and names redacted
+(`host #1`) — while `/hosts` in the browser shows the real names after you unlock. A
+deployment that deliberately keeps a clear-text inventory can set
+`SUSHI_HOSTS_INVENTORY` (inline JSON or a file path, shape
+`{ "hosts": [ { …HostProfile } ] }`); those entries are merged the same way and returned
+with `encrypted: false`.
+
+**Editing and deleting stay consistent** (`lib/client/host-consistency`): change the
+address or account of one profile and its SSH/SFTP/RDP siblings move with it, so a
+machine never splits into two half-entries (and a clash with an existing machine is
+reported before two machines merge). Deleting a merged row deletes the machine, with a
+confirmation naming the protocols that go with it, instead of leaving orphaned
+profiles behind. Saves still go through the normal encrypted-vault path — no new
+storage, no new sync path.
 
 ## Add Sushi to an iPhone or iPad Home Screen
 

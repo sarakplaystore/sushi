@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useEffect, useState, useCallback, useRef } from "react";
+import React, { useEffect, useMemo, useState, useCallback, useRef } from "react";
 import {
   Terminal,
   FolderKanban,
@@ -74,6 +74,23 @@ import {
   subscribeVaultChanges,
   verifyAccountPassword,
 } from "@/lib/client/vault-sync";
+import {
+  type UnifiedHost,
+  filterUnifiedHosts,
+  filterUnifiedHostsByProtocol,
+  groupUnifiedHosts,
+  hostAccessUrl,
+  mergeHosts,
+  openableProtocols,
+  parseHostDeepLink,
+  resolveHostDeepLink,
+} from "@/lib/client/unified-hosts";
+import {
+  applyIdentityChange,
+  describeProtocols,
+  removeMachine,
+  siblingsOf,
+} from "@/lib/client/host-consistency";
 import { HostProfileModal } from "./HostProfileModal";
 import { GatewaySetupModal } from "./GatewaySetupModal";
 import { VaultSecurityModal, type VaultModalTab } from "./VaultSecurityModal";
@@ -927,6 +944,10 @@ export function SushiWorkspace() {
     [openSessionTab, tabs]
   );
 
+  useEffect(() => {
+    openRdpCompanionRef.current = openRdpCompanion;
+  }, [openRdpCompanion]);
+
   /**
    * "Credentials" in an RDP session: edit the saved RDP host when there is one,
    * otherwise open a prefilled draft (no id → saving creates its own RDP host,
@@ -973,9 +994,18 @@ export function SushiWorkspace() {
     profile: HostProfile,
     connectAfterSave?: boolean
   ) => {
-    const nextHosts = hosts.some((h) => h.id === profile.id)
-      ? hosts.map((h) => (h.id === profile.id ? profile : h))
-      : [profile, ...hosts];
+    // Saving keeps the whole machine consistent: if the address or account changed,
+    // the SSH / SFTP / RDP profiles of that machine move with it (see
+    // lib/client/host-consistency). Otherwise one edit would split a machine in two.
+    const change = applyIdentityChange(hosts, profile);
+    if (change.conflict) {
+      const merge = window.confirm(
+        `${change.conflict.name || change.conflict.host} already uses ${profile.username}@${profile.host}. ` +
+          `Saving this as well gives that machine two ${profile.protocol.toUpperCase()} profiles. Continue?`
+      );
+      if (!merge) return;
+    }
+    const nextHosts = change.conflict ? applyIdentityChange(hosts, profile, { moveSiblings: true }).hosts : change.hosts;
     await persistVault(nextHosts, snippets);
     setHosts(nextHosts);
     setHostModalOpen(false);
@@ -986,9 +1016,34 @@ export function SushiWorkspace() {
     }
   };
 
-  const handleDeleteHost = async (id: string, e: React.MouseEvent) => {
-    e.stopPropagation();
-    const nextHosts = hosts.filter((h) => h.id !== id);
+  /**
+   * Deletes a connection. `wholeMachine` removes every protocol profile of that
+   * machine (the unified list shows one row per machine, so leaving its RDP/SFTP
+   * twins behind would resurrect a half-deleted host).
+   */
+  const handleDeleteHost = async (
+    id: string,
+    e?: React.MouseEvent,
+    options: { wholeMachine?: boolean } = {}
+  ) => {
+    e?.stopPropagation();
+    const target = hosts.find((host) => host.id === id);
+    if (!target) return;
+    const siblings = siblingsOf(hosts, target);
+    let nextHosts: HostProfile[];
+    if (options.wholeMachine) {
+      if (
+        siblings.length &&
+        !window.confirm(
+          `Delete ${target.name || target.host} entirely? This also removes its ${describeProtocols(siblings)} profile${siblings.length > 1 ? "s" : ""} (${target.username}@${target.host}).`
+        )
+      ) {
+        return;
+      }
+      nextHosts = removeMachine(hosts, target).hosts;
+    } else {
+      nextHosts = hosts.filter((h) => h.id !== id);
+    }
     try {
       await persistVault(nextHosts, snippets);
       setHosts(nextHosts);
@@ -1128,30 +1183,101 @@ export function SushiWorkspace() {
     remoteCaps ? remoteCaps.rdpGuacd : localCaps?.rdpGuacd
   );
 
-  const filteredHosts = hosts.filter((h) => {
-    if (protocolFilter !== "all" && h.protocol !== protocolFilter) return false;
-    if (hostSearch.trim()) {
-      const q = hostSearch.toLowerCase();
-      return (
-        h.name.toLowerCase().includes(q) ||
-        h.host.toLowerCase().includes(q) ||
-        h.username.toLowerCase().includes(q) ||
-        (h.group || "").toLowerCase().includes(q)
-      );
-    }
-    return true;
-  });
+  // ---------------------------------------------------------------------------
+  // Deep links: /?host=<host-id>&protocol=ssh|sftp|rdp opens that machine.
+  //
+  // This is the "one URL per machine" half of the unified host list: /hosts (and
+  // /api/hosts) hand out these links, so a bookmark, a chat message or a script can
+  // point at one server and have Sushi open the right session once the vault is
+  // unlocked. The URL carries no credentials — the vault does.
+  // ---------------------------------------------------------------------------
+  const deepLinkHandledRef = useRef(false);
 
-  // Group hosts by folder
-  const groupedHosts = filteredHosts.reduce<Record<string, HostProfile[]>>(
-    (acc, h) => {
-      const key = h.group || "Servers";
-      if (!acc[key]) acc[key] = [];
-      acc[key].push(h);
-      return acc;
+  const applyDeepLink = useCallback(
+    (entries: UnifiedHost[]) => {
+      if (typeof window === "undefined") return;
+      const link = parseHostDeepLink(window.location.search);
+      if (!link) return;
+      const entry = resolveHostDeepLink(entries, link.hostId);
+      if (!entry) {
+        setWhitelistBannerError(
+          `This link points at “${link.hostId}”, which is not in this vault. It may belong to another device, or the host was deleted.`
+        );
+        return;
+      }
+      // Consume the link so a reload/re-render does not open the host again.
+      window.history.replaceState(null, "", window.location.pathname);
+      deepLinkHandledRef.current = true;
+      openUnifiedHostRef.current(entry, link.protocol ?? undefined);
     },
-    {}
+    []
   );
+
+  /** `openUnifiedHost` is declared below the vault boot code; call the latest one. */
+  const openUnifiedHostRef = useRef<(entry: UnifiedHost, protocol?: ProtocolType) => void>(() => {});
+  /** Latest merged hosts, for the deep-link effect (declared below). */
+  const unifiedHostsRef = useRef<UnifiedHost[]>([]);
+
+  /**
+   * Runs once the vault is unlocked (that is when host names exist): a deep link is
+   * applied, otherwise the URL is left alone.
+   */
+  useEffect(() => {
+    if (deepLinkHandledRef.current) return;
+    if (!vaultReady || vaultLocked) return;
+    if (!hosts.length) return;
+    applyDeepLink(unifiedHostsRef.current);
+  }, [applyDeepLink, hosts.length, unifiedHostsRef, vaultLocked, vaultReady]);
+
+  /** `openRdpCompanion` is declared below; the merged-host action calls it lazily. */
+  const openRdpCompanionRef = useRef<(profile: HostProfile) => void>(() => {});
+
+  /**
+   * Saved profiles merged into one entry per machine + account, so a server saved as
+   * SSH *and* SFTP *and* RDP is one row with three ways in (`lib/client/unified-hosts`).
+   * The vault itself is untouched: edit/delete still act on the real profiles.
+   */
+  const unifiedHosts = useMemo(() => mergeHosts(hosts), [hosts]);
+  unifiedHostsRef.current = unifiedHosts;
+  const filteredHosts = useMemo(
+    () => filterUnifiedHosts(filterUnifiedHostsByProtocol(unifiedHosts, protocolFilter), hostSearch),
+    [unifiedHosts, protocolFilter, hostSearch]
+  );
+  /** Sidebar folders (one entry per machine). */
+  const groupedHosts = useMemo(() => groupUnifiedHosts(filteredHosts), [filteredHosts]);
+
+  /**
+   * One click on a merged host opens the protocol you picked (or the best one): an
+   * explicit profile when the vault has it, otherwise the derived RDP companion.
+   */
+  const openUnifiedHost = useCallback(
+    (entry: UnifiedHost, protocol?: ProtocolType) => {
+      setMobileSidebarOpen(false);
+      const wanted: ProtocolType = protocol ?? (entry.protocols.ssh ? "ssh" : entry.available[0] ?? "ssh");
+      const saved = entry.protocols[wanted];
+      if (saved) {
+        openSessionTab(saved);
+        return;
+      }
+      if (wanted === "sftp" && entry.protocols.ssh) {
+        openSessionTab(entry.protocols.ssh, "sftp");
+        return;
+      }
+      if (wanted === "ssh" && entry.protocols.sftp) {
+        openSessionTab(entry.protocols.sftp, "ssh");
+        return;
+      }
+      if (wanted === "rdp") {
+        openRdpCompanionRef.current(entry.primary);
+        return;
+      }
+      openSessionTab(entry.primary);
+    },
+    [openSessionTab]
+  );
+  useEffect(() => {
+    openUnifiedHostRef.current = openUnifiedHost;
+  }, [openUnifiedHost]);
 
   // Authentication & Passkey Gate
   if (authChecking) {
@@ -1496,12 +1622,13 @@ export function SushiWorkspace() {
                     {groupName}
                   </div>
                   {groupItems.map((h) => {
-                    const ProtoIcon =
-                      h.protocol === "rdp"
-                        ? Monitor
-                        : h.protocol === "sftp"
-                          ? FolderKanban
-                          : Terminal;
+                    const ProtoIcon = h.protocols.rdp
+                      ? Monitor
+                      : h.protocols.ssh
+                        ? Terminal
+                        : FolderKanban;
+                    const protocols = openableProtocols(h);
+                    const primary = h.primary;
                     return (
                       <div
                         key={h.id}
@@ -1509,8 +1636,9 @@ export function SushiWorkspace() {
                       >
                         <button
                           type="button"
-                          onClick={() => openSessionTab(h)}
+                          onClick={() => openUnifiedHost(h)}
                           className="flex min-w-0 flex-1 items-center gap-2.5 text-left"
+                          title={`${h.username}@${h.host} — ${protocols.join(" / ").toUpperCase()}`}
                         >
                           <span
                             className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-white/[0.04]"
@@ -1521,26 +1649,40 @@ export function SushiWorkspace() {
                             <ProtoIcon className="h-3.5 w-3.5" />
                           </span>
                           <div className="min-w-0">
-                            <div className="truncate text-xs font-medium text-slate-100">
-                              {h.name}
+                            <div className="flex items-center gap-1.5">
+                              <span className="truncate text-xs font-medium text-slate-100">
+                                {h.name}
+                              </span>
+                              {/* One badge per way in, so a merged host is obvious */}
+                              <span className="flex shrink-0 items-center gap-0.5">
+                                {protocols.map((protocol) => (
+                                  <span
+                                    key={protocol}
+                                    className="rounded bg-white/8 px-1 text-[9px] font-semibold uppercase text-slate-400"
+                                    title={`${protocol.toUpperCase()} · ${h.ports[protocol] ?? (protocol === "rdp" ? 3389 : 22)}`}
+                                  >
+                                    {protocol}
+                                  </span>
+                                ))}
+                              </span>
                             </div>
                             <div className="font-mono-code truncate text-[10px] text-slate-500">
-                              {h.username}@{h.host}:{h.port}
+                              {h.username}@{h.host}:{h.ports.ssh ?? h.ports.sftp ?? primary.port}
                             </div>
                           </div>
                         </button>
 
                         <div className="flex shrink-0 items-center gap-0.5">
-                          {/* Always visible so the desktop is one click away */}
-                          {h.protocol !== "rdp" && (
+                          {/* Every protocol is one click away on the same row */}
+                          {protocols.includes("rdp") && (
                             <button
                               type="button"
                               onClick={(e) => {
                                 e.stopPropagation();
-                                openRdpCompanion(h);
+                                openUnifiedHost(h, "rdp");
                               }}
                               className="rounded p-2 text-[#ff6b57]/75 transition hover:bg-[#ff6b57]/20 hover:text-[#ff9587] md:p-1"
-                              title="Open desktop via RDP"
+                              title={h.protocols.rdp ? "Open desktop (RDP)" : "Open desktop via derived RDP companion (port 3389)"}
                               aria-label={`Open ${h.name} via RDP`}
                             >
                               <Monitor className="h-3 w-3" />
@@ -1548,52 +1690,72 @@ export function SushiWorkspace() {
                           )}
 
                           <div className="hidden items-center gap-0.5 group-hover:flex group-focus-within:flex [@media(hover:none)]:flex">
-                            {h.protocol !== "rdp" && (
+                            {protocols.includes("sftp") && (
                               <button
                                 type="button"
                                 onClick={(e) => {
                                   e.stopPropagation();
-                                  openSessionTab(
-                                    h,
-                                    h.protocol === "ssh" ? "sftp" : "ssh"
-                                  );
+                                  openUnifiedHost(h, "sftp");
                                 }}
                                 className="rounded p-2 text-slate-400 hover:bg-white/10 hover:text-sky-300 md:p-1"
-                                aria-label={`Open ${h.name} as ${h.protocol === "ssh" ? "SFTP" : "SSH"}`}
-                                title={
-                                  h.protocol === "ssh"
-                                    ? "Open as SFTP"
-                                    : "Open as SSH"
-                                }
+                                aria-label={`Open ${h.name} as SFTP`}
+                                title="Open as SFTP"
                               >
-                                {h.protocol === "ssh" ? (
-                                  <FolderKanban className="h-3 w-3" />
-                                ) : (
-                                  <Terminal className="h-3 w-3" />
-                                )}
+                                <FolderKanban className="h-3 w-3" />
                               </button>
                             )}
+                            {protocols.includes("ssh") && (
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  openUnifiedHost(h, "ssh");
+                                }}
+                                className="rounded p-2 text-slate-400 hover:bg-white/10 hover:text-emerald-300 md:p-1"
+                                aria-label={`Open ${h.name} as SSH`}
+                                title="Open as SSH"
+                              >
+                                <Terminal className="h-3 w-3" />
+                              </button>
+                            )}
+                            <a
+                              href={hostAccessUrl(h)}
+                              onClick={(e) => e.stopPropagation()}
+                              className="rounded p-2 text-slate-400 hover:bg-white/10 hover:text-white md:p-1"
+                              aria-label={`Copy the one URL for ${h.name}`}
+                              title="One URL for this machine (opens it in Sushi)"
+                            >
+                              <ArrowLeftRight className="h-3 w-3" />
+                            </a>
                             <button
                               type="button"
                               onClick={(e) => {
                                 e.stopPropagation();
-                                setEditingProfile(h);
+                                setEditingProfile(primary);
                                 setHostModalIntent(null);
                                 setHostModalOpen(true);
                                 setMobileSidebarOpen(false);
                               }}
                               className="rounded p-2 text-slate-400 hover:bg-white/10 hover:text-white md:p-1"
                               aria-label={`Edit ${h.name}`}
-                              title="Edit host"
+                              title={
+                                Object.values(h.protocols).filter(Boolean).length > 1
+                                  ? "Edit this connection (each protocol keeps its own profile)"
+                                  : "Edit host"
+                              }
                             >
                               <Pencil className="h-3 w-3" />
                             </button>
                             <button
                               type="button"
-                              onClick={(e) => void handleDeleteHost(h.id, e)}
+                              onClick={(e) => void handleDeleteHost(primary.id, e, { wholeMachine: true })}
                               className="rounded p-2 text-slate-400 hover:bg-rose-500/20 hover:text-rose-400 md:p-1"
                               aria-label={`Delete ${h.name}`}
-                              title="Delete host"
+                              title={
+                                Object.values(h.protocols).filter(Boolean).length > 1
+                                  ? "Delete this machine (SSH / SFTP / RDP profiles)"
+                                  : "Delete host"
+                              }
                             >
                               <Trash2 className="h-3 w-3" />
                             </button>
@@ -1738,6 +1900,16 @@ export function SushiWorkspace() {
             <Sparkles className="h-3.5 w-3.5 text-[#ff6b57]" />
             Launchpad
           </button>
+
+          {/* One URL listing every host (SSH / SFTP / RDP merged) */}
+          <a
+            href="/hosts"
+            className="flex shrink-0 items-center gap-1 rounded-t-xl border border-b-0 border-white/8 px-3 py-2 text-xs text-slate-400 transition hover:bg-white/8 hover:text-white"
+            title="Every host on one page, with SSH, SFTP and RDP side by side"
+          >
+            <Server className="h-3.5 w-3.5" />
+            All hosts
+          </a>
 
           {/* Active Session Tabs */}
           {tabs.map((tab) => {
@@ -2257,13 +2429,15 @@ export function SushiWorkspace() {
                   </div>
 
                   <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
-                    {hosts.map((h) => {
-                      const Icon =
-                        h.protocol === "rdp"
-                          ? Monitor
-                          : h.protocol === "sftp"
-                            ? FolderKanban
-                            : Terminal;
+                    {unifiedHosts.map((h) => {
+                      const Icon = h.protocols.rdp
+                        ? Monitor
+                        : h.protocols.ssh
+                          ? Terminal
+                          : FolderKanban;
+                      const protocols = openableProtocols(h);
+                      const primary = h.primary;
+                      const profileCount = Object.values(h.protocols).filter(Boolean).length;
                       return (
                         <div
                           key={h.id}
@@ -2282,44 +2456,61 @@ export function SushiWorkspace() {
                                   {h.name}
                                 </div>
                                 <div className="font-mono-code truncate text-xs text-slate-400">
-                                  {h.username}@{h.host}:{h.port}
+                                  {h.username}@{h.host}:
+                                  {h.ports.ssh ?? h.ports.sftp ?? primary.port}
                                 </div>
                               </div>
                             </div>
-                            <span className="font-mono-code rounded-md bg-white/6 px-2 py-0.5 text-[10px] uppercase text-slate-300">
-                              {h.protocol}
-                            </span>
+                            <div className="flex shrink-0 flex-col items-end gap-1">
+                              {profileCount > 1 && (
+                                <span
+                                  className="rounded-md bg-white/6 px-2 py-0.5 text-[10px] uppercase text-slate-300"
+                                  title={`${profileCount} saved profiles merged into one machine`}
+                                >
+                                  {profileCount} profiles
+                                </span>
+                              )}
+                              <span className="flex items-center gap-0.5">
+                                {protocols.map((protocol) => (
+                                  <span
+                                    key={protocol}
+                                    className="rounded bg-white/6 px-1.5 py-0.5 text-[9px] font-semibold uppercase text-slate-300"
+                                  >
+                                    {protocol}
+                                  </span>
+                                ))}
+                              </span>
+                            </div>
                           </div>
 
                           <div className="mt-4 flex flex-wrap items-center justify-between gap-2 border-t border-white/6 pt-3">
                             <div className="flex flex-wrap items-center gap-1.5">
                               <button
                                 type="button"
-                                onClick={() => openSessionTab(h)}
+                                onClick={() => openUnifiedHost(h)}
                                 className="rounded-lg bg-white/10 px-3 py-1 text-xs font-medium text-white transition hover:bg-white/18"
                               >
                                 Connect
                               </button>
-                              {h.protocol !== "rdp" && (
+                              {protocols.includes("sftp") && (
                                 <button
                                   type="button"
-                                  onClick={() =>
-                                    openSessionTab(
-                                      h,
-                                      h.protocol === "ssh" ? "sftp" : "ssh"
-                                    )
-                                  }
+                                  onClick={() => openUnifiedHost(h, "sftp")}
                                   className="rounded-lg border border-white/10 px-2.5 py-1 text-xs text-slate-300 transition hover:bg-white/6 hover:text-white"
                                 >
-                                  {h.protocol === "ssh" ? "SFTP" : "SSH"}
+                                  SFTP
                                 </button>
                               )}
-                              {h.protocol !== "rdp" && (
+                              {protocols.includes("rdp") && (
                                 <button
                                   type="button"
-                                  onClick={() => openRdpCompanion(h)}
+                                  onClick={() => openUnifiedHost(h, "rdp")}
                                   className="flex items-center gap-1 rounded-lg border border-[#ff6b57]/35 bg-[#ff6b57]/10 px-2.5 py-1 text-xs text-[#ff9587] transition hover:bg-[#ff6b57]/20"
-                                  title="Open this host as an RDP desktop"
+                                  title={
+                                    h.protocols.rdp
+                                      ? "Open this host as an RDP desktop"
+                                      : "Open this host as an RDP desktop (derived on port 3389)"
+                                  }
                                 >
                                   <Monitor className="h-3 w-3" />
                                   RDP
@@ -2328,23 +2519,30 @@ export function SushiWorkspace() {
                             </div>
 
                             <div className="flex items-center gap-1">
+                              <a
+                                href={hostAccessUrl(h)}
+                                className="rounded-lg p-1.5 text-slate-400 hover:bg-white/8 hover:text-white"
+                                title={`One URL: ${hostAccessUrl(h)}`}
+                              >
+                                <ArrowLeftRight className="h-3.5 w-3.5" />
+                              </a>
                               <button
                                 type="button"
                                 onClick={() => {
-                                  setEditingProfile(h);
+                                  setEditingProfile(primary);
                                   setHostModalIntent(null);
                                   setHostModalOpen(true);
                                 }}
                                 className="rounded-lg p-1.5 text-slate-400 hover:bg-white/8 hover:text-white"
-                                title="Edit"
+                                title={profileCount > 1 ? "Edit this machine (SSH / SFTP / RDP each keep their own profile)" : "Edit"}
                               >
                                 <Pencil className="h-3.5 w-3.5" />
                               </button>
                               <button
                                 type="button"
-                                onClick={(e) => void handleDeleteHost(h.id, e)}
+                                onClick={(e) => void handleDeleteHost(primary.id, e, { wholeMachine: true })}
                                 className="rounded-lg p-1.5 text-slate-400 hover:bg-rose-500/15 hover:text-rose-400"
-                                title="Delete"
+                                title={profileCount > 1 ? "Delete this machine (all its profiles)" : "Delete"}
                               >
                                 <Trash2 className="h-3.5 w-3.5" />
                               </button>

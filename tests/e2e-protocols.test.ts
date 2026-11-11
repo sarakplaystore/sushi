@@ -100,6 +100,8 @@ import {
 } from "../src/lib/server/ssh-pool";
 import { POST as execRoutePost } from "../src/app/api/ssh/exec/route";
 import { POST as runRoutePost } from "../src/app/api/ssh/exec/run/route";
+import { GET as hostsApiGet } from "../src/app/api/hosts/route";
+import { GET as hostsPageGet } from "../src/app/hosts/route";
 import { POST as translateRoutePost } from "../src/app/api/translate/route";
 import {
   MAX_TRANSLATE_TEXT,
@@ -3247,13 +3249,123 @@ async function runTests() {
     }
   }
 
+  console.log("==> [9g] Testing the single-URL host inventory (/api/hosts + /hosts)...");
+  {
+    const authed = new Headers({ "x-sushi-session": validSessionToken });
+
+    // 1. Locked vault (the default): a complete, redacted index — no names, no leaks.
+    delete process.env.SUSHI_HOSTS_INVENTORY;
+    const lockedRes = await hostsApiGet(
+      new NextRequest("http://localhost/api/hosts", { headers: authed })
+    );
+    assert.equal(lockedRes.status, 200);
+    const locked = (await lockedRes.json()) as Record<string, unknown>;
+    assert.equal(locked.ok, true);
+    assert.equal(locked.self, "/api/hosts");
+    assert.equal(locked.page, "/hosts");
+    // `encrypted` mirrors the stored vault: with no envelope yet there is nothing to
+    // protect, with one it must be flagged as unreadable server-side.
+    assert.equal(typeof locked.encrypted, "boolean");
+    assert.deepEqual(locked.counts, {
+      hosts: 0,
+      profiles: 0,
+      byProtocol: { ssh: 0, sftp: 0, rdp: 0 },
+    });
+    assert.deepEqual(locked.hosts, []);
+    assert.ok(String(locked.hint).length > 20, "the index explains where the data comes from");
+
+    // 2. A clear-text inventory (opt-in) is merged into one entry per machine.
+    process.env.SUSHI_HOSTS_INVENTORY = JSON.stringify({
+      hosts: [
+        { id: "a-ssh", name: "prod", protocol: "ssh", host: "203.0.113.10", port: 22, username: "root" },
+        { id: "a-rdp", name: "prod (RDP)", protocol: "rdp", host: "203.0.113.10", port: 3389, username: "root" },
+        { id: "b-ssh", name: "db", protocol: "ssh", host: "198.51.100.7", port: 2222, username: "deploy" },
+        // Junk must be ignored, not crash the endpoint.
+        { nope: true },
+        "not-a-profile",
+        { host: "", username: "x", protocol: "ssh" },
+      ],
+    });
+    const openRes = await hostsApiGet(
+      new NextRequest("http://localhost/api/hosts", { headers: authed })
+    );
+    assert.equal(openRes.status, 200);
+    const open = (await openRes.json()) as {
+      encrypted: boolean;
+      counts: { hosts: number; profiles: number; byProtocol: Record<string, number> };
+      hosts: Array<{
+        id: string;
+        name: string;
+        host: string | null;
+        accessUrl: string;
+        protocols: string[];
+        links: Array<{ protocol: string; url: string; kind: string }>;
+      }>;
+    };
+    assert.equal(open.encrypted, false);
+    assert.equal(open.counts.hosts, 2, "two machines from four valid profiles");
+    assert.equal(open.counts.profiles, 3);
+    const prod = open.hosts.find((host) => host.host === "203.0.113.10")!;
+    assert.ok(prod, "the merged prod machine is present");
+    assert.equal(prod.accessUrl, "/hosts?host=unified-203.0.113.10-root");
+    assert.deepEqual(prod.protocols, ["ssh", "sftp", "rdp"]);
+    assert.deepEqual(
+      prod.links.map((link) => [link.protocol, link.url, link.kind]),
+      [
+        ["ssh", "ssh://root@203.0.113.10:22", "saved"],
+        ["sftp", "sftp://root@203.0.113.10:22", "derived"],
+        ["rdp", "rdp://root@203.0.113.10:3389", "saved"],
+      ]
+    );
+    const db = open.hosts.find((host) => host.id.includes("198.51.100.7"))!;
+    assert.equal(db.links.find((link) => link.protocol === "ssh")?.url, "ssh://deploy@198.51.100.7:2222");
+    assert.ok(!JSON.stringify(open).toLowerCase().includes("password"), "no credentials in the inventory");
+
+    // 3. Auth is required (the single URL is the normal Sushi session, nothing weaker).
+    const anon = await hostsApiGet(new NextRequest("http://localhost/api/hosts"));
+    assert.equal(anon.status, 401);
+
+    // 4. The page: HTML for people, JSON for scripts.
+    const pageRes = await hostsPageGet(new NextRequest("http://localhost/hosts", { headers: authed }));
+    assert.equal(pageRes.status, 200);
+    assert.match(pageRes.headers.get("content-type") || "", /text\/html/);
+    const page = await pageRes.text();
+    assert.match(page, /All hosts — one URL/);
+    assert.match(page, /\/api\/hosts/);
+    for (const protocol of ["ssh", "sftp", "rdp"]) {
+      assert.ok(page.includes(`protocol=${protocol}`), `the page documents ${protocol} links`);
+    }
+    assert.ok(!page.toLowerCase().includes("password:"), "the page never prints credentials");
+
+    const pageJson = await hostsPageGet(
+      new NextRequest("http://localhost/hosts?format=json", { headers: authed })
+    );
+    assert.equal(pageJson.status, 200);
+    const json = (await pageJson.json()) as Record<string, unknown>;
+    assert.equal(json.ok, true);
+    assert.equal(json.index, "/api/hosts");
+    assert.equal((json.protocols as unknown[]).length, 3);
+    const anonJson = await hostsPageGet(
+      new NextRequest("http://localhost/hosts", { headers: new Headers({ accept: "application/json" }) })
+    );
+    assert.equal(anonJson.status, 401);
+
+    // 5. A malformed inventory must not take the endpoint down.
+    process.env.SUSHI_HOSTS_INVENTORY = "{not json";
+    const brokenRes = await hostsApiGet(
+      new NextRequest("http://localhost/api/hosts", { headers: authed })
+    );
+    assert.equal(brokenRes.status, 200, "a broken SUSHI_HOSTS_INVENTORY falls back to the index");
+    delete process.env.SUSHI_HOSTS_INVENTORY;
+  }
+
   console.log("==> [10/10] Cleaning up test servers...");
   httpServer.close();
   guacdMock.close();
   rdpMock.close();
   sshServer.close();
   console.log(
-    "ALL AUTH, PASSKEY, KEY WHITELIST, TERMIX, SSH, SFTP, RDP, RDP-SESSION, EXEC STDIN, FOLDER-DOWNLOAD, SELECTION-DOWNLOAD, RDP-COMPANION, MENU-KEYS, SYSTEM-INFO, SSH-CONNECT-ERROR, SSH-REUSE, TRANSLATE, NO-TIMEOUT, AND RESUMABLE-RUN E2E TESTS PASSED!"
+    "ALL AUTH, PASSKEY, KEY WHITELIST, TERMIX, SSH, SFTP, RDP, RDP-SESSION, EXEC STDIN, FOLDER-DOWNLOAD, SELECTION-DOWNLOAD, RDP-COMPANION, MENU-KEYS, SYSTEM-INFO, SSH-CONNECT-ERROR, SSH-REUSE, TRANSLATE, NO-TIMEOUT, RESUMABLE-RUN, AND SINGLE-URL-HOST-LIST E2E TESTS PASSED!"
   );
 }
 

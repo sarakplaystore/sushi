@@ -1,3 +1,4 @@
+import { OS_COMMAND_SNIPPETS } from "./os-commands";
 import type {
   CommandSnippet,
   HostProfile,
@@ -76,6 +77,9 @@ export const DEFAULT_SNIPPETS: CommandSnippet[] = [
     command: "sudo nginx -t && sudo systemctl reload nginx",
     description: "Validate Nginx syntax before graceful reload",
   },
+  // Which OS (and which release) is this host? Ubuntu, Debian, RHEL/Rocky/Alma,
+  // Fedora, Arch, Alpine, SUSE and Amazon Linux, plus a probe that works anywhere.
+  ...OS_COMMAND_SNIPPETS,
 ];
 
 function bytesToBase64(bytes: Uint8Array): string {

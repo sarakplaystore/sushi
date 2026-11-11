@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useEffect, useRef, useState, useCallback } from "react";
+import React, { useEffect, useMemo, useRef, useState, useCallback } from "react";
 import {
   RotateCw,
   FolderKanban,
@@ -70,6 +70,12 @@ import {
   formatTerminalSystemLine,
   loadSshSystemInfo,
 } from "@/lib/client/sysinfo";
+import {
+  groupSnippetsByCategory,
+  isSnippetCategoryForHost,
+  mergeOsCommandSnippets,
+  osSnippetCategoryFor,
+} from "@/lib/client/os-commands";
 import {
   SSH_RETRY_DELAY_SECONDS,
   cleanSshFailureMessage,
@@ -220,6 +226,8 @@ export function SshTerminalSession({
   const [showSearch, setShowSearch] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [showSnippets, setShowSnippets] = useState(false);
+  /** Filters the snippet popover by title, command or category. */
+  const [snippetFilter, setSnippetFilter] = useState("");
   const [showThemes, setShowThemes] = useState(false);
   /** xterm currently has a text selection (enables the Translate button). */
   const [hasSelection, setHasSelection] = useState(false);
@@ -1733,6 +1741,34 @@ export function SshTerminalSession({
     return () => clearTimeout(t);
   }, [isActive]);
 
+  /**
+   * Snippets grouped by category (Diagnostics, Containers, OS · Ubuntu, …). The
+   * connected host's own OS family is flagged so the right "which Ubuntu is
+   * this?" command is one click away.
+   */
+  // Vaults saved before the OS commands existed still get them: they are merged
+  // in for display only, so nothing is written back to an unchanged vault.
+  const allSnippetGroups = useMemo(
+    () => groupSnippetsByCategory(mergeOsCommandSnippets(snippets)),
+    [snippets]
+  );
+  const snippetGroups = useMemo(() => {
+    const query = snippetFilter.trim().toLowerCase();
+    if (!query) return allSnippetGroups;
+    return allSnippetGroups
+      .map((group) => ({
+        category: group.category,
+        snippets: group.snippets.filter((item) =>
+          `${item.title} ${item.command} ${item.description || ""} ${group.category}`
+            .toLowerCase()
+            .includes(query)
+        ),
+      }))
+      .filter((group) => group.snippets.length > 0);
+  }, [allSnippetGroups, snippetFilter]);
+  const snippetCount = allSnippetGroups.reduce((total, group) => total + group.snippets.length, 0);
+  const hostOsCategory = osSnippetCategoryFor(systemInfo);
+
   const executeSnippet = (cmd: string) => {
     setShowSnippets(false);
     const term = termRef.current;
@@ -1924,7 +1960,10 @@ export function SshTerminalSession({
             <button
               type="button"
               onClick={() => {
-                setShowSnippets((v) => !v);
+                setShowSnippets((v) => {
+                  if (!v) setSnippetFilter("");
+                  return !v;
+                });
                 setShowThemes(false);
               }}
               className="flex items-center gap-1 rounded-lg border border-white/10 bg-white/5 px-2.5 py-1 text-xs text-slate-200 transition hover:bg-white/10"
@@ -1934,24 +1973,73 @@ export function SshTerminalSession({
               <span className="hidden sm:inline">Snippets</span>
             </button>
             {showSnippets && (
-              <div className="absolute top-full right-0 z-30 mt-2 max-h-[calc(100dvh-9rem)] w-72 max-w-[calc(100vw-2rem)] overflow-y-auto rounded-xl border border-white/12 bg-[#141924] p-2 shadow-2xl xl:top-9 xl:mt-0">
-                <div className="px-2 py-1 text-[11px] font-semibold uppercase tracking-wider text-slate-400">
-                  Run Quick Command
-                </div>
-                <div className="max-h-64 space-y-1 overflow-y-auto">
-                  {snippets.map((s) => (
-                    <button
-                      key={s.id}
-                      type="button"
-                      onClick={() => executeSnippet(s.command)}
-                      className="w-full rounded-lg px-2.5 py-1.5 text-left transition hover:bg-white/8"
+              <div className="absolute top-full right-0 z-30 mt-2 max-h-[calc(100dvh-9rem)] w-80 max-w-[calc(100vw-2rem)] overflow-y-auto rounded-xl border border-white/12 bg-[#141924] p-2 shadow-2xl xl:top-9 xl:mt-0">
+                <div className="flex items-baseline justify-between gap-2 px-2 py-1">
+                  <span className="text-[11px] font-semibold uppercase tracking-wider text-slate-400">
+                    Run Quick Command
+                  </span>
+                  {hostOsCategory && (
+                    <span
+                      className="truncate text-[10px] font-medium text-violet-300"
+                      title="Snippets matching the connected host's OS are flagged below"
                     >
-                      <div className="text-xs font-medium text-white">{s.title}</div>
-                      <div className="font-mono-code truncate text-[11px] text-slate-400">
-                        {s.command}
+                      this host: {hostOsCategory.replace(/^OS · /, "")}
+                    </span>
+                  )}
+                </div>
+                {snippetCount > 6 && (
+                  <input
+                    type="text"
+                    value={snippetFilter}
+                    onChange={(event) => setSnippetFilter(event.target.value)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Escape") {
+                        event.stopPropagation();
+                        setSnippetFilter("");
+                      }
+                    }}
+                    placeholder="Filter snippets (ubuntu, kernel, dnf …)"
+                    aria-label="Filter snippets"
+                    className="mb-1 w-full rounded-lg border border-white/10 bg-[#090b10] px-2.5 py-1.5 text-[11px] text-white placeholder-slate-500 outline-none focus:border-[#ff6b57]"
+                  />
+                )}
+                {!snippetGroups.length && (
+                  <div className="px-2.5 py-2 text-xs text-slate-400">
+                    {snippetCount
+                      ? "No snippet matches that filter."
+                      : "No snippets yet — import a Termix database or add your own."}
+                  </div>
+                )}
+                <div className="max-h-72 space-y-2 overflow-y-auto">
+                  {snippetGroups.map((group) => {
+                    const isHostOs = isSnippetCategoryForHost(group.category, systemInfo);
+                    return (
+                      <div key={group.category} className="space-y-0.5">
+                        <div className="flex items-center gap-1.5 px-2 pt-1 text-[10px] font-semibold uppercase tracking-wider text-slate-500">
+                          <span className="truncate">{group.category}</span>
+                          {isHostOs && (
+                            <span className="shrink-0 rounded-full bg-violet-500/20 px-1.5 py-0.5 text-[9px] font-semibold normal-case tracking-normal text-violet-200">
+                              this host
+                            </span>
+                          )}
+                        </div>
+                        {group.snippets.map((s) => (
+                          <button
+                            key={s.id}
+                            type="button"
+                            onClick={() => executeSnippet(s.command)}
+                            title={s.description || s.command}
+                            className="w-full rounded-lg px-2.5 py-1.5 text-left transition hover:bg-white/8"
+                          >
+                            <div className="text-xs font-medium text-white">{s.title}</div>
+                            <div className="font-mono-code truncate text-[11px] text-slate-400">
+                              {s.command}
+                            </div>
+                          </button>
+                        ))}
                       </div>
-                    </button>
-                  ))}
+                    );
+                  })}
                 </div>
               </div>
             )}

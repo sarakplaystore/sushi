@@ -474,6 +474,33 @@ you can confirm you opened the Ubuntu 22.04 box and not the 24.04 one *before* s
 host's shell is restricted (no `/etc/os-release`, a jailed `rbash`), the badge simply stays hidden and
 connecting still works.
 
+### One-tap OS commands (Snippets → `OS · …`)
+
+The header badge is the automatic answer. The same answers are also one click away in the
+**Snippets** popover, which now has a group per OS family — handy when you want to re-check a host by
+hand, script the same probe yourself, or look at a box whose restricted shell hides `/etc/os-release`
+from the automatic badge. Every command is read-only, runs as your login user (no `sudo`, no installs,
+no network access from the host) and has a fallback for a missing tool:
+
+| Group | Examples |
+|---|---|
+| `OS · Any Linux` | `cat /etc/os-release` (with a `/usr/lib/os-release` and `uname` fallback), kernel + libc, `hostnamectl`, cloud-init/DMI platform, `nproc` + `free -h` |
+| `OS · Ubuntu` | `lsb_release -a`, codename (`noble`, `jammy`, …), running kernel and every installed `linux-image-*`, `do-release-upgrade -c` (check only) |
+| `OS · Debian` | `/etc/debian_version` + codename, `lsb_release` fallback, configured apt repositories |
+| `OS · RHEL / Rocky / Alma` | `/etc/redhat-release`, `rpm -E '%{rhel} %{dist}'` (tells Rocky from Alma from genuine RHEL), `dnf check-update` |
+| `OS · Fedora` | `/etc/fedora-release`, `dnf check-update`, kernels |
+| `OS · Arch` | `/etc/arch-release` (rolling release, so no version number), kernel packages, package count + last upgrade from `pacman.log` |
+| `OS · Alpine` | `/etc/alpine-release`, apk repositories, `musl` version (the usual reason glibc binaries fail there) |
+| `OS · SUSE / openSUSE` | `os-release`, `/etc/SUSE-brand` + SLES registration status, `zypper list-updates` |
+| `OS · Amazon Linux` | `/etc/system-release`, `ID`/`VERSION_ID` and whether the host is dnf-based (2023) or yum-based (AL2) |
+
+Snippets are grouped by category in the popover, and the group that matches the connected host is
+flagged **this host** (the probe reads `PRETTY_NAME`, `NAME` and `VERSION_CODENAME`), so on an Ubuntu
+box you do not have to remember whether the right answer is `lsb_release` or
+`/etc/redhat-release`. Vaults saved before these commands existed get them merged into the popover —
+your own snippets and imported Termix snippet folders are untouched, and nothing is written back to
+the vault until you make a change yourself.
+
 ### Downloading files and folders (SFTP → ZIP)
 
 **Select what you want, then download it.** Every row has a checkbox and the header checkbox selects

@@ -334,3 +334,136 @@ export function createSudoAnswerer() {
     },
   };
 }
+
+/**
+ * Script behind "is my command still running?" (`/api/ssh/exec/run`).
+ *
+ * A resumable run is identified by its keystroke FIFO (removed the moment the
+ * command ends) and its output log (kept afterwards). One round trip answers both
+ * questions: `SUSHI_RUN_ALIVE` / `SUSHI_RUN_DEAD`, plus the log tail so the browser
+ * can redraw what it missed while the tab was gone.
+ *
+ * Read-only and cheap: `test -p` on the FIFO, `tail -c` on the log. Nothing is
+ * written, no root, no extra packages.
+ */
+export interface RunStatusScriptOptions {
+  /** Keystroke FIFO reported by the exec route (`/tmp/.sushi-keys-…`). */
+  keyChannel?: string | null;
+  /** Output log reported by the exec route (`/tmp/.sushi-run-….log`). */
+  runLog?: string | null;
+  /** How many bytes of the log tail to include (default 48 KiB, max 256 KiB). */
+  tailBytes?: number;
+}
+
+/** Output of `buildRunStatusScript`, parsed by `parseRunStatusOutput`. */
+export interface RunStatus {
+  alive: boolean;
+  exists: boolean;
+  /** Tail of the run log (empty when there is none). */
+  output: string;
+  /** `wc -c` size of the log, or -1 when it is gone. */
+  logBytes: number;
+}
+
+export const RUN_ALIVE_MARKER = "SUSHI_RUN_ALIVE";
+export const RUN_DEAD_MARKER = "SUSHI_RUN_DEAD";
+
+export function buildRunStatusScript({
+  keyChannel,
+  runLog,
+  tailBytes = 48 * 1024,
+}: RunStatusScriptOptions): string {
+  const channel = (keyChannel || "").trim();
+  const log = (runLog || "").trim();
+  const bytes = Math.max(1024, Math.min(256 * 1024, Math.floor(tailBytes)));
+  const lines: string[] = [];
+
+  if (channel && isKeyChannelPath(channel)) {
+    // A FIFO that still exists means the wrapper (and its command) is still there.
+    lines.push(
+      `if [ -p ${shellQuote(channel)} ]; then echo ${RUN_ALIVE_MARKER}; else echo ${RUN_DEAD_MARKER}; fi`
+    );
+  } else {
+    lines.push(`echo ${RUN_DEAD_MARKER}`);
+  }
+
+  if (log && isRunLogPath(log)) {
+    const quoted = shellQuote(log);
+    lines.push(
+      `if [ -f ${quoted} ]; then echo "SUSHI_LOG_BYTES=$(wc -c < ${quoted} 2>/dev/null | tr -d ' ')"; echo SUSHI_LOG_START; tail -c ${bytes} ${quoted} 2>/dev/null; echo; echo SUSHI_LOG_END; else echo "SUSHI_LOG_BYTES=-1"; fi`
+    );
+  } else {
+    lines.push(`echo "SUSHI_LOG_BYTES=-1"`);
+  }
+
+  return lines.join("\n");
+}
+
+/**
+ * Parses the `buildRunStatusScript` output.
+ *
+ * The state marker is always the script's first line, so a log that happens to
+ * contain the word "SUSHI_RUN_ALIVE" cannot confuse the answer: only that first line
+ * is read for the state, and the log sits between the LOG_START / LOG_END sentinels.
+ */
+export function parseRunStatusOutput(output: string): RunStatus {
+  // The state is the script's very first line (see buildRunStatusScript), so a log
+  // that happens to contain the marker word cannot change the answer.
+  const firstLine =
+    output
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .find(Boolean) || "";
+  const alive = firstLine === RUN_ALIVE_MARKER;
+  const logBytesLine = output.match(/SUSHI_LOG_BYTES=(-?\d+)/);
+  const logBytes = logBytesLine ? Number(logBytesLine[1]) : -1;
+
+  const start = output.indexOf("SUSHI_LOG_START");
+  const end = output.lastIndexOf("SUSHI_LOG_END");
+  let text = "";
+  if (start !== -1 && end > start) {
+    text = output
+      .slice(start + "SUSHI_LOG_START".length, end)
+      .replace(/^\r?\n/, "")
+      .replace(/\r?\n$/, "");
+  }
+
+  return { alive, exists: logBytes >= 0, output: text, logBytes };
+}
+
+/**
+ * Strips ANSI/VT control sequences from a PTY transcript.
+ *
+ * `script(1)` logs everything a terminal receives — colour codes, cursor moves,
+ * bracketed-paste toggles, `\r` progress redraws. That is right for xterm, but for
+ * the one-line "what did I miss?" preview in a resume prompt it must be plain text.
+ */
+export function stripTerminalControl(text: string): string {
+  return text
+    // OSC (window title, hyperlinks, Sushi's own meta marker) incl. BEL/ST
+    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "")
+    // CSI (colours, cursor movement, erase line)
+    .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "")
+    // Two-byte escapes (e.g. ESC ( B charset switch, ESC = keypad)
+    .replace(/\x1b[@-Z\\-_()][0-9A-Za-z]?/g, "")
+    // Other C0 controls that confuse a single-line preview, keeping newlines/tabs
+    .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, "")
+    // Backspaces already removed; carriage returns become line breaks.
+    .replace(/\r\n?/g, "\n");
+}
+
+/**
+ * Last meaningful lines of a transcript, for the resume preview.
+ * Drops blank lines and trims long ones, newest last.
+ */
+export function tailPreview(text: string, maxLines = 6, maxLineLength = 160): string[] {
+  const lines = stripTerminalControl(text)
+    .split("\n")
+    .map((line) => line.replace(/\s+$/, "").trim())
+    .filter(Boolean);
+  return lines
+    .slice(-maxLines)
+    .map((line) =>
+      line.length > maxLineLength ? `${line.slice(0, maxLineLength - 1)}…` : line
+    );
+}

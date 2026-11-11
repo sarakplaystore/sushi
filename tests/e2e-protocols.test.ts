@@ -99,6 +99,7 @@ import {
   sshPoolStats,
 } from "../src/lib/server/ssh-pool";
 import { POST as execRoutePost } from "../src/app/api/ssh/exec/route";
+import { POST as runRoutePost } from "../src/app/api/ssh/exec/run/route";
 import { POST as translateRoutePost } from "../src/app/api/translate/route";
 import {
   MAX_TRANSLATE_TEXT,
@@ -3141,13 +3142,118 @@ async function runTests() {
     assert.equal(ntNoChannelReady?.runLog, undefined, "run log only exists with a key channel");
   }
 
+  console.log("==> [9f] Testing resumable runs (is my command still running?) route...");
+
+  // A host that answers the run-status probe like a real /tmp would: a live FIFO
+  // (command still running) or a finished one (FIFO gone, log kept).
+  {
+    let runAlive = true;
+    const runServer = new SshServer({ hostKeys: [privateKey] }, (client) => {
+      client.on("authentication", (ctx) => {
+        if (ctx.method === "password" && ctx.username === "runner" && ctx.password === "pw") {
+          ctx.accept();
+        } else {
+          ctx.reject(["password"]);
+        }
+      });
+      client.on("ready", () => {
+        client.on("session", (accept) => {
+          const session = accept();
+          session.on("exec", (acceptExec, _reject, info) => {
+            const stream = acceptExec();
+            // Mirror buildRunStatusScript: first line = state, then the log tail.
+            if (info.command.includes("tail -c")) {
+              stream.write(runAlive ? "SUSHI_RUN_ALIVE\n" : "SUSHI_RUN_DEAD\n");
+              stream.write(
+                "SUSHI_LOG_BYTES=64\nSUSHI_LOG_START\nReading package lists... Done\n\u001b[32mSetting up docker.io\u001b[0m\nSUSHI_LOG_END\n"
+              );
+            } else {
+              stream.write("UNEXPECTED\n");
+            }
+            stream.exit(0);
+            stream.end();
+          });
+        });
+      });
+    });
+    await new Promise<void>((resolve) => runServer.listen(0, "127.0.0.1", () => resolve()));
+    const runPort = (runServer.address() as net.AddressInfo).port;
+    const runCreds: ConnectionCredentials = {
+      host: "127.0.0.1",
+      port: runPort,
+      username: "runner",
+      authMethod: "password",
+      password: "pw",
+    };
+    const keyChannel = createKeyChannelPath();
+    const runLog = createRunLogPath();
+    const postRun = (body: Record<string, unknown>, token = validSessionToken) =>
+      runRoutePost(
+        new NextRequest("http://localhost/api/ssh/exec/run", {
+          method: "POST",
+          headers: { "content-type": "application/json", "x-sushi-session": token },
+          body: JSON.stringify(body),
+        })
+      );
+
+    try {
+      // Still running: the FIFO exists and the log tail comes back.
+      const aliveRes = await postRun({
+        credentials: runCreds,
+        keyChannel,
+        runLog,
+      });
+      assert.equal(aliveRes.status, 200);
+      const alive = (await aliveRes.json()) as Record<string, unknown>;
+      assert.equal(alive.ok, true);
+      assert.equal(alive.running, true, "a live FIFO means the command is still running");
+      assert.equal(alive.logExists, true);
+      assert.equal(alive.logBytes, 64);
+      assert.ok(String(alive.output).includes("Reading package lists"));
+      assert.deepEqual(
+        (alive.preview as string[]).slice(-1),
+        ["Setting up docker.io"],
+        "the preview is plain text (no escape codes)"
+      );
+
+      // Finished: the FIFO is gone but the log and its output are still readable.
+      runAlive = false;
+      const deadRes = await postRun({ credentials: runCreds, keyChannel, runLog });
+      const dead = (await deadRes.json()) as Record<string, unknown>;
+      assert.equal(dead.running, false);
+      assert.equal(dead.logExists, true);
+      assert.ok(String(dead.output).includes("Setting up docker.io"));
+
+      // Auth + path validation: this route can never read an arbitrary file.
+      const unauth = await postRun({ credentials: runCreds, keyChannel }, "nope");
+      assert.equal(unauth.status, 401);
+      for (const bad of [
+        { keyChannel: "/etc/passwd" },
+        { keyChannel: "/tmp/.sushi-keys-aaaaaaaa; rm -rf /" },
+        { runLog: "/etc/shadow" },
+        { runLog: "/tmp/.sushi-run-../../etc/passwd.log" },
+        {},
+      ]) {
+        const res = await postRun({ credentials: runCreds, ...bad });
+        assert.equal(res.status, 400, `rejected: ${JSON.stringify(bad)}`);
+        const json = (await res.json()) as Record<string, unknown>;
+        assert.equal(json.ok, false);
+      }
+      const noCreds = await postRun({ keyChannel });
+      assert.equal(noCreds.status, 400);
+    } finally {
+      await new Promise<void>((resolve) => runServer.close(() => resolve()));
+      closeSshPool();
+    }
+  }
+
   console.log("==> [10/10] Cleaning up test servers...");
   httpServer.close();
   guacdMock.close();
   rdpMock.close();
   sshServer.close();
   console.log(
-    "ALL AUTH, PASSKEY, KEY WHITELIST, TERMIX, SSH, SFTP, RDP, RDP-SESSION, EXEC STDIN, FOLDER-DOWNLOAD, SELECTION-DOWNLOAD, RDP-COMPANION, MENU-KEYS, SYSTEM-INFO, SSH-CONNECT-ERROR, SSH-REUSE, TRANSLATE, AND NO-TIMEOUT E2E TESTS PASSED!"
+    "ALL AUTH, PASSKEY, KEY WHITELIST, TERMIX, SSH, SFTP, RDP, RDP-SESSION, EXEC STDIN, FOLDER-DOWNLOAD, SELECTION-DOWNLOAD, RDP-COMPANION, MENU-KEYS, SYSTEM-INFO, SSH-CONNECT-ERROR, SSH-REUSE, TRANSLATE, NO-TIMEOUT, AND RESUMABLE-RUN E2E TESTS PASSED!"
   );
 }
 

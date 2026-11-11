@@ -30,6 +30,10 @@ import {
   ChevronUp,
   AlertCircle,
   ShieldAlert,
+  Clock,
+  CirclePlay,
+  RotateCcw,
+  Infinity as InfinityIcon,
 } from "lucide-react";
 import type { AuthStatusResponse } from "@/types/auth";
 import type {
@@ -90,6 +94,21 @@ import {
   buildRdpCompanionProfile,
   rdpCompanionTitle,
 } from "@/lib/client/rdp-companion";
+import {
+  type RecentHostEntry,
+  type ResumePrompt,
+  type ResumableRun,
+  buildResumePrompt,
+  describeRunState,
+  formatRunDuration,
+  loadRecentHosts,
+  loadResumableRuns,
+  recordRecentHost,
+  removeRecentHost,
+  removeResumableRun,
+  resumableRunCandidates,
+  upsertResumableRun,
+} from "@/lib/client/session-resume";
 
 function downloadEncryptedVault(envelope: EncryptedVaultEnvelope, filename: string) {
   const url = URL.createObjectURL(new Blob([JSON.stringify(envelope, null, 2)], { type: "application/json" }));
@@ -182,6 +201,21 @@ export function SushiWorkspace() {
 
   const [tabs, setTabs] = useState<SessionTab[]>([]);
   const [activeTabId, setActiveTabId] = useState<string>("launchpad");
+
+  // ---------------------------------------------------------------------------
+  // Recently connected hosts + resumable runs ("your command is still running")
+  //
+  // Session state, not vault state: kept in this browser's localStorage so it
+  // survives a reload or a closed tab, and never synced (no secrets in it).
+  // ---------------------------------------------------------------------------
+  const [recentHosts, setRecentHosts] = useState<RecentHostEntry[]>([]);
+  const [resumableRuns, setResumableRuns] = useState<ResumableRun[]>([]);
+  /** Run each open SSH tab should take over (keyed by tab id). */
+  const [tabResumes, setTabResumes] = useState<Record<string, ResumableRun>>({});
+  /** The "go back to the still-running command?" prompt (null = not shown). */
+  const [resumePrompt, setResumePrompt] = useState<ResumePrompt | null>(null);
+  /** Runs already offered once, so Dismiss is not undone by the next poll. */
+  const dismissedResumeRef = useRef<Set<string>>(new Set());
 
   // Modals
   const [hostModalOpen, setHostModalOpen] = useState(false);
@@ -704,7 +738,13 @@ export function SushiWorkspace() {
       profile: HostProfile,
       overrideProtocol?: ProtocolType,
       overrideInitialPath?: string,
-      overrideTitle?: string
+      overrideTitle?: string,
+      /**
+       * A run to take over in the new tab: its command line is replayed and, when the
+       * command is still alive on the host, the session attaches to that run instead
+       * of starting a new one ("go back to my command").
+       */
+      resumeRun?: ResumableRun
     ) => {
       setMobileSidebarOpen(false);
       const proto = overrideProtocol || profile.protocol;
@@ -731,9 +771,124 @@ export function SushiWorkspace() {
       };
       setTabs((prev) => [...prev, newTab]);
       setActiveTabId(tabId);
+      if (resumeRun) {
+        // The terminal reads this once and then reports the run back to us, so the
+        // tab reattaches to the command that is already running on the host.
+        setTabResumes((prev) => ({ ...prev, [tabId]: resumeRun }));
+      }
     },
     [enforceKeyWhitelist, sshKeys]
   );
+
+  // ---------------------------------------------------------------------------
+  // Session history: recently connected hosts, and runs that outlived their tab
+  // ---------------------------------------------------------------------------
+
+  /** Reads history + runs from localStorage (call after mount and after changes). */
+  const refreshSessionHistory = useCallback(() => {
+    setRecentHosts(loadRecentHosts());
+    setResumableRuns(loadResumableRuns());
+  }, []);
+
+  useEffect(() => {
+    refreshSessionHistory();
+  }, [refreshSessionHistory]);
+
+  /**
+   * A session really connected: remember the host for the "Recently connected" list
+   * and, if a command from this browser is still running there, offer to go back.
+   */
+  const handleSessionConnected = useCallback(
+    (profile: HostProfile, savedHostId?: string | null) => {
+      setRecentHosts(
+        recordRecentHost(profile, { isSaved: Boolean(savedHostId ?? hosts.some((h) => h.id === profile.id)) })
+      );
+      const runs = loadResumableRuns();
+      setResumableRuns(runs);
+      const prompt = buildResumePrompt(runs);
+      if (!prompt) return;
+      if (dismissedResumeRef.current.has(prompt.run.id)) return;
+      // The tab that is running it right now does not need to be offered it.
+      if (resumePrompt && resumePrompt.run.id === prompt.run.id) return;
+      setResumePrompt(prompt);
+    },
+    [hosts, resumePrompt]
+  );
+
+  /** A tab started / finished / updated a command: keep the run in the history. */
+  const handleRunUpdated = useCallback((run: ResumableRun | null, tabId: string) => {
+    if (!run) {
+      // The tab forgot its run (new command, reconnect…): nothing to offer for it.
+      setTabResumes((prev) => {
+        if (!(tabId in prev)) return prev;
+        const next = { ...prev };
+        delete next[tabId];
+        return next;
+      });
+      return;
+    }
+    setResumableRuns(upsertResumableRun(run));
+  }, []);
+
+  /** Closes the card, drops the run from history (its log stays on the host). */
+  const dismissResumePrompt = useCallback(() => {
+    setResumePrompt((current) => {
+      if (current) {
+        dismissedResumeRef.current.add(current.run.id);
+        setResumableRuns(removeResumableRun(current.run.id));
+      }
+      return null;
+    });
+  }, []);
+
+  /** "Go back": reopen that host in a tab that attaches to the running command. */
+  const resumeRunInTab = useCallback(
+    (run: ResumableRun) => {
+      dismissedResumeRef.current.add(run.id);
+      setResumePrompt(null);
+      // Prefer the saved vault entry (fresh credentials) over the stored snapshot.
+      const saved = hosts.find(
+        (h) =>
+          h.protocol === run.profile.protocol &&
+          h.host === run.profile.host &&
+          Number(h.port) === Number(run.profile.port) &&
+          h.username === run.profile.username
+      );
+      openSessionTab(saved ?? run.profile, "ssh", undefined, undefined, run);
+    },
+    [hosts, openSessionTab]
+  );
+
+  /** "Just open the host" from the resume card: a normal session, no resume. */
+  const openRunHostFresh = useCallback(
+    (run: ResumableRun) => {
+      dismissedResumeRef.current.add(run.id);
+      setResumePrompt(null);
+      const saved = hosts.find(
+        (h) =>
+          h.protocol === run.profile.protocol &&
+          h.host === run.profile.host &&
+          Number(h.port) === Number(run.profile.port) &&
+          h.username === run.profile.username
+      );
+      openSessionTab(saved ?? run.profile);
+    },
+    [hosts, openSessionTab]
+  );
+
+  /** Opens a host from the "Recently connected" list (saved entry when there is one). */
+  const openRecentHost = useCallback(
+    (entry: RecentHostEntry) => {
+      const saved = hosts.find((h) => h.id === entry.profileId);
+      openSessionTab(saved ?? entry.profile);
+    },
+    [hosts, openSessionTab]
+  );
+
+  /** Forget one host in the recent list (does not touch the vault). */
+  const forgetRecentHost = useCallback((key: string) => {
+    setRecentHosts(removeRecentHost(key));
+  }, []);
 
   /**
    * Opens the same machine as a desktop: one click from a host row, a host card,
@@ -791,6 +946,14 @@ export function SushiWorkspace() {
 
   const closeSessionTab = (tabId: string, e?: React.MouseEvent) => {
     e?.stopPropagation();
+    // Closing the tab does not stop the command: its run stays in the history so the
+    // "go back?" prompt (or the launchpad list) can reopen it.
+    setTabResumes((prev) => {
+      if (!(tabId in prev)) return prev;
+      const next = { ...prev };
+      delete next[tabId];
+      return next;
+    });
     setTabs((prev) => {
       const idx = prev.findIndex((t) => t.id === tabId);
       const next = prev.filter((t) => t.id !== tabId);
@@ -1682,6 +1845,56 @@ export function SushiWorkspace() {
                 </div>
               )}
 
+              {/* "Your command is still running — go back?" after a reload / closed tab */}
+              {resumePrompt && (
+                <div
+                  role="status"
+                  className="flex flex-wrap items-start justify-between gap-3 rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-xs text-amber-100"
+                >
+                  <span className="flex items-start gap-2">
+                    <InfinityIcon className="mt-0.5 h-4 w-4 shrink-0 text-amber-400" />
+                    <span className="space-y-1">
+                      <span className="block font-semibold text-amber-200">
+                        {resumePrompt.title}
+                      </span>
+                      <span className="block text-amber-100/90">{resumePrompt.body}</span>
+                      {resumePrompt.run.cwd ? (
+                        <span className="font-mono-code block text-[11px] text-amber-200/60">
+                          {resumePrompt.run.cwd}
+                          {resumePrompt.run.runLog ? ` · log ${resumePrompt.run.runLog}` : ""}
+                        </span>
+                      ) : null}
+                    </span>
+                  </span>
+                  <span className="flex shrink-0 flex-wrap items-center gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => resumeRunInTab(resumePrompt.run)}
+                      className="inline-flex items-center gap-1 rounded-lg bg-amber-500/25 px-3 py-1 font-semibold text-amber-50 hover:bg-amber-500/35"
+                    >
+                      <CirclePlay className="h-3 w-3" />
+                      {resumePrompt.acceptLabel}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => openRunHostFresh(resumePrompt.run)}
+                      className="rounded-lg border border-amber-400/40 px-3 py-1 font-medium text-amber-100 hover:bg-amber-500/20"
+                      title="Open a normal session on that host without attaching to the run"
+                    >
+                      Just open the host
+                    </button>
+                    <button
+                      type="button"
+                      onClick={dismissResumePrompt}
+                      className="rounded-lg px-2 py-1 text-amber-200/70 hover:text-amber-100"
+                      title="Do not ask again for this command"
+                    >
+                      Dismiss
+                    </button>
+                  </span>
+                </div>
+              )}
+
               {vaultSyncError && (
                 <div role="alert" className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-xs text-rose-200">
                   <span>{vaultSyncError}</span>
@@ -1894,6 +2107,139 @@ export function SushiWorkspace() {
                 </button>
               </div>
 
+              {/* Recently connected (session history: nothing here is a saved host) */}
+              {(recentHosts.length > 0 || resumableRunCandidates(resumableRuns).length > 0) && (
+                <div className="space-y-3">
+                  <div className="flex items-center justify-between">
+                    <h2 className="flex items-center gap-1.5 text-sm font-semibold text-white">
+                      <Clock className="h-3.5 w-3.5 text-slate-400" />
+                      Recently Connected
+                    </h2>
+                    <span className="text-[11px] text-slate-500">
+                      This browser only · not saved hosts
+                    </span>
+                  </div>
+
+                  {/* Commands that outlived their tab */}
+                  {resumableRunCandidates(resumableRuns).map((run) => (
+                    <div
+                      key={run.id}
+                      className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-amber-500/25 bg-amber-500/[0.06] px-3 py-2"
+                    >
+                      <span className="flex min-w-0 items-center gap-2">
+                        <InfinityIcon
+                          className={`h-3.5 w-3.5 shrink-0 ${
+                            run.running ? "text-amber-300" : "text-slate-500"
+                          }`}
+                        />
+                        <span className="min-w-0">
+                          <span className="font-mono-code block truncate text-[11px] text-slate-100">
+                            {run.command}
+                          </span>
+                          <span className="block truncate text-[10px] text-slate-400">
+                            {run.profile.username}@{run.profile.host}
+                            {run.profile.port ? `:${run.profile.port}` : ""} ·{" "}
+                            {describeRunState(run)}
+                          </span>
+                        </span>
+                      </span>
+                      <span className="flex shrink-0 items-center gap-1.5">
+                        <button
+                          type="button"
+                          onClick={() => resumeRunInTab(run)}
+                          className="inline-flex items-center gap-1 rounded-lg border border-amber-400/40 bg-amber-500/15 px-2.5 py-1 text-[11px] font-semibold text-amber-100 hover:bg-amber-500/25"
+                          title="Reopen that session, replay the command line and attach to the run"
+                        >
+                          <CirclePlay className="h-3 w-3" />
+                          {run.running ? "Go back to it" : "Open log"}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setResumableRuns(removeResumableRun(run.id))}
+                          className="rounded-lg p-1 text-slate-500 hover:bg-white/8 hover:text-rose-300"
+                          title="Forget this run (it is not stopped on the host)"
+                        >
+                          <X className="h-3 w-3" />
+                        </button>
+                      </span>
+                    </div>
+                  ))}
+
+                  {/* Hosts that were opened from this browser */}
+                  {recentHosts.length > 0 && (
+                    <div className="flex flex-wrap gap-2">
+                      {recentHosts.map((entry) => {
+                        const Icon =
+                          entry.protocol === "rdp"
+                            ? Monitor
+                            : entry.protocol === "sftp"
+                              ? FolderKanban
+                              : Terminal;
+                        const saved = hosts.some((h) => h.id === entry.profileId);
+                        return (
+                          <div
+                            key={entry.key}
+                            className="group flex items-center gap-1 rounded-xl border border-white/8 bg-[#111520] pl-2.5 pr-1 py-1.5 transition hover:border-white/18"
+                          >
+                            <button
+                              type="button"
+                              onClick={() => openRecentHost(entry)}
+                              className="flex min-w-0 items-center gap-2 text-left"
+                              title={`${entry.username}@${entry.host}:${entry.port} — ${formatRunDuration(Date.now() - entry.lastConnectedAt)} ago`}
+                            >
+                              <Icon className="h-3.5 w-3.5 shrink-0 text-slate-400" />
+                              <span className="min-w-0">
+                                <span className="block max-w-[160px] truncate text-[11px] font-medium text-slate-100">
+                                  {entry.name}
+                                </span>
+                                <span className="font-mono-code block max-w-[160px] truncate text-[10px] text-slate-500">
+                                  {entry.username}@{entry.host} ·{" "}
+                                  {formatRunDuration(Date.now() - entry.lastConnectedAt)} ago
+                                </span>
+                              </span>
+                              {!saved && (
+                                <span
+                                  className="shrink-0 rounded bg-white/6 px-1 text-[9px] uppercase text-slate-400"
+                                  title="Not in the vault — this tab's history only"
+                                >
+                                  ad-hoc
+                                </span>
+                              )}
+                            </button>
+                            {saved && (
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  const host = hosts.find((h) => h.id === entry.profileId);
+                                  if (host) openSessionTab(host, host.protocol === "ssh" ? "sftp" : "ssh");
+                                }}
+                                className="rounded p-1 text-slate-500 hover:bg-white/10 hover:text-sky-300"
+                                title={entry.protocol === "ssh" ? "Open as SFTP" : "Open as SSH"}
+                              >
+                                {entry.protocol === "ssh" ? (
+                                  <FolderKanban className="h-3 w-3" />
+                                ) : (
+                                  <Terminal className="h-3 w-3" />
+                                )}
+                              </button>
+                            )}
+                            <button
+                              type="button"
+                              onClick={() => forgetRecentHost(entry.key)}
+                              className="rounded p-1 text-slate-600 hover:bg-white/8 hover:text-rose-300"
+                              title="Remove from recently connected"
+                              aria-label={`Remove ${entry.name} from recently connected`}
+                            >
+                              <X className="h-3 w-3" />
+                            </button>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              )}
+
               {/* Saved Hosts Section */}
               {hosts.length > 0 && (
                 <div className="space-y-3">
@@ -2034,6 +2380,9 @@ export function SushiWorkspace() {
                     }
                     onOpenRdp={() => openRdpCompanion(tab.profile)}
                     onOpenGatewayModal={() => setGatewayModalOpen(true)}
+                    onConnected={() => handleSessionConnected(tab.profile, tab.profile.id)}
+                    onRunChange={(run) => handleRunUpdated(run, tab.id)}
+                    resumeRun={tabResumes[tab.id] ?? null}
                   />
                 )}
                 {tab.protocol === "sftp" && (

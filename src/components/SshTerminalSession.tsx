@@ -44,6 +44,7 @@ import {
   supportsStreamingRequestBody,
 } from "@/lib/client/exec-stdin";
 import { getStoredSessionToken } from "@/lib/client/auth-storage";
+import { randomUUID } from "@/lib/client/web-crypto";
 import {
   CONFIRM_PROMPT_RE,
   MENU_KEY,
@@ -85,6 +86,8 @@ import {
   type SshConnectFailure,
 } from "@/lib/client/ssh-retry";
 import { SshConnectErrorCard } from "@/components/SshConnectErrorCard";
+import { fetchRunStatus } from "@/lib/client/run-status";
+import type { ResumableRun } from "@/lib/client/session-resume";
 import { TranslatePanel } from "@/components/TranslatePanel";
 
 interface SshTerminalSessionProps {
@@ -97,6 +100,23 @@ interface SshTerminalSessionProps {
   onOpenCompanionSftp: (cwd?: string) => void;
   onOpenRdp: () => void;
   onOpenGatewayModal: () => void;
+  /**
+   * The session really connected (used for the "Recently connected" history and to
+   * offer a command that is still running on this host).
+   */
+  onConnected?: () => void;
+  /**
+   * A command started, changed state, or ended. `null` means "this tab has no run
+   * any more" (a new command replaced it, or the session was reset). The workspace
+   * stores it so the run survives a reload / a closed tab.
+   */
+  onRunChange?: (run: ResumableRun | null) => void;
+  /**
+   * A run to take over: the command line is replayed in the terminal and, when the
+   * command is still alive on the host, its output log is redrawn and keystrokes are
+   * delivered to the run that is already going.
+   */
+  resumeRun?: ResumableRun | null;
 }
 
 const TERMINAL_THEMES: Record<
@@ -172,6 +192,9 @@ export function SshTerminalSession({
   onOpenCompanionSftp,
   onOpenRdp,
   onOpenGatewayModal,
+  onConnected,
+  onRunChange,
+  resumeRun,
 }: SshTerminalSessionProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<import("@xterm/xterm").Terminal | null>(null);
@@ -251,6 +274,17 @@ export function SshTerminalSession({
   const [detachedRun, setDetachedRun] = useState<(ExecKeyChannel & { runLog?: string }) | null>(
     null
   );
+  /**
+   * The run this tab is tracking: the command that started in it, or the one it
+   * reattached to. Reported to the workspace (and from there to localStorage), so a
+   * reload or a closed tab can offer "go back to the still-running command".
+   */
+  const [currentRun, setCurrentRun] = useState<ResumableRun | null>(null);
+  const currentRunRef = useRef<ResumableRun | null>(null);
+  /** True while the tab is showing the log of a run it did not start. */
+  const [reattached, setReattached] = useState(false);
+  /** The resumed command is being followed; its log tail is redrawn here. */
+  const [trackingRun, setTrackingRun] = useState(false);
   const [connectSeq, setConnectSeq] = useState(0);
   /** The failure that ended the session; null while the session is healthy. */
   const [connectFailure, setConnectFailure] = useState<SshConnectFailure | null>(
@@ -567,9 +601,13 @@ export function SshTerminalSession({
                   keyPath = evt.keyChannel;
                   keyChannelRef.current = { path: evt.keyChannel, credentials };
                   setKeyChannelActive(true);
+                  // Kept in the tab's run, so the command can be reached again after
+                  // a reload or a closed tab (this is what makes resume work).
+                  updateRunRef.current({ keyChannel: evt.keyChannel });
                 }
                 if (typeof evt.runLog === "string" && evt.runLog) {
                   runLogPath = evt.runLog;
+                  updateRunRef.current({ runLog: evt.runLog });
                   if (noTimeoutRef.current) {
                     options.stream?.(
                       `\r\n\x1b[90mno-timeout run: output is also logged to ${evt.runLog}, and keys still reach it via ${evt.keyChannel ?? "the key channel"} — the command survives a disconnect.\x1b[0m\r\n`
@@ -586,6 +624,8 @@ export function SshTerminalSession({
               } else if (evt.type === "meta") {
                 gotMeta = true;
                 exitCode = Number(evt.exitCode ?? 0);
+                // The command ended inside this tab: nothing left to resume.
+                if (!noTimeoutRef.current) updateRunRef.current({ running: false, exitCode });
                 if (typeof evt.cwd === "string" && evt.cwd) {
                   cwdRef.current = evt.cwd;
                   setCurrentCwd(evt.cwd);
@@ -609,6 +649,12 @@ export function SshTerminalSession({
             // The request ended without an exit marker: in no-timeout mode the
             // command is (by design) still running on the host.
             setDetachedRun({ path: keyPath, credentials, runLog: runLogPath || undefined });
+            updateRunRef.current({
+              running: true,
+              detached: true,
+              keyChannel: keyPath,
+              ...(runLogPath ? { runLog: runLogPath } : {}),
+            });
           }
         } catch (err) {
           // Any failure before the stream produced output means the streamed body was
@@ -634,6 +680,12 @@ export function SshTerminalSession({
             // host — offer its key channel + output log so it can be answered later.
             if (noTimeoutRef.current && gotReady && keyPath) {
               setDetachedRun({ path: keyPath, credentials, runLog: runLogPath || undefined });
+              updateRunRef.current({
+                running: true,
+                detached: true,
+                keyChannel: keyPath,
+                ...(runLogPath ? { runLog: runLogPath } : {}),
+              });
             }
           }
         } finally {
@@ -740,6 +792,244 @@ export function SshTerminalSession({
   );
 
   /**
+   * Publishes the tab's run to the workspace (localStorage-backed), so the command
+   * can be found again after a reload or a closed tab. `null` clears it.
+   */
+  const publishRun = useCallback(
+    (run: ResumableRun | null) => {
+      currentRunRef.current = run;
+      setCurrentRun(run);
+      onRunChange?.(run);
+    },
+    [onRunChange]
+  );
+
+  /**
+   * Remembers a command that just started. Only serverless commands can outlive the
+   * tab (they are the ones with a keystroke FIFO and a /tmp log); a WebSocket PTY
+   * lives exactly as long as its socket, so it is not offered as resumable.
+   */
+  const beginRun = useCallback(
+    (command: string, transport: "ws" | "serverless") => {
+      if (transport !== "serverless") {
+        publishRun(null);
+        return;
+      }
+      publishRun({
+        id: `run-${randomUUID()}`,
+        profile: {
+          ...profile,
+          // The stored snapshot never carries credentials (see session-resume).
+          password: undefined,
+          privateKey: undefined,
+          passphrase: undefined,
+        },
+        command,
+        cwd: cwdRef.current,
+        detached: noTimeoutRef.current,
+        running: true,
+        startedAt: Date.now(),
+        updatedAt: Date.now(),
+      });
+    },
+    [profile, publishRun]
+  );
+
+  /** `updateRun` is called from the transport callbacks installed per connection. */
+  const updateRunRef = useRef<(patch: Partial<ResumableRun>) => void>(() => {});
+  /** Same for the connection callbacks (they are installed once per session). */
+  const onConnectedRef = useRef(onConnected);
+  useEffect(() => {
+    onConnectedRef.current = onConnected;
+  }, [onConnected]);
+  /** A run handed over by the workspace, consumed once the session connects. */
+  const resumeRunRef = useRef<ResumableRun | null>(resumeRun ?? null);
+  useEffect(() => {
+    resumeRunRef.current = resumeRun ?? null;
+  }, [resumeRun]);
+
+  /** Fills in the FIFO / log paths and the final state of the tracked run. */
+  const updateRun = useCallback(
+    (patch: Partial<ResumableRun>) => {
+      const run = currentRunRef.current;
+      if (!run) return;
+      const next: ResumableRun = {
+        ...run,
+        ...patch,
+        profile: run.profile,
+        id: run.id,
+        updatedAt: Date.now(),
+      };
+      // Nothing actually changed: do not rewrite localStorage on every poll.
+      const changed =
+        next.running !== run.running ||
+        next.exitCode !== run.exitCode ||
+        next.keyChannel !== run.keyChannel ||
+        next.runLog !== run.runLog ||
+        next.command !== run.command;
+      currentRunRef.current = next;
+      setCurrentRun(next);
+      if (changed) onRunChange?.(next);
+    },
+    [onRunChange]
+  );
+  useEffect(() => {
+    updateRunRef.current = updateRun;
+  }, [updateRun]);
+
+  /**
+   * "Go back to that session": shows the command line again, redraws what the log
+   * captured while the tab was gone, and points the keystroke channel at the FIFO of
+   * the command that is still running — so typing reaches it instead of starting a
+   * second copy.
+   */
+  const attachToRun = useCallback(
+    async (term: import("@xterm/xterm").Terminal, run: ResumableRun) => {
+      const credentials: ConnectionCredentials = {
+        host: run.profile.host,
+        port: run.profile.port,
+        username: run.profile.username,
+        authMethod: run.profile.authMethod,
+        password: profile.password,
+        privateKey: profile.privateKey,
+        passphrase: profile.passphrase,
+      };
+      const label = `${run.profile.username}@${run.profile.host}`;
+      setReattached(true);
+      setTrackingRun(run.running);
+      currentRunRef.current = run;
+      setCurrentRun(run);
+      onRunChange?.(run);
+
+      term.writeln(
+        `\x1b[90m↳ resuming \x1b[0m\x1b[1m${run.command}\x1b[0m\x1b[90m on ${label} — started ${new Date(run.startedAt).toLocaleString()}\x1b[0m`
+      );
+
+      if (run.keyChannel && run.running) {
+        keyChannelRef.current = { path: run.keyChannel, credentials };
+        setKeyChannelActive(true);
+      }
+
+      const status = run.keyChannel || run.runLog
+        ? await fetchRunStatus(
+            { credentials, keyChannel: run.keyChannel, runLog: run.runLog },
+            gatewaySettings
+          )
+        : null;
+
+      if (status?.ok) {
+        if (status.output) {
+          term.writeln("\x1b[90m── output so far (from the run log on the host) ──\x1b[0m");
+          term.write(status.output.replace(/\r?\n/g, "\r\n"));
+        }
+        if (status.running) {
+          term.writeln(
+            "\x1b[33m● still running on the host\x1b[0m" +
+              (run.runLog ? ` \x1b[90m(log: ${run.runLog})\x1b[0m` : "") +
+              "\x1b[90m — keys you type are sent to it.\x1b[0m"
+          );
+          updateRun({ running: true });
+        } else {
+          term.writeln(
+            "\x1b[90m● that command has finished on the host; the full log is still there" +
+              (run.runLog ? ` at ${run.runLog}` : "") +
+              ".\x1b[0m"
+          );
+          setTrackingRun(false);
+          updateRun({ running: false });
+          if (run.keyChannel) {
+            keyChannelRef.current = null;
+            setKeyChannelActive(false);
+          }
+          writePrompt(term);
+        }
+      } else {
+        term.writeln(
+          `\x1b[33m● could not read the run log${status?.error ? `: ${status.error}` : ""}. The command may have finished or the host is unreachable.\x1b[0m`
+        );
+        setTrackingRun(false);
+        if (run.keyChannel) {
+          keyChannelRef.current = null;
+          setKeyChannelActive(false);
+        }
+        writePrompt(term);
+      }
+    },
+    [gatewaySettings, onRunChange, profile, updateRun, writePrompt]
+  );
+
+  /**
+   * Polls a reattached run: prints what the log gained and notices when the command
+   * ends, so the terminal goes back to a normal prompt by itself.
+   */
+  useEffect(() => {
+    if (!reattached || !currentRun || modeRef.current !== "serverless") return;
+    let stopped = false;
+    let printed = 0;
+    let misses = 0;
+    const credentials: ConnectionCredentials = {
+      host: profile.host,
+      port: profile.port,
+      username: profile.username,
+      authMethod: profile.authMethod,
+      password: profile.password,
+      privateKey: profile.privateKey,
+      passphrase: profile.passphrase,
+    };
+
+    const tick = async () => {
+      const run = currentRunRef.current;
+      if (stopped || !run || !run.keyChannel) return;
+      const status = await fetchRunStatus(
+        { credentials, keyChannel: run.keyChannel, runLog: run.runLog },
+        gatewaySettings,
+        { timeoutMs: 12000 }
+      );
+      if (stopped) return;
+      if (!status.ok) {
+        // A single failed poll is not an ending; three in a row is.
+        misses += 1;
+        if (misses >= 3) {
+          setTrackingRun(false);
+          setReattached(false);
+          return;
+        }
+        return;
+      }
+      misses = 0;
+      if (status.output.length > printed) {
+        const fresh = status.output.slice(printed);
+        printed = status.output.length;
+        termRef.current?.write(fresh.replace(/\r?\n/g, "\r\n"));
+      }
+      if (!status.running) {
+        setTrackingRun(false);
+        setReattached(false);
+        keyChannelRef.current = null;
+        setKeyChannelActive(false);
+        updateRun({ running: false });
+        termRef.current?.writeln("\r\n\x1b[90m● the command finished on the host.\x1b[0m");
+        const t = termRef.current;
+        if (t) writePrompt(t);
+        return;
+      }
+    };
+
+    const timer = setInterval(() => void tick(), 4000);
+    void tick();
+    return () => {
+      stopped = true;
+      clearInterval(timer);
+    };
+  }, [gatewaySettings, profile, reattached, updateRun, writePrompt]);
+
+  /** Stops following a reattached run without touching the command on the host. */
+  const stopTrackingRun = useCallback(() => {
+    setTrackingRun(false);
+    setReattached(false);
+  }, []);
+
+  /**
    * Writes raw bytes into the running command's keystroke FIFO.
    *
    * This is the path that makes an old-Ubuntu `Configuring lightdm` screen usable on
@@ -768,6 +1058,7 @@ export function SshTerminalSession({
         keyBatcherRef.current?.dispose();
         keyBatcherRef.current = null;
         setKeyChannelActive(false);
+        updateRunRef.current({ running: false });
         setMenuNote(
           "This host has no key channel for the running command — typing an answer and pressing Enter works instead."
         );
@@ -1005,6 +1296,9 @@ export function SshTerminalSession({
         setMenu(null);
         setMenuNote(null);
         pendingCommandRef.current = rawCmd;
+        // Track this as the tab's run: it can outlive the tab in no-timeout mode, and
+        // the workspace stores it so a reload can offer "go back".
+        beginRun(rawCmd, modeRef.current);
         const result = await execServerless(commandToRun, {
           elevateUser,
           password,
@@ -1070,6 +1364,12 @@ export function SshTerminalSession({
           return;
         }
 
+        // A normal (with-timeout) command that returned is over. In no-timeout mode
+        // the lack of a META marker means it is still running on the host instead.
+        if (!noTimeoutRef.current) {
+          updateRun({ running: false, exitCode: result.exitCode });
+        }
+
         // sudo accepted / rejected the password we used
         if (elevateUser && options.password) {
           if (SUDO_WRONG_PASSWORD_RE.test(result.output)) {
@@ -1093,7 +1393,7 @@ export function SshTerminalSession({
         if (!secretPromptRef.current && !sessionLost) writePrompt(term);
       }
     },
-    [askSudoPassword, enterRootMode, execServerless, profile.username, probeElevation, writePrompt]
+    [askSudoPassword, beginRun, enterRootMode, execServerless, profile.username, probeElevation, updateRun, writePrompt]
   );
 
   /**
@@ -1510,7 +1810,16 @@ export function SshTerminalSession({
           if (line) term.writeln(`\x1b[90m\u21b3 ${line}\x1b[0m`);
           // Only now can anything be typed: a prompt exists from here on.
           connectingRef.current = false;
-          writePrompt(term);
+          onConnectedRef.current?.();
+          if (resumeRunRef.current) {
+            // "Go back": show the command again and take over the run if the host is
+            // still executing it. The prompt is written once the attach finishes.
+            const run = resumeRunRef.current;
+            resumeRunRef.current = null;
+            await attachToRun(term, run);
+          } else {
+            writePrompt(term);
+          }
           term.focus();
         })();
       };
@@ -1565,6 +1874,7 @@ export function SshTerminalSession({
               openedReady = true;
               setStatus("connected");
               if (msg.fingerprint) setFingerprint(msg.fingerprint);
+              onConnectedRef.current?.();
               term.focus();
               if (initialPath && initialPath !== "~") {
                 ws.send(
@@ -2177,6 +2487,47 @@ export function SshTerminalSession({
           </button>
         </div>
       </div>
+
+      {/* Following a command that was started before this tab existed. */}
+      {reattached && currentRun && (
+        <div className="flex flex-wrap items-center justify-between gap-2 border-b border-amber-500/25 bg-amber-500/10 px-4 py-1.5 text-[11px] text-amber-100">
+          <span className="flex min-w-0 items-center gap-1.5">
+            <Infinity className="h-3.5 w-3.5 shrink-0 text-amber-300" />
+            <span className="truncate">
+              Resumed run · <span className="font-mono-code">{currentRun.command}</span>
+              {currentRun.runLog ? (
+                <span className="text-amber-200/70"> · log {currentRun.runLog}</span>
+              ) : null}
+            </span>
+            <span className="shrink-0 rounded-full bg-amber-500/20 px-1.5 py-0.5 text-[10px] font-semibold">
+              {trackingRun ? "still running" : "finished"}
+            </span>
+          </span>
+          <span className="flex items-center gap-1.5">
+            {currentRun.runLog && (
+              <span className="hidden font-mono-code text-[10px] text-amber-200/70 sm:inline">
+                polling every 4s
+              </span>
+            )}
+            <button
+              type="button"
+              onClick={() => sendDetachedKeys("\x03")}
+              className="rounded border border-rose-400/40 bg-rose-500/15 px-2 py-0.5 font-semibold text-rose-100 hover:bg-rose-500/25"
+              title="Send Ctrl+C to the command that is still running on the host"
+            >
+              Stop it
+            </button>
+            <button
+              type="button"
+              onClick={stopTrackingRun}
+              className="rounded border border-white/20 px-2 py-0.5 font-semibold text-amber-100 hover:bg-white/10"
+              title="Stop following the log here. The command keeps running on the host."
+            >
+              Dismiss
+            </button>
+          </span>
+        </div>
+      )}
 
       {/*
         Full-screen terminal menu bar (serverless mode).

@@ -24,6 +24,7 @@ It is designed around a **Hybrid VPS + Serverless Architecture**:
   - Password, keyboard-interactive (PAM), and PEM/OpenSSH Private Key (`Ed25519`, `RSA`, `ECDSA` + passphrase) authentication
   - **Distro & cloud badge on connect**: the header names the machine you are on — `Ubuntu 24.04.1 LTS · Oracle Cloud`, `Debian 12 · KVM VPS`, `Rocky Linux 9.4 · AWS EC2` — read in one non-root exec (`/etc/os-release`, cloud-init's `cloud-id`, DMI strings) and cached for five minutes; the **Test SSH Auth** card in *New Connection* shows the same OS, hosting platform and vCPU/RAM before you connect
   - SHA-256 host key fingerprint verification, quick command snippets, scrollback search, and terminal themes
+- Commands survive a closed tab (No timeout + resume prompt) and recently connected hosts are remembered
   - **Translate selected text**: highlight any text in the terminal and hit the **Translate** button — the translation appears in a panel above the terminal (Chinese by default, 14 target languages, remembered per browser). Translates through Sushi's own `/api/translate` (see *Translating text* below)
 - **SFTP File Manager (`/api/sftp/*`)**
   - Works identically on **Vercel Serverless** and **VPS**
@@ -664,6 +665,26 @@ ways past a question — including the old curses installers (`Configuring light
    *still running on host* chip appears in the header with **y⏎ / ⏎ / ^C** buttons that deliver keys
    to that command through `/api/ssh/exec/keys`, and the output log can be read via SFTP or
    `cat /tmp/.sushi-run-….log`. Stop always sends a real Ctrl+C through the FIFO.
+
+**Closing the tab no longer loses the command.** With **No timeout** on, Sushi remembers the run
+(host, command line, working directory, keystroke FIFO and log path) in this browser, so:
+
+- **Reopen Sushi (or reload the tab)** and a card asks *"A command is still running on the host —
+  go back to that session?"* with **Go back to the session**, **Just open the host** and **Dismiss**.
+  *Go back* reopens the host, replays the command line in the terminal, redraws the output you missed
+  from `/tmp/.sushi-run-….log` and re-attaches the keystroke channel to the FIFO that is still there —
+  typing reaches the running command instead of starting a second copy. A **Resumed run** bar above
+  the terminal shows whether it is *still running*, with **Stop it** (real Ctrl+C through the FIFO) and
+  **Dismiss** (stop following; the command keeps running). The log is polled every 4 s, so the
+  terminal keeps filling in until the command ends.
+- **The launchpad** lists **Recently Connected** hosts (this browser only — an ad-hoc connection is
+  marked *ad-hoc*, saved hosts open from the vault with fresh credentials) and every run that
+  outlived its tab, with *running · 4m 12s* or *finished · exit 2*, so you can go back to it later.
+- Only non-secret session data is kept in `localStorage` (no passwords, keys or passphrases); runs
+  older than a week are pruned, and removing a run from the list never stops anything on the host.
+- `POST /api/ssh/exec/run` answers *is it still running?* in one round trip (`test -p` on the FIFO,
+  `tail -c` of the log, max 256 KiB, both paths validated against the exact `/tmp/.sushi-…` shapes).
+  A WebSocket PTY tab cannot outlive its socket, so only serverless runs are offered.
 
 Ctrl+C sends a real SIGINT when stdin is live and cancels the request otherwise, and always leaves the
 session healthy. After a deployment, an open tab shows a **Reload** banner instead of silently keeping

@@ -1986,6 +1986,139 @@ export function SushiWorkspace() {
             }
           >
             <div className="mx-auto max-w-5xl space-y-8">
+              {/* Recently connected (session history: nothing here is a saved host) */}
+              {(recentHosts.length > 0 || resumableRunCandidates(resumableRuns).length > 0) && (
+                <div className="space-y-3">
+                  <div className="flex items-center justify-between">
+                    <h2 className="flex items-center gap-1.5 text-sm font-semibold text-white">
+                      <Clock className="h-3.5 w-3.5 text-slate-400" />
+                      Recently Connected
+                    </h2>
+                    <span className="text-[11px] text-slate-500">
+                      This browser only · not saved hosts
+                    </span>
+                  </div>
+
+                  {/* Commands that outlived their tab */}
+                  {resumableRunCandidates(resumableRuns).map((run) => (
+                    <div
+                      key={run.id}
+                      className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-amber-500/25 bg-amber-500/[0.06] px-3 py-2"
+                    >
+                      <span className="flex min-w-0 items-center gap-2">
+                        <InfinityIcon
+                          className={`h-3.5 w-3.5 shrink-0 ${
+                            run.running ? "text-amber-300" : "text-slate-500"
+                          }`}
+                        />
+                        <span className="min-w-0">
+                          <span className="font-mono-code block truncate text-[11px] text-slate-100">
+                            {run.command}
+                          </span>
+                          <span className="block truncate text-[10px] text-slate-400">
+                            {run.profile.username}@{run.profile.host}
+                            {run.profile.port ? `:${run.profile.port}` : ""} ·{" "}
+                            {describeRunState(run)}
+                          </span>
+                        </span>
+                      </span>
+                      <span className="flex shrink-0 items-center gap-1.5">
+                        <button
+                          type="button"
+                          onClick={() => resumeRunInTab(run)}
+                          className="inline-flex items-center gap-1 rounded-lg border border-amber-400/40 bg-amber-500/15 px-2.5 py-1 text-[11px] font-semibold text-amber-100 hover:bg-amber-500/25"
+                          title="Reopen that session, replay the command line and attach to the run"
+                        >
+                          <CirclePlay className="h-3 w-3" />
+                          {run.running ? "Go back to it" : "Open log"}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setResumableRuns(removeResumableRun(run.id))}
+                          className="rounded-lg p-1 text-slate-500 hover:bg-white/8 hover:text-rose-300"
+                          title="Forget this run (it is not stopped on the host)"
+                        >
+                          <X className="h-3 w-3" />
+                        </button>
+                      </span>
+                    </div>
+                  ))}
+
+                  {/* Hosts that were opened from this browser */}
+                  {recentHosts.length > 0 && (
+                    <div className="flex flex-wrap gap-2">
+                      {recentHosts.map((entry) => {
+                        const Icon =
+                          entry.protocol === "rdp"
+                            ? Monitor
+                            : entry.protocol === "sftp"
+                              ? FolderKanban
+                              : Terminal;
+                        const saved = hosts.some((h) => h.id === entry.profileId);
+                        return (
+                          <div
+                            key={entry.key}
+                            className="group flex items-center gap-1 rounded-xl border border-white/8 bg-[#111520] pl-2.5 pr-1 py-1.5 transition hover:border-white/18"
+                          >
+                            <button
+                              type="button"
+                              onClick={() => openRecentHost(entry)}
+                              className="flex min-w-0 items-center gap-2 text-left"
+                              title={`${entry.username}@${entry.host}:${entry.port} — ${formatRunDuration(Date.now() - entry.lastConnectedAt)} ago`}
+                            >
+                              <Icon className="h-3.5 w-3.5 shrink-0 text-slate-400" />
+                              <span className="min-w-0">
+                                <span className="block max-w-[160px] truncate text-[11px] font-medium text-slate-100">
+                                  {entry.name}
+                                </span>
+                                <span className="font-mono-code block max-w-[160px] truncate text-[10px] text-slate-500">
+                                  {entry.username}@{entry.host} ·{" "}
+                                  {formatRunDuration(Date.now() - entry.lastConnectedAt)} ago
+                                </span>
+                              </span>
+                              {!saved && (
+                                <span
+                                  className="shrink-0 rounded bg-white/6 px-1 text-[9px] uppercase text-slate-400"
+                                  title="Not in the vault — this tab's history only"
+                                >
+                                  ad-hoc
+                                </span>
+                              )}
+                            </button>
+                            {saved && (
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  const host = hosts.find((h) => h.id === entry.profileId);
+                                  if (host) openSessionTab(host, host.protocol === "ssh" ? "sftp" : "ssh");
+                                }}
+                                className="rounded p-1 text-slate-500 hover:bg-white/10 hover:text-sky-300"
+                                title={entry.protocol === "ssh" ? "Open as SFTP" : "Open as SSH"}
+                              >
+                                {entry.protocol === "ssh" ? (
+                                  <FolderKanban className="h-3 w-3" />
+                                ) : (
+                                  <Terminal className="h-3 w-3" />
+                                )}
+                              </button>
+                            )}
+                            <button
+                              type="button"
+                              onClick={() => forgetRecentHost(entry.key)}
+                              className="rounded p-1 text-slate-600 hover:bg-white/8 hover:text-rose-300"
+                              title="Remove from recently connected"
+                              aria-label={`Remove ${entry.name} from recently connected`}
+                            >
+                              <X className="h-3 w-3" />
+                            </button>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              )}
+
               {insecureHttp && !insecureNoticeDismissed && (
                 <div className="flex items-start justify-between gap-3 rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-xs text-amber-100">
                   <span className="flex items-start gap-2">
@@ -2278,139 +2411,6 @@ export function SushiWorkspace() {
                   </p>
                 </button>
               </div>
-
-              {/* Recently connected (session history: nothing here is a saved host) */}
-              {(recentHosts.length > 0 || resumableRunCandidates(resumableRuns).length > 0) && (
-                <div className="space-y-3">
-                  <div className="flex items-center justify-between">
-                    <h2 className="flex items-center gap-1.5 text-sm font-semibold text-white">
-                      <Clock className="h-3.5 w-3.5 text-slate-400" />
-                      Recently Connected
-                    </h2>
-                    <span className="text-[11px] text-slate-500">
-                      This browser only · not saved hosts
-                    </span>
-                  </div>
-
-                  {/* Commands that outlived their tab */}
-                  {resumableRunCandidates(resumableRuns).map((run) => (
-                    <div
-                      key={run.id}
-                      className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-amber-500/25 bg-amber-500/[0.06] px-3 py-2"
-                    >
-                      <span className="flex min-w-0 items-center gap-2">
-                        <InfinityIcon
-                          className={`h-3.5 w-3.5 shrink-0 ${
-                            run.running ? "text-amber-300" : "text-slate-500"
-                          }`}
-                        />
-                        <span className="min-w-0">
-                          <span className="font-mono-code block truncate text-[11px] text-slate-100">
-                            {run.command}
-                          </span>
-                          <span className="block truncate text-[10px] text-slate-400">
-                            {run.profile.username}@{run.profile.host}
-                            {run.profile.port ? `:${run.profile.port}` : ""} ·{" "}
-                            {describeRunState(run)}
-                          </span>
-                        </span>
-                      </span>
-                      <span className="flex shrink-0 items-center gap-1.5">
-                        <button
-                          type="button"
-                          onClick={() => resumeRunInTab(run)}
-                          className="inline-flex items-center gap-1 rounded-lg border border-amber-400/40 bg-amber-500/15 px-2.5 py-1 text-[11px] font-semibold text-amber-100 hover:bg-amber-500/25"
-                          title="Reopen that session, replay the command line and attach to the run"
-                        >
-                          <CirclePlay className="h-3 w-3" />
-                          {run.running ? "Go back to it" : "Open log"}
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => setResumableRuns(removeResumableRun(run.id))}
-                          className="rounded-lg p-1 text-slate-500 hover:bg-white/8 hover:text-rose-300"
-                          title="Forget this run (it is not stopped on the host)"
-                        >
-                          <X className="h-3 w-3" />
-                        </button>
-                      </span>
-                    </div>
-                  ))}
-
-                  {/* Hosts that were opened from this browser */}
-                  {recentHosts.length > 0 && (
-                    <div className="flex flex-wrap gap-2">
-                      {recentHosts.map((entry) => {
-                        const Icon =
-                          entry.protocol === "rdp"
-                            ? Monitor
-                            : entry.protocol === "sftp"
-                              ? FolderKanban
-                              : Terminal;
-                        const saved = hosts.some((h) => h.id === entry.profileId);
-                        return (
-                          <div
-                            key={entry.key}
-                            className="group flex items-center gap-1 rounded-xl border border-white/8 bg-[#111520] pl-2.5 pr-1 py-1.5 transition hover:border-white/18"
-                          >
-                            <button
-                              type="button"
-                              onClick={() => openRecentHost(entry)}
-                              className="flex min-w-0 items-center gap-2 text-left"
-                              title={`${entry.username}@${entry.host}:${entry.port} — ${formatRunDuration(Date.now() - entry.lastConnectedAt)} ago`}
-                            >
-                              <Icon className="h-3.5 w-3.5 shrink-0 text-slate-400" />
-                              <span className="min-w-0">
-                                <span className="block max-w-[160px] truncate text-[11px] font-medium text-slate-100">
-                                  {entry.name}
-                                </span>
-                                <span className="font-mono-code block max-w-[160px] truncate text-[10px] text-slate-500">
-                                  {entry.username}@{entry.host} ·{" "}
-                                  {formatRunDuration(Date.now() - entry.lastConnectedAt)} ago
-                                </span>
-                              </span>
-                              {!saved && (
-                                <span
-                                  className="shrink-0 rounded bg-white/6 px-1 text-[9px] uppercase text-slate-400"
-                                  title="Not in the vault — this tab's history only"
-                                >
-                                  ad-hoc
-                                </span>
-                              )}
-                            </button>
-                            {saved && (
-                              <button
-                                type="button"
-                                onClick={() => {
-                                  const host = hosts.find((h) => h.id === entry.profileId);
-                                  if (host) openSessionTab(host, host.protocol === "ssh" ? "sftp" : "ssh");
-                                }}
-                                className="rounded p-1 text-slate-500 hover:bg-white/10 hover:text-sky-300"
-                                title={entry.protocol === "ssh" ? "Open as SFTP" : "Open as SSH"}
-                              >
-                                {entry.protocol === "ssh" ? (
-                                  <FolderKanban className="h-3 w-3" />
-                                ) : (
-                                  <Terminal className="h-3 w-3" />
-                                )}
-                              </button>
-                            )}
-                            <button
-                              type="button"
-                              onClick={() => forgetRecentHost(entry.key)}
-                              className="rounded p-1 text-slate-600 hover:bg-white/8 hover:text-rose-300"
-                              title="Remove from recently connected"
-                              aria-label={`Remove ${entry.name} from recently connected`}
-                            >
-                              <X className="h-3 w-3" />
-                            </button>
-                          </div>
-                        );
-                      })}
-                    </div>
-                  )}
-                </div>
-              )}
 
               {/* Saved Hosts Section */}
               {hosts.length > 0 && (

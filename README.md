@@ -159,9 +159,13 @@ storage, no new sync path.
 1. Open your Sushi URL over **HTTPS** in Safari, tap **Share**, and choose
    **Add to Home Screen**. Confirm the name and tap **Add**. Sushi has a dedicated
    Home Screen icon and opens as a standalone web app.
-2. Use the navigation button at the top left to access saved hosts and settings
-   on a phone. Sessions still require a network connection; installing the icon
-   does not make SSH, SFTP, or RDP work offline.
+2. On a phone the app opens straight onto **your host list**: Recently Connected
+   at the top, then search, the **All / SSH / SFTP / RDP** filter and one row per
+   machine with its protocol actions. Tap **Show quick connect** for the dashboard
+   (quick connect, capability pills and the new-connection cards); the choice is
+   remembered per device. On a tablet or desktop the dashboard is the home screen
+   and the same list lives in the sidebar. Sessions still require a network
+   connection; installing the icon does not make SSH, SFTP, or RDP work offline.
 
 The Home Screen app may have separate login and browser storage from Safari,
 including the local device key used to encrypt a device-key vault. Sign in to
@@ -719,9 +723,10 @@ ways past a question — including the old curses installers (`Configuring light
   the terminal shows whether it is *still running*, with **Stop it** (real Ctrl+C through the FIFO) and
   **Dismiss** (stop following; the command keeps running). The log is polled every 4 s, so the
   terminal keeps filling in until the command ends.
-- **The launchpad** lists **Recently Connected** hosts (this browser only — an ad-hoc connection is
-  marked *ad-hoc*, saved hosts open from the vault with fresh credentials) and every run that
-  outlived its tab, with *running · 4m 12s* or *finished · exit 2*, so you can go back to it later.
+- **Recently Connected** sits at the top of the home screen (the dashboard on desktop, the host list
+  on a phone) and lists hosts from this browser only — an ad-hoc connection is marked *ad-hoc*,
+  saved hosts open from the vault with fresh credentials — plus every run that outlived its tab,
+  with *running · 4m 12s* or *finished · exit 2*, so you can go back to it later.
 - Only non-secret session data is kept in `localStorage` (no passwords, keys or passphrases); runs
   older than a week are pruned, and removing a run from the list never stops anything on the host.
 - `POST /api/ssh/exec/run` answers *is it still running?* in one round trip (`test -p` on the FIFO,

@@ -76,9 +76,6 @@ import {
 } from "@/lib/client/vault-sync";
 import {
   type UnifiedHost,
-  filterUnifiedHosts,
-  filterUnifiedHostsByProtocol,
-  groupUnifiedHosts,
   hostAccessUrl,
   mergeHosts,
   openableProtocols,
@@ -91,6 +88,8 @@ import {
   removeMachine,
   siblingsOf,
 } from "@/lib/client/host-consistency";
+import { HostNavList } from "./HostNavList";
+import { useIsPhoneViewport, useMobileHome } from "@/lib/client/mobile-home";
 import { HostProfileModal } from "./HostProfileModal";
 import { GatewaySetupModal } from "./GatewaySetupModal";
 import { VaultSecurityModal, type VaultModalTab } from "./VaultSecurityModal";
@@ -212,6 +211,10 @@ export function SushiWorkspace() {
   // Navigation & Tabs
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
+  /** Phone layout: the host list is the home screen instead of the hero/launchpad. */
+  const isPhoneLayout = useIsPhoneViewport() === true;
+  const [mobileHome, setMobileHome] = useMobileHome();
+  const [desktopHomeNoticeDismissed, setDesktopHomeNoticeDismissed] = useState(true);
   const [protocolFilter, setProtocolFilter] = useState<"all" | ProtocolType>("all");
   const [hostSearch, setHostSearch] = useState("");
   const [quickConnectInput, setQuickConnectInput] = useState("");
@@ -258,6 +261,26 @@ export function SushiWorkspace() {
   const settingsContainerRef = useRef<HTMLDivElement | null>(null);
   const settingsButtonRef = useRef<HTMLButtonElement | null>(null);
   const settingsFirstActionRef = useRef<HTMLButtonElement | null>(null);
+
+  /** "You're on the mobile home screen" notice: remembered per browser. */
+  useEffect(() => {
+    try {
+      setDesktopHomeNoticeDismissed(
+        localStorage.getItem("sushi_mobile_home_notice_dismissed") === "1"
+      );
+    } catch {
+      setDesktopHomeNoticeDismissed(false);
+    }
+  }, []);
+
+  const dismissDesktopHomeNotice = useCallback(() => {
+    setDesktopHomeNoticeDismissed(true);
+    try {
+      localStorage.setItem("sushi_mobile_home_notice_dismissed", "1");
+    } catch {
+      // best effort
+    }
+  }, []);
 
   const closeMobileNavigation = useCallback(() => {
     setSettingsOpen(false);
@@ -1016,6 +1039,14 @@ export function SushiWorkspace() {
     }
   };
 
+  /** Opens the editor for the profile behind a merged host row. */
+  const handleEditHost = useCallback((entry: UnifiedHost) => {
+    setEditingProfile(entry.primary);
+    setHostModalIntent(null);
+    setHostModalOpen(true);
+    setMobileSidebarOpen(false);
+  }, []);
+
   /**
    * Deletes a connection. `wholeMachine` removes every protocol profile of that
    * machine (the unified list shows one row per machine, so leaving its RDP/SFTP
@@ -1239,12 +1270,6 @@ export function SushiWorkspace() {
    */
   const unifiedHosts = useMemo(() => mergeHosts(hosts), [hosts]);
   unifiedHostsRef.current = unifiedHosts;
-  const filteredHosts = useMemo(
-    () => filterUnifiedHosts(filterUnifiedHostsByProtocol(unifiedHosts, protocolFilter), hostSearch),
-    [unifiedHosts, protocolFilter, hostSearch]
-  );
-  /** Sidebar folders (one entry per machine). */
-  const groupedHosts = useMemo(() => groupUnifiedHosts(filteredHosts), [filteredHosts]);
 
   /**
    * One click on a merged host opens the protocol you picked (or the best one): an
@@ -1543,64 +1568,10 @@ export function SushiWorkspace() {
             </button>
           </div>
 
-          {/* Search + New Host */}
-          <div className="space-y-2.5 p-3">
-            <div className="flex items-center gap-1.5">
-              <div className="relative flex-1">
-                <Search className="pointer-events-none absolute left-2.5 top-2 h-3.5 w-3.5 text-slate-500" />
-                <input
-                  ref={searchInputRef}
-                  type="text"
-                  value={hostSearch}
-                  onChange={(e) => setHostSearch(e.target.value)}
-                  placeholder="Search hosts (⌘K)"
-                  className="w-full rounded-xl border border-white/8 bg-[#090b10] py-1.5 pl-8 pr-2.5 text-xs text-white placeholder-slate-500 outline-none focus:border-white/20"
-                />
-              </div>
-              <button
-                type="button"
-                onClick={() => {
-                  setEditingProfile(null);
-                  setHostModalIntent(null);
-                  setHostModalOpen(true);
-                  setMobileSidebarOpen(false);
-                }}
-                className="flex h-8 w-8 shrink-0 items-center justify-center rounded-xl bg-[#ff6b57] text-white transition hover:bg-[#ff7f6e]"
-                title="Add new remote host"
-              >
-                <Plus className="h-4 w-4" />
-              </button>
-            </div>
-
-            {/* Protocol Filter Pills */}
-            <div className="grid grid-cols-4 gap-1 rounded-xl bg-[#090b10] p-1 text-[11px]">
-              {(["all", "ssh", "sftp", "rdp"] as const).map((p) => (
-                <button
-                  key={p}
-                  type="button"
-                  onClick={() => setProtocolFilter(p)}
-                  className={`rounded-lg py-1 font-medium uppercase transition ${
-                    protocolFilter === p
-                      ? "bg-white/12 text-white"
-                      : "text-slate-400 hover:text-slate-200"
-                  }`}
-                >
-                  {p}
-                </button>
-              ))}
-            </div>
-          </div>
-
-          {/* Saved Hosts List */}
-          <div className="workspace-sidebar-hosts min-h-0 flex-1 space-y-4 overflow-y-auto px-3 py-1">
-            {filteredHosts.length === 0 ? (
-              <div className="rounded-xl border border-dashed border-white/10 bg-white/[0.015] p-4 text-center">
-                <p className="text-xs font-medium text-slate-300">
-                  {hosts.length === 0 ? "No Saved Hosts Yet" : "No Matching Hosts"}
-                </p>
-                <p className="mt-1 text-[11px] text-slate-500">
-                  Add an SSH, SFTP, or RDP server to store it in your AES-256 vault.
-                </p>
+          {/* The mobile drawer leads with the list, so it carries no second search box. */}
+          {isPhoneLayout ? (
+            <>
+              <div className="p-3 pb-1.5">
                 <button
                   type="button"
                   onClick={() => {
@@ -1609,165 +1580,49 @@ export function SushiWorkspace() {
                     setHostModalOpen(true);
                     setMobileSidebarOpen(false);
                   }}
-                  className="mt-3 inline-flex items-center gap-1 rounded-lg bg-white/8 px-3 py-1.5 text-xs font-medium text-white hover:bg-white/14"
+                  className="flex w-full items-center justify-center gap-1.5 rounded-xl bg-[#ff6b57] px-3 py-2 text-xs font-semibold text-white transition hover:bg-[#ff7f6e]"
                 >
-                  <Plus className="h-3.5 w-3.5" />
+                  <Plus className="h-4 w-4" />
                   New Connection
                 </button>
               </div>
-            ) : (
-              Object.entries(groupedHosts).map(([groupName, groupItems]) => (
-                <div key={groupName} className="space-y-1">
-                  <div className="px-2 text-[10px] font-semibold uppercase tracking-wider text-slate-500">
-                    {groupName}
-                  </div>
-                  {groupItems.map((h) => {
-                    const ProtoIcon = h.protocols.rdp
-                      ? Monitor
-                      : h.protocols.ssh
-                        ? Terminal
-                        : FolderKanban;
-                    const protocols = openableProtocols(h);
-                    const primary = h.primary;
-                    return (
-                      <div
-                        key={h.id}
-                        className="group flex items-center justify-between rounded-xl px-2.5 py-2 transition hover:bg-white/[0.06]"
-                      >
-                        <button
-                          type="button"
-                          onClick={() => openUnifiedHost(h)}
-                          className="flex min-w-0 flex-1 items-center gap-2.5 text-left"
-                          title={`${h.username}@${h.host} — ${protocols.join(" / ").toUpperCase()}`}
-                        >
-                          <span
-                            className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-white/[0.04]"
-                            style={{
-                              color: h.accentColor || "#34d399",
-                            }}
-                          >
-                            <ProtoIcon className="h-3.5 w-3.5" />
-                          </span>
-                          <div className="min-w-0">
-                            <div className="flex items-center gap-1.5">
-                              <span className="truncate text-xs font-medium text-slate-100">
-                                {h.name}
-                              </span>
-                              {/* One badge per way in, so a merged host is obvious */}
-                              <span className="flex shrink-0 items-center gap-0.5">
-                                {protocols.map((protocol) => (
-                                  <span
-                                    key={protocol}
-                                    className="rounded bg-white/8 px-1 text-[9px] font-semibold uppercase text-slate-400"
-                                    title={`${protocol.toUpperCase()} · ${h.ports[protocol] ?? (protocol === "rdp" ? 3389 : 22)}`}
-                                  >
-                                    {protocol}
-                                  </span>
-                                ))}
-                              </span>
-                            </div>
-                            <div className="font-mono-code truncate text-[10px] text-slate-500">
-                              {h.username}@{h.host}:{h.ports.ssh ?? h.ports.sftp ?? primary.port}
-                            </div>
-                          </div>
-                        </button>
-
-                        <div className="flex shrink-0 items-center gap-0.5">
-                          {/* Every protocol is one click away on the same row */}
-                          {protocols.includes("rdp") && (
-                            <button
-                              type="button"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                openUnifiedHost(h, "rdp");
-                              }}
-                              className="rounded p-2 text-[#ff6b57]/75 transition hover:bg-[#ff6b57]/20 hover:text-[#ff9587] md:p-1"
-                              title={h.protocols.rdp ? "Open desktop (RDP)" : "Open desktop via derived RDP companion (port 3389)"}
-                              aria-label={`Open ${h.name} via RDP`}
-                            >
-                              <Monitor className="h-3 w-3" />
-                            </button>
-                          )}
-
-                          <div className="hidden items-center gap-0.5 group-hover:flex group-focus-within:flex [@media(hover:none)]:flex">
-                            {protocols.includes("sftp") && (
-                              <button
-                                type="button"
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  openUnifiedHost(h, "sftp");
-                                }}
-                                className="rounded p-2 text-slate-400 hover:bg-white/10 hover:text-sky-300 md:p-1"
-                                aria-label={`Open ${h.name} as SFTP`}
-                                title="Open as SFTP"
-                              >
-                                <FolderKanban className="h-3 w-3" />
-                              </button>
-                            )}
-                            {protocols.includes("ssh") && (
-                              <button
-                                type="button"
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  openUnifiedHost(h, "ssh");
-                                }}
-                                className="rounded p-2 text-slate-400 hover:bg-white/10 hover:text-emerald-300 md:p-1"
-                                aria-label={`Open ${h.name} as SSH`}
-                                title="Open as SSH"
-                              >
-                                <Terminal className="h-3 w-3" />
-                              </button>
-                            )}
-                            <a
-                              href={hostAccessUrl(h)}
-                              onClick={(e) => e.stopPropagation()}
-                              className="rounded p-2 text-slate-400 hover:bg-white/10 hover:text-white md:p-1"
-                              aria-label={`Copy the one URL for ${h.name}`}
-                              title="One URL for this machine (opens it in Sushi)"
-                            >
-                              <ArrowLeftRight className="h-3 w-3" />
-                            </a>
-                            <button
-                              type="button"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                setEditingProfile(primary);
-                                setHostModalIntent(null);
-                                setHostModalOpen(true);
-                                setMobileSidebarOpen(false);
-                              }}
-                              className="rounded p-2 text-slate-400 hover:bg-white/10 hover:text-white md:p-1"
-                              aria-label={`Edit ${h.name}`}
-                              title={
-                                Object.values(h.protocols).filter(Boolean).length > 1
-                                  ? "Edit this connection (each protocol keeps its own profile)"
-                                  : "Edit host"
-                              }
-                            >
-                              <Pencil className="h-3 w-3" />
-                            </button>
-                            <button
-                              type="button"
-                              onClick={(e) => void handleDeleteHost(primary.id, e, { wholeMachine: true })}
-                              className="rounded p-2 text-slate-400 hover:bg-rose-500/20 hover:text-rose-400 md:p-1"
-                              aria-label={`Delete ${h.name}`}
-                              title={
-                                Object.values(h.protocols).filter(Boolean).length > 1
-                                  ? "Delete this machine (SSH / SFTP / RDP profiles)"
-                                  : "Delete host"
-                              }
-                            >
-                              <Trash2 className="h-3 w-3" />
-                            </button>
-                          </div>
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-              ))
-            )}
-          </div>
+              <div className="pb-2">
+                <HostNavList
+                  variant="page"
+                  hosts={unifiedHosts}
+                  protocolFilter={protocolFilter}
+                  onProtocolFilterChange={setProtocolFilter}
+                  search={hostSearch}
+                  onSearchChange={setHostSearch}
+                  onOpen={(entry, protocol) => openUnifiedHost(entry, protocol)}
+                  onEdit={handleEditHost}
+                  onDelete={(entry, event) =>
+                    void handleDeleteHost(entry.primary.id, event, { wholeMachine: true })
+                  }
+                />
+              </div>
+            </>
+          ) : (
+            <HostNavList
+              hosts={unifiedHosts}
+              protocolFilter={protocolFilter}
+              onProtocolFilterChange={setProtocolFilter}
+              search={hostSearch}
+              onSearchChange={setHostSearch}
+              searchInputRef={searchInputRef}
+              onOpen={(entry, protocol) => openUnifiedHost(entry, protocol)}
+              onEdit={handleEditHost}
+              onDelete={(entry, event) =>
+                void handleDeleteHost(entry.primary.id, event, { wholeMachine: true })
+              }
+              onNewHost={() => {
+                setEditingProfile(null);
+                setHostModalIntent(null);
+                setHostModalOpen(true);
+                setMobileSidebarOpen(false);
+              }}
+            />
+          )}
 
           {/* Sidebar Bottom Controls */}
           <div className="space-y-1.5 border-t border-white/8 p-3">
@@ -1977,15 +1832,63 @@ export function SushiWorkspace() {
 
         {/* Workspace Stage */}
         <div className="relative min-h-0 flex-1 overflow-hidden">
-          {/* Launchpad Home View */}
+          {/* Launchpad Home View — host list is home on a phone, the hero on desktop */}
           <div
             className={
               activeTabId === "launchpad"
-                ? "h-full w-full overflow-y-auto p-4 sm:p-8"
+                ? "h-full w-full overflow-y-auto overscroll-contain p-3 pb-6 sm:p-8"
                 : "hidden"
             }
           >
-            <div className="mx-auto max-w-5xl space-y-8">
+            {/* Pinned hero on a phone: one tap back to the host list. */}
+            {isPhoneLayout && mobileHome === "launchpad" && (
+              <div className="mx-auto mb-4 flex w-full max-w-5xl items-center justify-between gap-2 rounded-xl border border-white/10 bg-[#0c1017] px-3 py-2">
+                <span className="text-[11px] text-slate-400">
+                  You pinned the dashboard as your phone home screen.
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setMobileHome("hosts")}
+                  className="shrink-0 rounded-lg bg-white/8 px-2.5 py-1 text-[11px] font-medium text-white hover:bg-white/14"
+                >
+                  Show host list
+                </button>
+              </div>
+            )}
+
+            {/* Tells desktop users where the list went when they open Sushi on a phone. */}
+            {!isPhoneLayout && !desktopHomeNoticeDismissed && (
+              <div className="mx-auto mb-4 flex w-full max-w-5xl items-start justify-between gap-2 rounded-xl border border-sky-500/25 bg-sky-500/[0.07] px-3 py-2 text-[11px] text-sky-100">
+                <span>
+                  On a phone, Sushi now opens on your <strong>host list</strong> (search,
+                  filter and every saved machine one tap away) with Recently Connected on
+                  top, instead of this dashboard.
+                </span>
+                <button
+                  type="button"
+                  onClick={dismissDesktopHomeNotice}
+                  className="shrink-0 rounded p-1 text-sky-300 hover:bg-white/10"
+                  aria-label="Dismiss"
+                >
+                  <X className="h-3 w-3" />
+                </button>
+              </div>
+            )}
+
+            {/* Desktop: Recently Connected, hero, quick connect and saved host cards.
+                Kept mounted (just hidden) on a phone, which lands on the list below. */}
+            <div
+              className={
+                isPhoneLayout === null
+                  ? // Before hydration CSS already hides this on a phone, so the
+                    // dashboard never flashes in front of the host list.
+                    "hidden md:block"
+                  : isPhoneLayout && mobileHome === "hosts"
+                    ? "hidden"
+                    : "block"
+              }
+            >
+
               {/* Recently connected (session history: nothing here is a saved host) */}
               {(recentHosts.length > 0 || resumableRunCandidates(resumableRuns).length > 0) && (
                 <div className="space-y-3">
@@ -2555,6 +2458,135 @@ export function SushiWorkspace() {
                 </div>
               )}
             </div>
+
+            {isPhoneLayout && mobileHome === "hosts" && (
+              <div className="flex h-full flex-col">
+                {/* Recently connected stays on top on a phone too. */}
+                <div className="mb-3 space-y-2 rounded-2xl border border-white/8 bg-[#0c1017] p-3">
+                  <div className="flex items-center justify-between">
+                    <h2 className="flex items-center gap-1.5 text-xs font-semibold text-white">
+                      <Clock className="h-3.5 w-3.5 text-slate-400" />
+                      Recently Connected
+                    </h2>
+                    <span className="text-[10px] text-slate-500">This browser only</span>
+                  </div>
+
+                  {recentHosts.length === 0 &&
+                    resumableRunCandidates(resumableRuns).length === 0 && (
+                      <p className="text-[11px] text-slate-500">
+                        Nothing yet — a host you connect from this device shows up here
+                        first.
+                      </p>
+                    )}
+
+                  {resumableRunCandidates(resumableRuns)
+                    .slice(0, 2)
+                    .map((run) => (
+                      <div
+                        key={run.id}
+                        className="flex items-center justify-between gap-2 rounded-xl border border-amber-500/25 bg-amber-500/[0.06] px-2.5 py-1.5"
+                      >
+                        <span className="min-w-0">
+                          <span className="font-mono-code block truncate text-[11px] text-slate-100">
+                            {run.command}
+                          </span>
+                          <span className="block truncate text-[10px] text-slate-400">
+                            {run.profile.username}@{run.profile.host} ·{" "}
+                            {describeRunState(run)}
+                          </span>
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => resumeRunInTab(run)}
+                          className="shrink-0 rounded-lg border border-amber-400/40 bg-amber-500/15 px-2 py-1 text-[11px] font-semibold text-amber-100 hover:bg-amber-500/25"
+                        >
+                          {run.running ? "Go back to it" : "Open log"}
+                        </button>
+                      </div>
+                    ))}
+
+                  {recentHosts.length > 0 && (
+                    <div className="space-y-1">
+                      {recentHosts.slice(0, 3).map((entry) => {
+                        const Icon =
+                          entry.protocol === "rdp"
+                            ? Monitor
+                            : entry.protocol === "sftp"
+                              ? FolderKanban
+                              : Terminal;
+                        return (
+                          <div
+                            key={entry.key}
+                            className="flex items-center gap-1 rounded-xl border border-white/8 bg-[#111520] py-1 pl-2.5 pr-1"
+                          >
+                            <button
+                              type="button"
+                              onClick={() => openRecentHost(entry)}
+                              className="flex min-w-0 flex-1 items-center gap-2 text-left"
+                            >
+                              <Icon className="h-3.5 w-3.5 shrink-0 text-slate-400" />
+                              <span className="min-w-0">
+                                <span className="block truncate text-[11px] font-medium text-slate-100">
+                                  {entry.name}
+                                </span>
+                                <span className="font-mono-code block truncate text-[10px] text-slate-500">
+                                  {entry.username}@{entry.host} ·{" "}
+                                  {formatRunDuration(Date.now() - entry.lastConnectedAt)} ago
+                                </span>
+                              </span>
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => forgetRecentHost(entry.key)}
+                              className="shrink-0 rounded p-1.5 text-slate-600 hover:bg-white/8 hover:text-rose-300"
+                              aria-label={`Remove ${entry.name} from recently connected`}
+                            >
+                              <X className="h-3 w-3" />
+                            </button>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+
+                {/* The host list is the phone home screen: search, filter, one row per machine. */}
+                <HostNavList
+                  variant="page"
+                  hosts={unifiedHosts}
+                  protocolFilter={protocolFilter}
+                  onProtocolFilterChange={setProtocolFilter}
+                  search={hostSearch}
+                  onSearchChange={setHostSearch}
+                  onOpen={(entry, protocol) => openUnifiedHost(entry, protocol)}
+                  onEdit={handleEditHost}
+                  onDelete={(entry, event) =>
+                    void handleDeleteHost(entry.primary.id, event, { wholeMachine: true })
+                  }
+                  onNewHost={() => {
+                    setEditingProfile(null);
+                    setHostModalIntent(null);
+                    setHostModalOpen(true);
+                  }}
+                />
+
+                <div className="mx-auto mt-4 flex w-full max-w-3xl flex-wrap items-center justify-between gap-2 pb-2 text-[11px]">
+                  <button
+                    type="button"
+                    onClick={() => setMobileHome("launchpad")}
+                    className="rounded-lg border border-white/10 px-2.5 py-1.5 text-slate-300 hover:bg-white/8"
+                  >
+                    Show quick connect
+                  </button>
+                  <a
+                    href="/hosts"
+                    className="rounded-lg border border-white/10 px-2.5 py-1.5 text-slate-300 hover:bg-white/8"
+                  >
+                    All hosts &amp; API →
+                  </a>
+                </div>
+              </div>
+            )}
           </div>
 
           {/* Mounted Protocol Session Views (stay alive across tab switches!) */}

@@ -1,28 +1,20 @@
 import { NextRequest, NextResponse } from "next/server";
+import { getCorsHeaders } from "@/lib/server/security";
+
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
 import {
-  addWhitelistedKey,
   attachAdminProfileCookie,
   attachSessionCookie,
   createSessionToken,
   getEffectiveAuthConfig,
-  mergeAuthorizedKeys,
   mergePasskeySummaries,
   removeServerPasskey,
-  removeWhitelistedKey,
   updateAdminCredentials,
   verifyAdminSession,
-  verifySignedAuthorizedKeyCertificates,
   verifySignedPasskeyCertificates,
 } from "@/lib/server/auth";
-import {
-  generateEd25519KeyPair,
-  parseAuthorizedPublicKey,
-} from "@/lib/server/ssh-key-utils";
-import { getCorsHeaders } from "@/lib/server/security";
 import { isServerVaultEnabled, readStoredVault } from "@/lib/server/vault-store";
-
-export const runtime = "nodejs";
-export const dynamic = "force-dynamic";
 
 export async function OPTIONS(req: NextRequest) {
   return new NextResponse(null, {
@@ -41,139 +33,58 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  let body: {
-    action?: "list" | "add_authorized_key" | "generate_authorized_keypair";
-    signedCertificates?: string[];
-    signedKeyCertificates?: string[];
-    adminProfileCert?: string;
-    publicKey?: string;
-    label?: string;
-    passphrase?: string;
-  } = {};
+  let signedCerts: string[] = [];
+  let adminProfileCert: string | undefined;
 
   try {
-    body = await req.json();
+    const body = await req.json();
+    if (Array.isArray(body?.signedCertificates)) {
+      signedCerts = body.signedCertificates;
+    }
+    if (typeof body?.adminProfileCert === "string") {
+      adminProfileCert = body.adminProfileCert;
+    }
   } catch {
-    // empty body defaults to list
+    // ignore
   }
 
-  const cfg = await getEffectiveAuthConfig(req.headers, body.adminProfileCert);
+  try {
+    const cfg = await getEffectiveAuthConfig(req.headers, adminProfileCert);
 
-  // Action: Add whitelisted public key
-  if (body.action === "add_authorized_key") {
-    try {
-      if (!body.publicKey?.trim()) {
-        return NextResponse.json(
-          { ok: false, error: "SSH/PEM public key is required." },
-          { status: 400, headers: cors }
-        );
-      }
-      const record = parseAuthorizedPublicKey(
-        body.publicKey,
-        body.label,
-        body.passphrase
-      );
-      const saved = await addWhitelistedKey(cfg, record);
-      const res = NextResponse.json(
-        {
-          ok: true,
-          record,
-          signedKeyCert: saved.signedKeyCert,
-          adminProfileCert: saved.adminProfileCert,
-        },
-        { headers: cors }
-      );
-      if (saved.adminProfileCert) {
-        attachAdminProfileCookie(res, saved.adminProfileCert, req);
-      }
-      return res;
-    } catch (err) {
-      return NextResponse.json(
-        {
-          ok: false,
-          error:
-            err instanceof Error
-              ? err.message
-              : "Failed to whitelist SSH key.",
-        },
-        { status: 400, headers: cors }
-      );
+    const certKeys = verifySignedPasskeyCertificates(
+      signedCerts,
+      cfg.username,
+      cfg.authSecret
+    );
+    const passkeys = mergePasskeySummaries(cfg.serverPasskeys, certKeys);
+
+    // Exportable JSON array for SUSHI_PASSKEYS_JSON
+    const exportMap = new Map<string, unknown>();
+    for (const k of [...certKeys, ...cfg.serverPasskeys]) {
+      exportMap.set(k.id, k);
     }
+
+    return NextResponse.json(
+      {
+        ok: true,
+        username: cfg.username,
+        canBootstrapOnDisk: cfg.canBootstrapOnDisk,
+        canEditCredentials: !cfg.envConfigured,
+        envConfigured: cfg.envConfigured,
+        passkeys,
+        passkeysEnvJson: JSON.stringify(Array.from(exportMap.values())),
+      },
+      { headers: cors }
+    );
+  } catch (err) {
+    return NextResponse.json(
+      {
+        ok: false,
+        error: err instanceof Error ? err.message : "Account operation failed.",
+      },
+      { status: 400, headers: cors }
+    );
   }
-
-  // Action: Generate fresh Ed25519 login keypair & whitelist its public key
-  if (body.action === "generate_authorized_keypair") {
-    try {
-      const kp = generateEd25519KeyPair(
-        body.label?.trim() || `${cfg.username}@sushi`
-      );
-      const saved = await addWhitelistedKey(cfg, kp.record);
-      const res = NextResponse.json(
-        {
-          ok: true,
-          privateKey: kp.privateKey,
-          publicKey: kp.publicKey,
-          record: kp.record,
-          signedKeyCert: saved.signedKeyCert,
-          adminProfileCert: saved.adminProfileCert,
-        },
-        { headers: cors }
-      );
-      if (saved.adminProfileCert) {
-        attachAdminProfileCookie(res, saved.adminProfileCert, req);
-      }
-      return res;
-    } catch (err) {
-      return NextResponse.json(
-        {
-          ok: false,
-          error:
-            err instanceof Error
-              ? err.message
-              : "Failed to generate SSH keypair.",
-        },
-        { status: 400, headers: cors }
-      );
-    }
-  }
-
-  // Default: List account info, Passkeys, and Whitelisted Public Keys
-  const certPasskeys = verifySignedPasskeyCertificates(
-    body.signedCertificates,
-    cfg.username,
-    cfg.authSecret
-  );
-  const summaries = mergePasskeySummaries(cfg.serverPasskeys, certPasskeys);
-
-  const rawPasskeyMap = new Map<string, unknown>();
-  for (const k of [...certPasskeys, ...cfg.serverPasskeys]) {
-    rawPasskeyMap.set(k.id, k);
-  }
-
-  const certAuthKeys = verifySignedAuthorizedKeyCertificates(
-    body.signedKeyCertificates,
-    cfg.username,
-    cfg.authSecret
-  );
-  const authorizedKeys = mergeAuthorizedKeys(cfg.authorizedKeys, certAuthKeys);
-  const authorizedKeysEnvBlock = authorizedKeys
-    .map((k) => k.publicKeyOpenSSH)
-    .join("\n");
-
-  return NextResponse.json(
-    {
-      ok: true,
-      username: cfg.username || auth.username || "admin",
-      envConfigured: cfg.envConfigured,
-      canEditCredentials: !cfg.envConfigured,
-      canEditCredentialsOnDisk: cfg.canBootstrapOnDisk && !cfg.envConfigured,
-      passkeys: summaries,
-      passkeysEnvJson: JSON.stringify(Array.from(rawPasskeyMap.values())),
-      authorizedKeys,
-      authorizedKeysEnvBlock,
-    },
-    { headers: cors }
-  );
 }
 
 export async function PUT(req: NextRequest) {
@@ -194,7 +105,11 @@ export async function PUT(req: NextRequest) {
       adminProfileCert?: string;
     };
 
-    const cfg = await getEffectiveAuthConfig(req.headers, body.adminProfileCert);
+    const cfg = await getEffectiveAuthConfig(
+      req.headers,
+      body?.adminProfileCert
+    );
+
     if (cfg.envConfigured) {
       return NextResponse.json(
         {
@@ -277,36 +192,11 @@ export async function DELETE(req: NextRequest) {
   try {
     const body = (await req.json()) as {
       credentialId?: string;
-      authorizedKeyFingerprint?: string;
-      adminProfileCert?: string;
     };
-
-    if (body?.authorizedKeyFingerprint) {
-      const cfg = await getEffectiveAuthConfig(
-        req.headers,
-        body.adminProfileCert
-      );
-      const removed = await removeWhitelistedKey(
-        cfg,
-        body.authorizedKeyFingerprint
-      );
-      const res = NextResponse.json(
-        {
-          ok: true,
-          removedOnDisk: removed.removedOnDisk,
-          adminProfileCert: removed.adminProfileCert,
-        },
-        { headers: cors }
-      );
-      if (removed.adminProfileCert) {
-        attachAdminProfileCookie(res, removed.adminProfileCert, req);
-      }
-      return res;
-    }
 
     if (!body?.credentialId) {
       return NextResponse.json(
-        { ok: false, error: "Missing credentialId or authorizedKeyFingerprint." },
+        { ok: false, error: "Missing credentialId." },
         { status: 400, headers: cors }
       );
     }
@@ -319,7 +209,7 @@ export async function DELETE(req: NextRequest) {
     return NextResponse.json(
       {
         ok: false,
-        error: err instanceof Error ? err.message : "Failed to revoke key.",
+        error: err instanceof Error ? err.message : "Failed to revoke passkey.",
       },
       { status: 400, headers: cors }
     );

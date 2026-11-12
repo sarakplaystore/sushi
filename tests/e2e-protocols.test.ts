@@ -158,7 +158,6 @@ import {
 import {
   generateEd25519KeyPair,
   normalizePrivateKeyForSsh,
-  verifyPrivateKeyAgainstWhitelist,
 } from "../src/lib/server/ssh-key-utils";
 import {
   exportToTermixFile,
@@ -1307,8 +1306,7 @@ async function runTests() {
   const rogueKp = generateEd25519KeyPair("rogue@attacker");
   const bootstrappedVercel = await bootstrapAdminAccount(
     "verceladmin",
-    "vercel-pass-123",
-    [loginKp.record]
+    "vercel-pass-123"
   );
   assert.equal(bootstrappedVercel.persistedOnDisk, false);
   assert.ok(bootstrappedVercel.adminProfileCert);
@@ -1321,31 +1319,6 @@ async function runTests() {
   assert.equal(initVercelCfg.username, "verceladmin");
   assert.equal(await initVercelCfg.verifyPassword("vercel-pass-123"), true);
   assert.equal(await initVercelCfg.verifyPassword("wrong"), false);
-
-  // Verify Whitelisted Private Key Cryptographic Login
-  const okKeyAuth = verifyPrivateKeyAgainstWhitelist(
-    loginKp.privateKey,
-    undefined,
-    initVercelCfg.authorizedKeys
-  );
-  assert.equal(okKeyAuth.ok, true);
-  if (okKeyAuth.ok) {
-    assert.equal(okKeyAuth.matchedKey.fingerprint, loginKp.record.fingerprint);
-  }
-  // Rogue private key must be rejected
-  const rogueKeyAuth = verifyPrivateKeyAgainstWhitelist(
-    rogueKp.privateKey,
-    undefined,
-    initVercelCfg.authorizedKeys
-  );
-  assert.equal(rogueKeyAuth.ok, false);
-  // Submitting only the public key must be rejected!
-  const pubOnlyAttempt = verifyPrivateKeyAgainstWhitelist(
-    loginKp.publicKey,
-    undefined,
-    initVercelCfg.authorizedKeys
-  );
-  assert.equal(pubOnlyAttempt.ok, false);
 
   // Restore env for WS tests below
   delete process.env.VERCEL;

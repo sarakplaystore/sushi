@@ -3,11 +3,9 @@ import path from "node:path";
 import type { IncomingMessage } from "node:http";
 import type { NextRequest, NextResponse } from "next/server";
 import type {
-  AuthorizedKeyRecord,
   PublicPasskeySummary,
   StoredPasskeyRecord,
 } from "@/types/auth";
-import { parseAuthorizedKeysBlock } from "./ssh-key-utils";
 import { compareAndSwapAuthWithVaultGuard, compareAndSwapStateRecord, getStateStoreKind, hasPersistentStateStore, readStateRecord } from "./state-store";
 
 export const SESSION_COOKIE_NAME = "sushi_session";
@@ -25,7 +23,6 @@ export interface DiskAuthFile {
   passwordHash: string;
   authSecret: string;
   passkeys: StoredPasskeyRecord[];
-  authorizedKeys?: AuthorizedKeyRecord[];
   createdAt: number;
   updatedAt: number;
 }
@@ -35,7 +32,6 @@ export interface SignedAdminProfilePayload {
   username: string;
   passwordSalt: string;
   passwordHash: string;
-  authorizedKeys: AuthorizedKeyRecord[];
   updatedAt: number;
 }
 
@@ -49,7 +45,6 @@ export interface EffectiveAuthConfig {
   authSecret: string;
   sessionVersion?: string;
   serverPasskeys: StoredPasskeyRecord[];
-  authorizedKeys: AuthorizedKeyRecord[];
   adminProfilePayload?: SignedAdminProfilePayload;
 }
 
@@ -156,23 +151,27 @@ async function readDiskAuthFile(): Promise<DiskAuthFile | null> {
   if (!hasPersistentStateStore()) return null;
   const raw = await readStateRecord("auth");
   if (raw === null) return null;
-  let parsed: DiskAuthFile;
+  let parsed: Record<string, unknown>;
   try {
-    parsed = JSON.parse(raw) as DiskAuthFile;
+    parsed = JSON.parse(raw) as Record<string, unknown>;
   } catch {
     throw new Error("Persistent account data is corrupt; setup is disabled until it is restored.");
   }
   if (!parsed || parsed.version !== 1 || typeof parsed.username !== "string" ||
       !parsed.username || typeof parsed.authSecret !== "string" || !parsed.authSecret ||
       typeof parsed.passwordSalt !== "string" || typeof parsed.passwordHash !== "string" ||
-      (parsed.passkeys !== undefined && !Array.isArray(parsed.passkeys)) ||
-      (parsed.authorizedKeys !== undefined && !Array.isArray(parsed.authorizedKeys))) {
+      (parsed.passkeys !== undefined && !Array.isArray(parsed.passkeys))) {
     throw new Error("Persistent account data is invalid; setup is disabled until it is restored.");
   }
   const record: DiskAuthFile = {
-    ...parsed,
-    passkeys: Array.isArray(parsed.passkeys) ? parsed.passkeys : [],
-    authorizedKeys: Array.isArray(parsed.authorizedKeys) ? parsed.authorizedKeys : [],
+    version: 1,
+    username: parsed.username,
+    passwordSalt: parsed.passwordSalt,
+    passwordHash: parsed.passwordHash,
+    authSecret: parsed.authSecret,
+    passkeys: Array.isArray(parsed.passkeys) ? (parsed.passkeys as StoredPasskeyRecord[]) : [],
+    createdAt: typeof parsed.createdAt === "number" ? parsed.createdAt : Date.now(),
+    updatedAt: typeof parsed.updatedAt === "number" ? parsed.updatedAt : Date.now(),
   };
   authRecordSources.set(record, raw);
   return record;
@@ -205,29 +204,6 @@ function parseEnvPasskeys(): StoredPasskeyRecord[] {
   } catch {
     return [];
   }
-}
-
-function parseEnvAuthorizedKeys(): AuthorizedKeyRecord[] {
-  const raw = process.env.SUSHI_AUTHORIZED_KEYS?.trim();
-  if (!raw) return [];
-  return parseAuthorizedKeysBlock(raw).map((k) => ({
-    ...k,
-    source: "env" as const,
-  }));
-}
-
-function mergeAuthorizedKeyLists(
-  ...lists: Array<AuthorizedKeyRecord[] | undefined>
-): AuthorizedKeyRecord[] {
-  const map = new Map<string, AuthorizedKeyRecord>();
-  for (const list of lists) {
-    if (!list) continue;
-    for (const key of list) {
-      if (!key?.fingerprint || !key?.publicKeyOpenSSH) continue;
-      map.set(key.fingerprint, key);
-    }
-  }
-  return Array.from(map.values()).sort((a, b) => b.createdAt - a.createdAt);
 }
 
 // ---------------------------------------------------------------------------
@@ -290,10 +266,11 @@ export function verifyAdminProfileCertificate(
     return null;
   }
   return {
-    ...parsed,
-    authorizedKeys: Array.isArray(parsed.authorizedKeys)
-      ? parsed.authorizedKeys
-      : [],
+    v: 1,
+    username: parsed.username,
+    passwordSalt: parsed.passwordSalt,
+    passwordHash: parsed.passwordHash,
+    updatedAt: typeof parsed.updatedAt === "number" ? parsed.updatedAt : Date.now(),
   };
 }
 
@@ -351,30 +328,21 @@ export async function getEffectiveAuthConfig(
   const envSecret = process.env.SUSHI_AUTH_SECRET?.trim() || "";
   const disk = await readDiskAuthFile();
   const envPasskeys = parseEnvPasskeys();
-  const envAuthorizedKeys = parseEnvAuthorizedKeys();
 
   const hasEnvCreds = Boolean(
-    envUser &&
-      (envPass.length > 0 ||
-        envPassHash.length > 0 ||
-        envAuthorizedKeys.length > 0)
+    envUser && (envPass.length > 0 || envPassHash.length > 0)
   );
 
   // 1. Explicit Environment Variable Credentials
   if (hasEnvCreds) {
     const derivedSecret = deriveInstanceSecret(
-      `${envUser}:${envPassHash || envPass || envAuthorizedKeys[0]?.fingerprint || ""}`
+      `${envUser}:${envPassHash || envPass}`
     );
 
     const mergedPasskeysMap = new Map<string, StoredPasskeyRecord>();
     for (const pk of [...envPasskeys, ...(disk?.passkeys || [])]) {
       mergedPasskeysMap.set(pk.id, pk);
     }
-
-    const authorizedKeys = mergeAuthorizedKeyLists(
-      (disk?.authorizedKeys || []).map((k) => ({ ...k, source: "server" as const })),
-      envAuthorizedKeys
-    );
 
     return {
       initialized: true,
@@ -383,9 +351,8 @@ export async function getEffectiveAuthConfig(
       envConfigured: true,
       username: envUser,
       authSecret: derivedSecret,
-      sessionVersion: credentialSessionVersion(derivedSecret, envUser, envPassHash || envPass || envAuthorizedKeys[0]?.fingerprint || ""),
+      sessionVersion: credentialSessionVersion(derivedSecret, envUser, envPassHash || envPass),
       serverPasskeys: Array.from(mergedPasskeysMap.values()),
-      authorizedKeys,
       verifyPassword: async (candidate: string) => {
         if (!envPass && !envPassHash) return false;
         if (envPassHash) {
@@ -409,17 +376,12 @@ export async function getEffectiveAuthConfig(
     };
   }
 
-  // 2. Persistent Disk Auth File (Self-Hosted VPS / Local Server)
+  // 2. Persistent State Store Auth Record (Self-Hosted Disk, Turso, Firestore, or Redis)
   if (disk) {
     const mergedPasskeysMap = new Map<string, StoredPasskeyRecord>();
     for (const pk of [...envPasskeys, ...disk.passkeys]) {
       mergedPasskeysMap.set(pk.id, pk);
     }
-
-    const authorizedKeys = mergeAuthorizedKeyLists(
-      (disk.authorizedKeys || []).map((k) => ({ ...k, source: "server" as const })),
-      envAuthorizedKeys
-    );
 
     return {
       initialized: true,
@@ -430,7 +392,6 @@ export async function getEffectiveAuthConfig(
       authSecret: envSecret || disk.authSecret,
       sessionVersion: credentialSessionVersion(envSecret || disk.authSecret, disk.username, disk.passwordSalt, disk.passwordHash),
       serverPasskeys: Array.from(mergedPasskeysMap.values()),
-      authorizedKeys,
       verifyPassword: async (candidate: string) => {
         if (!disk.passwordHash) return false;
         const derived = await scryptHash(candidate, disk.passwordSalt);
@@ -443,7 +404,7 @@ export async function getEffectiveAuthConfig(
     };
   }
 
-  // 3. Stateless Interactive Browser-Bootstrapped Admin Certificate (Vercel!)
+  // 3. Stateless Interactive Browser-Bootstrapped Admin Certificate (Legacy Vercel opt-in)
   const serverlessSecret = deriveInstanceSecret();
   const rawAdminCert = extractAdminCertFromHeaders(headers, explicitAdminCert);
   const verifiedProfile = verifyAdminProfileCertificate(
@@ -465,7 +426,6 @@ export async function getEffectiveAuthConfig(
         passwordHash: verifiedProfile.passwordHash,
         authSecret: serverlessSecret,
         passkeys: [],
-        authorizedKeys: verifiedProfile.authorizedKeys,
         createdAt: now,
         updatedAt: verifiedProfile.updatedAt || now,
       };
@@ -474,13 +434,6 @@ export async function getEffectiveAuthConfig(
       await compareAndSwapStateRecord("auth", null, JSON.stringify(record, null, 2));
       return getEffectiveAuthConfig(headers, explicitAdminCert);
     }
-    const authorizedKeys = mergeAuthorizedKeyLists(
-      verifiedProfile.authorizedKeys.map((k) => ({
-        ...k,
-        source: "certificate" as const,
-      })),
-      envAuthorizedKeys
-    );
 
     return {
       initialized: true,
@@ -491,7 +444,6 @@ export async function getEffectiveAuthConfig(
       authSecret: serverlessSecret,
       sessionVersion: credentialSessionVersion(serverlessSecret, verifiedProfile.username, verifiedProfile.passwordSalt, verifiedProfile.passwordHash),
       serverPasskeys: envPasskeys,
-      authorizedKeys,
       adminProfilePayload: verifiedProfile,
       verifyPassword: async (candidate: string) => {
         if (!verifiedProfile.passwordHash) return false;
@@ -505,23 +457,7 @@ export async function getEffectiveAuthConfig(
     };
   }
 
-  // 4. Only SUSHI_AUTHORIZED_KEYS set without SUSHI_AUTH_USERNAME (pure SSH key whitelist mode!)
-  if (envAuthorizedKeys.length > 0) {
-    return {
-      initialized: true,
-      canBootstrapOnDisk: isPersistentDiskAvailable(),
-      canBootstrapInteractive: true,
-      envConfigured: true,
-      username: "admin",
-      authSecret: serverlessSecret,
-      sessionVersion: credentialSessionVersion(serverlessSecret, "admin", ...envAuthorizedKeys.map((key) => key.fingerprint)),
-      serverPasskeys: envPasskeys,
-      authorizedKeys: envAuthorizedKeys,
-      verifyPassword: async () => false,
-    };
-  }
-
-  // 5. Uninitialized — Ready for interactive First-Run Setup in Browser (on BOTH VPS and Vercel!)
+  // 4. Uninitialized — Ready for interactive First-Run Setup in Browser
   return {
     initialized: false,
     canBootstrapOnDisk: isPersistentDiskAvailable(),
@@ -530,19 +466,17 @@ export async function getEffectiveAuthConfig(
     username: "",
     authSecret: serverlessSecret,
     serverPasskeys: envPasskeys,
-    authorizedKeys: envAuthorizedKeys,
     verifyPassword: async () => false,
   };
 }
 
 /**
- * Bootstraps an admin account on EITHER persistent VPS disk OR stateless Vercel
- * (returning a signed `adminProfileCert` cookie + token).
+ * Bootstraps an admin account on persistent state storage (or stateless Vercel opt-in,
+ * returning a signed `adminProfileCert` cookie + token).
  */
 export async function bootstrapAdminAccount(
   username: string,
-  password: string,
-  initialAuthorizedKeys: AuthorizedKeyRecord[] = []
+  password: string
 ): Promise<{
   username: string;
   authSecret: string;
@@ -578,7 +512,6 @@ export async function bootstrapAdminAccount(
       passwordHash,
       authSecret,
       passkeys: [],
-      authorizedKeys: initialAuthorizedKeys,
       createdAt: now,
       updatedAt: now,
     };
@@ -589,7 +522,6 @@ export async function bootstrapAdminAccount(
         username: cleanUser,
         passwordSalt: saltHex,
         passwordHash,
-        authorizedKeys: initialAuthorizedKeys,
         updatedAt: now,
       },
       authSecret
@@ -615,7 +547,6 @@ export async function bootstrapAdminAccount(
       username: cleanUser,
       passwordSalt: saltHex,
       passwordHash,
-      authorizedKeys: initialAuthorizedKeys,
       updatedAt: now,
     },
     authSecret
@@ -676,7 +607,6 @@ export async function updateAdminCredentials(
         username: existing.username,
         passwordSalt: existing.passwordSalt,
         passwordHash: existing.passwordHash,
-        authorizedKeys: existing.authorizedKeys || [],
         updatedAt: existing.updatedAt,
       },
       existing.authSecret
@@ -703,7 +633,6 @@ export async function updateAdminCredentials(
       username: cleanUser,
       passwordSalt: saltHex,
       passwordHash,
-      authorizedKeys: cfg.adminProfilePayload.authorizedKeys || [],
       updatedAt: Date.now(),
     };
     return {
@@ -718,115 +647,6 @@ export async function updateAdminCredentials(
   throw new Error(
     "Credentials configured via environment variables must be updated in your hosting dashboard."
   );
-}
-
-export async function addWhitelistedKey(
-  cfg: EffectiveAuthConfig,
-  record: AuthorizedKeyRecord
-): Promise<{
-  persistedOnDisk: boolean;
-  adminProfileCert?: string;
-  signedKeyCert: string;
-}> {
-  const signedKeyCert = issueSignedAuthorizedKeyCertificate(
-    record,
-    cfg.username,
-    cfg.authSecret
-  );
-
-  if (hasPersistentStateStore()) {
-    let disk = await readDiskAuthFile();
-    if (!disk) {
-      disk = {
-        version: 1,
-        username: cfg.username,
-        passwordSalt: crypto.randomBytes(16).toString("hex"),
-        passwordHash: "",
-        authSecret: cfg.authSecret,
-        passkeys: [],
-        authorizedKeys: [],
-        createdAt: Date.now(),
-        updatedAt: Date.now(),
-      };
-    }
-    const keys = disk.authorizedKeys || [];
-    const idx = keys.findIndex((k) => k.fingerprint === record.fingerprint);
-    if (idx >= 0) {
-      keys[idx] = { ...record, source: "server" };
-    } else {
-      keys.push({ ...record, source: "server" });
-    }
-    disk.authorizedKeys = keys;
-    disk.updatedAt = Date.now();
-    await writeDiskAuthFile(disk);
-    return { persistedOnDisk: true, signedKeyCert };
-  }
-
-  if (cfg.adminProfilePayload) {
-    const keys = [...(cfg.adminProfilePayload.authorizedKeys || [])];
-    const idx = keys.findIndex((k) => k.fingerprint === record.fingerprint);
-    if (idx >= 0) {
-      keys[idx] = record;
-    } else {
-      keys.push(record);
-    }
-    const updatedPayload: SignedAdminProfilePayload = {
-      ...cfg.adminProfilePayload,
-      authorizedKeys: keys,
-      updatedAt: Date.now(),
-    };
-    return {
-      persistedOnDisk: false,
-      adminProfileCert: issueAdminProfileCertificate(
-        updatedPayload,
-        cfg.authSecret
-      ),
-      signedKeyCert,
-    };
-  }
-
-  return { persistedOnDisk: false, signedKeyCert };
-}
-
-export async function removeWhitelistedKey(
-  cfg: EffectiveAuthConfig,
-  fingerprint: string
-): Promise<{ removedOnDisk: boolean; adminProfileCert?: string }> {
-  if (hasPersistentStateStore()) {
-    const disk = await readDiskAuthFile();
-    if (disk && Array.isArray(disk.authorizedKeys)) {
-      const before = disk.authorizedKeys.length;
-      disk.authorizedKeys = disk.authorizedKeys.filter(
-        (k) => k.fingerprint !== fingerprint && k.id !== fingerprint
-      );
-      if (disk.authorizedKeys.length !== before) {
-        disk.updatedAt = Date.now();
-        await writeDiskAuthFile(disk);
-        return { removedOnDisk: true };
-      }
-    }
-    return { removedOnDisk: false };
-  }
-
-  if (cfg.adminProfilePayload) {
-    const nextKeys = (cfg.adminProfilePayload.authorizedKeys || []).filter(
-      (k) => k.fingerprint !== fingerprint && k.id !== fingerprint
-    );
-    const updatedPayload: SignedAdminProfilePayload = {
-      ...cfg.adminProfilePayload,
-      authorizedKeys: nextKeys,
-      updatedAt: Date.now(),
-    };
-    return {
-      removedOnDisk: false,
-      adminProfileCert: issueAdminProfileCertificate(
-        updatedPayload,
-        cfg.authSecret
-      ),
-    };
-  }
-
-  return { removedOnDisk: false };
 }
 
 export async function saveServerPasskey(
@@ -844,7 +664,6 @@ export async function saveServerPasskey(
       passwordHash: "",
       authSecret: cfg.authSecret,
       passkeys: [],
-      authorizedKeys: [],
       createdAt: Date.now(),
       updatedAt: Date.now(),
     };
@@ -969,7 +788,7 @@ export function clearSessionCookie(res: NextResponse): void {
 }
 
 // ---------------------------------------------------------------------------
-// WebAuthn Challenge Tokens & Signed Passkey / Key Certificates
+// WebAuthn Challenge Tokens & Signed Passkey Certificates
 // ---------------------------------------------------------------------------
 
 export interface WebAuthnChallengeClaims {
@@ -1053,70 +872,6 @@ export function verifySignedPasskeyCertificates(
     });
   }
   return valid;
-}
-
-interface SignedAuthorizedKeyPayload extends AuthorizedKeyRecord {
-  v: 1;
-  username: string;
-}
-
-export function issueSignedAuthorizedKeyCertificate(
-  record: AuthorizedKeyRecord,
-  username: string,
-  secret: string
-): string {
-  const payload: SignedAuthorizedKeyPayload = {
-    v: 1,
-    username,
-    ...record,
-    source: "certificate",
-  };
-  return signPayload(payload as unknown as Record<string, unknown>, secret);
-}
-
-export function verifySignedAuthorizedKeyCertificates(
-  certs: string[] | undefined,
-  expectedUsername: string,
-  secret: string
-): AuthorizedKeyRecord[] {
-  if (!Array.isArray(certs) || !secret) return [];
-  const valid: AuthorizedKeyRecord[] = [];
-  const seen = new Set<string>();
-
-  for (const cert of certs) {
-    if (typeof cert !== "string") continue;
-    const payload = verifySignedPayload<SignedAuthorizedKeyPayload>(cert, secret);
-    if (!payload || payload.v !== 1) continue;
-    if (expectedUsername && !safeEqualStrings(payload.username, expectedUsername)) {
-      continue;
-    }
-    if (
-      !payload.fingerprint ||
-      !payload.publicKeyOpenSSH ||
-      seen.has(payload.fingerprint)
-    ) {
-      continue;
-    }
-    seen.add(payload.fingerprint);
-    valid.push({
-      id: payload.fingerprint,
-      fingerprint: payload.fingerprint,
-      keyType: payload.keyType || "ssh-ed25519",
-      publicKeyOpenSSH: payload.publicKeyOpenSSH,
-      label: payload.label || "Authorized Key",
-      createdAt: Number(payload.createdAt || Date.now()),
-      lastUsedAt: payload.lastUsedAt,
-      source: "certificate",
-    });
-  }
-  return valid;
-}
-
-export function mergeAuthorizedKeys(
-  serverKeys: AuthorizedKeyRecord[],
-  certKeys: AuthorizedKeyRecord[]
-): AuthorizedKeyRecord[] {
-  return mergeAuthorizedKeyLists(certKeys, serverKeys);
 }
 
 export function mergePasskeySummaries(
@@ -1284,7 +1039,7 @@ export async function verifyIncomingAuth(
   return {
     ok: false,
     error:
-      "Authentication required: sign in with Password, Passkey, or Whitelisted Private Key.",
+      "Authentication required: sign in with Password or Passkey.",
   };
 }
 

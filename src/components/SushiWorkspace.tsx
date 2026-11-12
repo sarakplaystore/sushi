@@ -102,7 +102,6 @@ import { SftpBrowserSession } from "./SftpBrowserSession";
 import { RdpDesktopSession } from "./RdpDesktopSession";
 import {
   getStoredAdminProfileCert,
-  getStoredAuthorizedKeyCertificates,
   getStoredPasskeyCertificates,
   setStoredSessionToken,
 } from "@/lib/client/auth-storage";
@@ -401,14 +400,12 @@ export function SushiWorkspace() {
     const gw = loadGatewaySettings();
     try {
       const certs = getStoredPasskeyCertificates().map((c) => c.cert);
-      const keyCerts = getStoredAuthorizedKeyCertificates().map((c) => c.cert);
       const adminCert = getStoredAdminProfileCert();
       const res = await fetch("/api/auth/status", {
         method: "POST",
         headers: getAuthHeaders(gw),
         body: JSON.stringify({
           signedCertificates: certs,
-          signedKeyCertificates: keyCerts,
           adminProfileCert: adminCert || undefined,
         }),
       });
@@ -2731,7 +2728,7 @@ export function SushiWorkspace() {
                       className="inline-flex items-center gap-1.5 rounded-xl border border-white/12 bg-white/5 px-3.5 py-2 text-xs font-medium text-slate-200 transition hover:bg-white/10"
                     >
                       <Fingerprint className="h-3.5 w-3.5 text-[#ff6b57]" />
-                      Account &amp; Login Keys
+                      Account &amp; Passkeys
                     </button>
                     <button
                       type="button"

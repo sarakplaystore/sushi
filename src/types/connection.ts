@@ -169,7 +169,7 @@ export interface SystemCapabilities {
   rdpGuacd: boolean;
   rdpProbe: boolean;
   serverVault: boolean;
-  storageBackend?: "disk" | "redis" | "firestore" | "none";
+  storageBackend?: "disk" | "redis" | "turso" | "firestore" | "none";
   requiresGatewayToken: boolean;
   guacdHost?: string;
   nodeVersion: string;

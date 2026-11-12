@@ -538,7 +538,7 @@ export function AuthGateScreen({
       <div className="flex h-full w-full items-center justify-center bg-[#090b10] p-4">
         <div className="w-full max-w-md space-y-4 rounded-2xl border border-amber-500/30 bg-[#0f131b] p-6 text-sm text-slate-200">
           <h1 className="font-semibold text-white">Shared storage required</h1>
-          <p>Configure Google Cloud Firestore or a persistent Redis REST database for this Vercel deployment before creating the admin account. This prevents every device from creating a separate account.</p>
+          <p>Configure Turso, Google Cloud Firestore, or a persistent Redis REST database for this Vercel deployment before creating the admin account. This prevents every device from creating a separate account.</p>
           <button type="button" onClick={() => void onRefreshStatus()} className="rounded-xl bg-[#ff6b57] px-4 py-2 text-xs font-semibold text-white">Check again</button>
         </div>
       </div>

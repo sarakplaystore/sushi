@@ -1658,21 +1658,46 @@ export function SushiWorkspace() {
                   </div>
                   <div className="mb-1.5 rounded-xl border border-white/8 bg-[#0d121b] px-2.5 py-2">
                     <div className="flex items-center justify-between gap-2 text-[11px] font-medium text-slate-200">
-                      <span className="flex items-center gap-1.5"><Cloud className="h-3.5 w-3.5 text-sky-400" /> Google Cloud Firestore</span>
-                      <span className={localCaps?.storageBackend === "firestore" ? "text-emerald-400" : "text-slate-400"}>
-                        {localCaps?.storageBackend === "firestore" ? "Configured" : "Not active"}
+                      <span className="flex items-center gap-1.5">
+                        <Cloud className="h-3.5 w-3.5 text-sky-400" />
+                        {localCaps?.storageBackend === "turso"
+                          ? "Turso (libSQL)"
+                          : localCaps?.storageBackend === "redis"
+                            ? "Redis REST"
+                            : localCaps?.storageBackend === "firestore"
+                              ? "Google Cloud Firestore"
+                              : "Cloud Vault Sync"}
+                      </span>
+                      <span className={
+                        localCaps?.storageBackend === "turso" ||
+                        localCaps?.storageBackend === "redis" ||
+                        localCaps?.storageBackend === "firestore"
+                          ? "text-emerald-400"
+                          : "text-slate-400"
+                      }>
+                        {localCaps?.storageBackend === "turso" ||
+                        localCaps?.storageBackend === "redis" ||
+                        localCaps?.storageBackend === "firestore"
+                          ? "Configured"
+                          : "Not active"}
                       </span>
                     </div>
                     <p className="mt-1 text-[10px] leading-relaxed text-slate-400">
-                      {localCaps?.storageBackend === "firestore"
-                        ? localCaps.serverVault ? "Encrypted vault sync is enabled for this deployment." : "Firestore is configured, but vault sync is disabled."
+                      {localCaps?.storageBackend === "turso" ||
+                      localCaps?.storageBackend === "redis" ||
+                      localCaps?.storageBackend === "firestore"
+                        ? localCaps.serverVault
+                          ? "Encrypted vault sync is enabled for this deployment."
+                          : "Shared storage is configured, but vault sync is disabled."
                         : localCaps?.serverVault
-                          ? `Current vault storage: ${localCaps.storageBackend === "redis" ? "Redis" : localCaps.storageBackend === "disk" ? "server disk" : "shared storage"}. Configure Firestore in your hosting environment.`
-                          : "Vault sync is disabled. Configure Firestore in your hosting environment."}
+                          ? `Current vault storage: ${localCaps.storageBackend === "disk" ? "server disk" : "shared storage"}. Configure Turso, Firestore, or Redis for cloud sync.`
+                          : "Vault sync is disabled. Configure Turso, Firestore, or Redis in your hosting environment."}
                     </p>
-                    {localCaps?.storageBackend !== "firestore" && (
-                      <a href="https://github.com/sarakplaystore/sushi#google-cloud-firestore" target="_blank" rel="noreferrer" className="mt-1 inline-block text-[10px] font-medium text-sky-300 underline decoration-sky-300/40 underline-offset-2 hover:text-sky-200">Firestore setup guide</a>
-                    )}
+                    {localCaps?.storageBackend !== "turso" &&
+                      localCaps?.storageBackend !== "redis" &&
+                      localCaps?.storageBackend !== "firestore" && (
+                        <a href="https://github.com/sarakplaystore/sushi#3-deploy-to-vercel--optional-companion-vps-gateway" target="_blank" rel="noreferrer" className="mt-1 inline-block text-[10px] font-medium text-sky-300 underline decoration-sky-300/40 underline-offset-2 hover:text-sky-200">Cloud storage setup guide</a>
+                      )}
                   </div>
                   <button ref={settingsFirstActionRef} type="button" onClick={() => {
                     setSettingsOpen(false);
@@ -2119,7 +2144,7 @@ export function SushiWorkspace() {
               )}
               {localCaps && !localCaps.serverVault && (
                 <div role="status" className="rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-xs text-amber-100">
-                  Shared vault storage is disabled or not configured. Saved connections can appear in other tabs of this browser, but not on other devices. {localCaps.mode === "vercel" ? "Connect persistent Redis REST storage to this Vercel project to enable cross-device sync. Keep this browser's data until migration is complete." : "Enable persistent shared vault storage to sync other devices."}
+                  Shared vault storage is disabled or not configured. Saved connections can appear in other tabs of this browser, but not on other devices. {localCaps.mode === "vercel" ? "Connect Turso, Firestore, or persistent Redis REST storage to this Vercel project to enable cross-device sync. Keep this browser's data until migration is complete." : "Enable persistent shared vault storage to sync other devices."}
                 </div>
               )}
               {localCaps?.serverVault && vaultKeySource !== "account" && !vaultSyncError && (

@@ -323,19 +323,25 @@ for the account and vault; switching stores does not automatically copy data.
 
 ### 3. Deploy to Vercel (+ Optional Companion VPS Gateway)
 
-1. Provision **either** [Google Cloud Firestore](#google-cloud-firestore) or a
-   Redis database with an **Upstash-compatible REST API**. Sushi does not create
-   a database or enable billing for you. Back up and migrate existing data before
-   changing an existing deployment's backend (see below).
-2. Import `sarakplaystore/sushi` into Vercel (Next.js, Node.js `22.x`). For
-   Firestore, use the server-side settings in the next section. For Redis, set
-   one complete pair of **server-side** environment variables:
-   - `SUSHI_REDIS_REST_URL` and `SUSHI_REDIS_REST_TOKEN`, or
-   - `UPSTASH_REDIS_REST_URL` and `UPSTASH_REDIS_REST_TOKEN`, or
-   - `KV_REST_API_URL` and `KV_REST_API_TOKEN` (older Vercel KV integrations).
+1. Provision **Turso (libSQL)**, **[Google Cloud Firestore](#google-cloud-firestore)**,
+   or a **Redis database with an Upstash-compatible REST API**. Sushi does not
+   create a database or enable billing for you. Back up and migrate existing data
+   before changing an existing deployment's backend (see below).
+2. Import `sarakplaystore/sushi` into Vercel (Next.js, Node.js `22.x`):
+   - **Turso (libSQL):** Connect a Turso database from the Vercel Marketplace
+     (which injects `TURSO_DATABASE_URL` and `TURSO_AUTH_TOKEN`), or set
+     `SUSHI_TURSO_DATABASE_URL` + `SUSHI_TURSO_AUTH_TOKEN` as server-side secrets.
+     Sushi automatically provisions the `sushi_state_v1` table over Turso's HTTPS
+     pipeline (`/v2/pipeline`) on first use.
+   - **Firestore:** Use the server-side settings in the next section.
+   - **Redis:** Set one complete pair of **server-side** environment variables:
+     - `SUSHI_REDIS_REST_URL` and `SUSHI_REDIS_REST_TOKEN`, or
+     - `UPSTASH_REDIS_REST_URL` and `UPSTASH_REDIS_REST_TOKEN`, or
+     - `KV_REST_API_URL` and `KV_REST_API_TOKEN` (older Vercel KV integrations).
 
-   The first complete Redis pair in that order is used; a partial pair fails
-   closed. Never prefix a credential with `NEXT_PUBLIC_` or commit it. Redeploy
+   A partial credential pair (or configuring both Redis and Turso without setting
+   `SUSHI_STORAGE_BACKEND=redis` or `SUSHI_STORAGE_BACKEND=turso`) fails closed.
+   Never prefix a credential with `NEXT_PUBLIC_` or commit it. Redeploy
    after changing environment variables. Production and preview normally have
    different default namespaces. Use an explicit `SUSHI_STORAGE_PREFIX` only
    for instances that should share the same account; back up the database.

@@ -52,6 +52,8 @@ import {
   decryptVaultEnvelope,
   encryptVaultData,
   loadLocalEnvelope,
+  mergeVaultPlaintexts,
+  resolvePersistedTabProfile,
   resolveProfileWithKeychain,
 } from "@/lib/client/crypto-vault";
 import {
@@ -63,6 +65,7 @@ import {
   saveGatewaySettings,
 } from "@/lib/client/gateway";
 import {
+  cacheSyncedVault,
   cacheSyncedVaultIfUnchanged,
   clearLocalSyncMetadata,
   fetchRemoteVault,
@@ -110,19 +113,28 @@ import {
   rdpCompanionTitle,
 } from "@/lib/client/rdp-companion";
 import {
+  type PersistedSessionTab,
   type RecentHostEntry,
   type ResumePrompt,
   type ResumableRun,
+  type SyncedWorkspaceState,
   buildResumePrompt,
   describeRunState,
   formatRunDuration,
+  hostHistoryKey,
   loadRecentHosts,
   loadResumableRuns,
+  matchRunningCommandForTab,
+  mergeWorkspaceStates,
+  readLocalWorkspaceState,
+  recordClosedTab,
   recordRecentHost,
   removeRecentHost,
   removeResumableRun,
   resumableRunCandidates,
+  savePersistedTabs,
   upsertResumableRun,
+  writeLocalWorkspaceState,
 } from "@/lib/client/session-resume";
 
 function downloadEncryptedVault(envelope: EncryptedVaultEnvelope, filename: string) {
@@ -222,10 +234,7 @@ export function SushiWorkspace() {
   const [activeTabId, setActiveTabId] = useState<string>("launchpad");
 
   // ---------------------------------------------------------------------------
-  // Recently connected hosts + resumable runs ("your command is still running")
-  //
-  // Session state, not vault state: kept in this browser's localStorage so it
-  // survives a reload or a closed tab, and never synced (no secrets in it).
+  // Cross-device & reload persistent workspace state (open tabs, runs, history)
   // ---------------------------------------------------------------------------
   const [recentHosts, setRecentHosts] = useState<RecentHostEntry[]>([]);
   const [resumableRuns, setResumableRuns] = useState<ResumableRun[]>([]);
@@ -235,6 +244,35 @@ export function SushiWorkspace() {
   const [resumePrompt, setResumePrompt] = useState<ResumePrompt | null>(null);
   /** Runs already offered once, so Dismiss is not undone by the next poll. */
   const dismissedResumeRef = useRef<Set<string>>(new Set());
+
+  // Live refs so cross-device refreshes and serialized saves never read stale closures
+  // or unmount running terminal/SFTP/RDP sessions.
+  const vaultReadyRef = useRef(false);
+  vaultReadyRef.current = vaultReady;
+  const vaultLockedRef = useRef(false);
+  vaultLockedRef.current = vaultLocked;
+  const hostsRef = useRef<HostProfile[]>([]);
+  hostsRef.current = hosts;
+  const snippetsRef = useRef<CommandSnippet[]>(DEFAULT_SNIPPETS);
+  snippetsRef.current = snippets;
+  const sshKeysRef = useRef<WhitelistedSshKey[]>([]);
+  sshKeysRef.current = sshKeys;
+  const enforceKeyWhitelistRef = useRef(false);
+  enforceKeyWhitelistRef.current = enforceKeyWhitelist;
+  const tabsRef = useRef<SessionTab[]>([]);
+  tabsRef.current = tabs;
+  const activeTabIdRef = useRef<string>("launchpad");
+  activeTabIdRef.current = activeTabId;
+  const activeTabUpdatedAtRef = useRef<number>(0);
+  const tabUpdatedAtMapRef = useRef<Record<string, number>>({});
+  const tabRunIdsRef = useRef<Record<string, string | null>>({});
+  const tabsHydratedRef = useRef(false);
+  const localClosedTabIdsRef = useRef<Set<string>>(new Set());
+  const lastSyncedPlainRef = useRef<VaultPlaintext | null>(null);
+  const vaultWriteChainRef = useRef<Promise<void>>(Promise.resolve());
+  const workspaceSyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const workspaceSyncDirtyRef = useRef(false);
+  const scheduleWorkspaceSyncRef = useRef<() => void>(() => {});
 
   // Modals
   const [hostModalOpen, setHostModalOpen] = useState(false);
@@ -390,12 +428,284 @@ export function SushiWorkspace() {
     }
   }, []);
 
+  const buildPersistedTabs = useCallback(
+    (tabList: SessionTab[], hostList: HostProfile[]): PersistedSessionTab[] =>
+      tabList.map((tab) => ({
+        id: tab.id,
+        title: tab.title,
+        protocol: tab.protocol,
+        profile: {
+          ...tab.profile,
+          password: undefined,
+          privateKey: undefined,
+          passphrase: undefined,
+        },
+        hostId: hostList.some((h) => h.id === tab.profile.id) ? tab.profile.id : null,
+        initialPath: tab.initialPath,
+        createdAt: tab.createdAt,
+        updatedAt: tabUpdatedAtMapRef.current[tab.id] ?? tab.createdAt,
+        runId: tabRunIdsRef.current[tab.id] ?? null,
+      })),
+    []
+  );
+
+  const buildCurrentWorkspaceState = useCallback(
+    (
+      overrideTabs?: SessionTab[],
+      overrideActiveTabId?: string,
+      overrideHosts?: HostProfile[]
+    ): SyncedWorkspaceState => {
+      const localState = readLocalWorkspaceState();
+      if (!tabsHydratedRef.current && overrideTabs === undefined) {
+        return localState;
+      }
+      const effectiveTabs = overrideTabs ?? tabsRef.current;
+      const effectiveActive = overrideActiveTabId ?? activeTabIdRef.current;
+      const effectiveHosts = overrideHosts ?? hostsRef.current;
+      const persistedTabs = buildPersistedTabs(effectiveTabs, effectiveHosts);
+      const validActive =
+        effectiveActive === "launchpad" || persistedTabs.some((t) => t.id === effectiveActive)
+          ? effectiveActive
+          : "launchpad";
+      return {
+        ...localState,
+        openTabs: persistedTabs,
+        activeTabId: validActive,
+        activeTabUpdatedAt: activeTabUpdatedAtRef.current,
+      };
+    },
+    [buildPersistedTabs]
+  );
+
+  const persistTabsLocally = useCallback(
+    (nextTabs: SessionTab[], nextActiveTabId: string, bumpActiveTs = false) => {
+      tabsRef.current = nextTabs;
+      activeTabIdRef.current = nextActiveTabId;
+      if (bumpActiveTs) {
+        activeTabUpdatedAtRef.current = Date.now();
+      }
+      if (!tabsHydratedRef.current) return;
+      savePersistedTabs(
+        buildPersistedTabs(nextTabs, hostsRef.current),
+        nextActiveTabId,
+        activeTabUpdatedAtRef.current
+      );
+    },
+    [buildPersistedTabs]
+  );
+
   const applyPlainVault = useCallback((plain: VaultPlaintext) => {
+    const nextKeys = plain.sshKeys || [];
+    const nextEnforce = Boolean(plain.enforceKeyWhitelist);
+    hostsRef.current = plain.hosts;
+    snippetsRef.current = plain.snippets;
+    sshKeysRef.current = nextKeys;
+    enforceKeyWhitelistRef.current = nextEnforce;
     setHosts(plain.hosts);
     setSnippets(plain.snippets);
-    setSshKeys(plain.sshKeys || []);
-    setEnforceKeyWhitelist(Boolean(plain.enforceKeyWhitelist));
-  }, []);
+    setSshKeys(nextKeys);
+    setEnforceKeyWhitelist(nextEnforce);
+
+    const localWs = buildCurrentWorkspaceState(
+      tabsHydratedRef.current ? tabsRef.current : undefined,
+      tabsHydratedRef.current ? activeTabIdRef.current : undefined,
+      plain.hosts
+    );
+    const mergedWs = mergeWorkspaceStates(localWs, plain.workspace);
+    writeLocalWorkspaceState(mergedWs);
+    setRecentHosts(mergedWs.recentHosts);
+    setResumableRuns(mergedWs.resumableRuns);
+    lastSyncedPlainRef.current = {
+      version: 1,
+      hosts: plain.hosts,
+      snippets: plain.snippets,
+      sshKeys: nextKeys,
+      enforceKeyWhitelist: nextEnforce,
+      workspace: mergedWs,
+    };
+
+    if (!tabsHydratedRef.current) {
+      tabsHydratedRef.current = true;
+      const claimedRunIds = new Set<string>();
+      const initialResumes: Record<string, ResumableRun> = {};
+      const restoredTabs: SessionTab[] = [];
+
+      for (const ptab of mergedWs.openTabs) {
+        if (localClosedTabIdsRef.current.has(ptab.id)) continue;
+        const resolvedProfile = resolvePersistedTabProfile(
+          ptab,
+          plain.hosts,
+          nextKeys,
+          nextEnforce
+        );
+        if (!resolvedProfile) continue;
+        tabUpdatedAtMapRef.current[ptab.id] = ptab.updatedAt;
+        restoredTabs.push({
+          id: ptab.id,
+          title: ptab.title,
+          protocol: ptab.protocol,
+          profile: resolvedProfile,
+          initialPath: ptab.initialPath,
+          createdAt: ptab.createdAt,
+        });
+        const run = matchRunningCommandForTab(ptab, mergedWs.resumableRuns, claimedRunIds);
+        if (run) {
+          claimedRunIds.add(run.id);
+          tabRunIdsRef.current[ptab.id] = run.id;
+          initialResumes[ptab.id] = run;
+          dismissedResumeRef.current.add(run.id);
+        }
+      }
+
+      const hasDeepLink =
+        typeof window !== "undefined" && Boolean(parseHostDeepLink(window.location.search));
+      const restoredActive =
+        !hasDeepLink &&
+        mergedWs.activeTabId !== "launchpad" &&
+        restoredTabs.some((t) => t.id === mergedWs.activeTabId)
+          ? mergedWs.activeTabId
+          : "launchpad";
+
+      activeTabUpdatedAtRef.current = mergedWs.activeTabUpdatedAt;
+      tabsRef.current = restoredTabs;
+      activeTabIdRef.current = restoredActive;
+      setTabs(restoredTabs);
+      if (!hasDeepLink) {
+        setActiveTabId(restoredActive);
+      }
+      if (Object.keys(initialResumes).length > 0) {
+        setTabResumes((prev) => ({ ...prev, ...initialResumes }));
+      }
+      savePersistedTabs(
+        buildPersistedTabs(restoredTabs, plain.hosts),
+        restoredActive,
+        mergedWs.activeTabUpdatedAt
+      );
+
+      const unclaimed = mergedWs.resumableRuns.filter(
+        (r) => !claimedRunIds.has(r.id) && !dismissedResumeRef.current.has(r.id)
+      );
+      const prompt = buildResumePrompt(unclaimed);
+      if (prompt) setResumePrompt(prompt);
+
+      // If this browser had local workspace items not yet present in the shared
+      // vault, push the merged workspace state once a vault envelope exists.
+      if (
+        (pendingEnvelopeRef.current !== null || syncRevisionRef.current !== null) &&
+        JSON.stringify(mergedWs) !== JSON.stringify(plain.workspace ?? null) &&
+        (mergedWs.openTabs.length > 0 ||
+          mergedWs.resumableRuns.length > 0 ||
+          mergedWs.recentHosts.length > 0)
+      ) {
+        scheduleWorkspaceSyncRef.current();
+      }
+      return;
+    }
+
+    // Live cross-device update: keep every mounted tab running and uninterrupted,
+    // refresh host credentials in-place, append any newly opened remote tabs, and
+    // attach newly started remote commands.
+    const claimedRunIds = new Set<string>(
+      Object.values(tabRunIdsRef.current).filter((v): v is string => Boolean(v))
+    );
+    const existingIds = new Set(tabsRef.current.map((t) => t.id));
+    const nextResumes: Record<string, ResumableRun> = {};
+    let tabsChanged = false;
+
+    const updatedExisting = tabsRef.current.map((tab) => {
+      const resolvedProfile = resolvePersistedTabProfile(
+        {
+          id: tab.id,
+          title: tab.title,
+          protocol: tab.protocol,
+          profile: tab.profile,
+          hostId: tab.profile.id,
+          initialPath: tab.initialPath,
+          createdAt: tab.createdAt,
+          updatedAt: tabUpdatedAtMapRef.current[tab.id] ?? tab.createdAt,
+        },
+        plain.hosts,
+        nextKeys,
+        nextEnforce
+      );
+
+      let nextTab = tab;
+      if (resolvedProfile && JSON.stringify(resolvedProfile) !== JSON.stringify(tab.profile)) {
+        const nextTitle =
+          tab.title === tab.profile.name && resolvedProfile.name
+            ? resolvedProfile.name
+            : tab.title;
+        nextTab = { ...tab, title: nextTitle, profile: resolvedProfile };
+        tabsChanged = true;
+      }
+
+      if (nextTab.protocol === "ssh" && !tabRunIdsRef.current[nextTab.id]) {
+        const matchingRun = matchRunningCommandForTab(
+          { protocol: nextTab.protocol, profile: nextTab.profile },
+          mergedWs.resumableRuns,
+          claimedRunIds
+        );
+        if (matchingRun && !dismissedResumeRef.current.has(matchingRun.id)) {
+          claimedRunIds.add(matchingRun.id);
+          tabRunIdsRef.current[nextTab.id] = matchingRun.id;
+          nextResumes[nextTab.id] = matchingRun;
+          dismissedResumeRef.current.add(matchingRun.id);
+        }
+      }
+      return nextTab;
+    });
+
+    const addedRemoteTabs: SessionTab[] = [];
+    for (const ptab of mergedWs.openTabs) {
+      if (existingIds.has(ptab.id) || localClosedTabIdsRef.current.has(ptab.id)) continue;
+      const resolvedProfile = resolvePersistedTabProfile(
+        ptab,
+        plain.hosts,
+        nextKeys,
+        nextEnforce
+      );
+      if (!resolvedProfile) continue;
+      tabUpdatedAtMapRef.current[ptab.id] = ptab.updatedAt;
+      addedRemoteTabs.push({
+        id: ptab.id,
+        title: ptab.title,
+        protocol: ptab.protocol,
+        profile: resolvedProfile,
+        initialPath: ptab.initialPath,
+        createdAt: ptab.createdAt,
+      });
+      tabsChanged = true;
+      const run = matchRunningCommandForTab(ptab, mergedWs.resumableRuns, claimedRunIds);
+      if (run) {
+        claimedRunIds.add(run.id);
+        tabRunIdsRef.current[ptab.id] = run.id;
+        nextResumes[ptab.id] = run;
+        dismissedResumeRef.current.add(run.id);
+      }
+    }
+
+    if (tabsChanged) {
+      const combinedTabs = [...updatedExisting, ...addedRemoteTabs];
+      tabsRef.current = combinedTabs;
+      setTabs(combinedTabs);
+      savePersistedTabs(
+        buildPersistedTabs(combinedTabs, plain.hosts),
+        activeTabIdRef.current,
+        activeTabUpdatedAtRef.current
+      );
+    }
+    if (Object.keys(nextResumes).length > 0) {
+      setTabResumes((prev) => ({ ...prev, ...nextResumes }));
+    }
+
+    const unclaimed = mergedWs.resumableRuns.filter(
+      (r) => !claimedRunIds.has(r.id) && !dismissedResumeRef.current.has(r.id)
+    );
+    const prompt = buildResumePrompt(unclaimed);
+    if (prompt) {
+      setResumePrompt((prev) => (prev?.run.id === prompt.run.id ? prev : prompt));
+    }
+  }, [buildCurrentWorkspaceState, buildPersistedTabs]);
 
   const createAccountVault = useCallback(async (
     plain: VaultPlaintext,
@@ -443,7 +753,11 @@ export function SushiWorkspace() {
     const sequence = ++bootSequenceRef.current;
     if (password) accountPasswordRef.current = password;
     const currentPassword = accountPasswordRef.current;
-    setVaultReady(false);
+    // Never unmount already-running terminal/SFTP/RDP sessions when re-checking
+    // or reloading the vault in an active workspace.
+    if (!vaultReadyRef.current) {
+      setVaultReady(false);
+    }
     setVaultBootError(null);
     setVaultRecoveryEnvelope(null);
     setVaultConflict(null);
@@ -605,8 +919,9 @@ export function SushiWorkspace() {
       explicitMode?: "device" | "passphrase",
       nextSshKeys?: WhitelistedSshKey[],
       nextEnforceWhitelist?: boolean,
-      explicitSource?: "account" | "independent"
-    ) => {
+      explicitSource?: "account" | "independent",
+      options: { background?: boolean } = {}
+    ): Promise<VaultPlaintext> => {
       const targetMode = explicitMode ?? vaultMode;
       const source = targetMode === "passphrase" ? explicitSource ?? vaultKeySource : "independent";
       const passToUse = targetMode === "passphrase" ? passphraseOverride ?? activePassphrase : null;
@@ -614,50 +929,186 @@ export function SushiWorkspace() {
       if (accountVaultOutdated && explicitSource !== "account") {
         throw new Error("Update the vault to the current account password before making changes.");
       }
-      // Capture the base before encryption. Two simultaneous edits from this
-      // tab must not silently overwrite each other either.
-      const baseRevision = syncRevisionRef.current;
-      const baseLocalEnvelope = pendingEnvelopeRef.current;
-      vaultMutationVersionRef.current++;
-      try {
-        if (source === "account" && passToUse) await verifyAccountPassword(gatewaySettings, passToUse);
-        const envelope = await encryptVaultData({
-          version: 1,
-          hosts: nextHosts,
-          snippets: nextSnippets,
-          sshKeys: nextSshKeys ?? sshKeys,
-          enforceKeyWhitelist: nextEnforceWhitelist ?? enforceKeyWhitelist,
-        }, passToUse);
-        envelope.keySource = source;
-        if (localCaps?.serverVault) {
-          const revision = await saveRemoteVault(gatewaySettings, envelope, baseRevision);
-          syncRevisionRef.current = revision;
-          if (!await cacheSyncedVaultIfUnchanged(baseLocalEnvelope, envelope, revision)) {
-            setVaultSyncError("Vault saved to shared storage, but this browser's local copy changed or could not be cached. Reload before editing again.");
+
+      const executeSave = async (): Promise<VaultPlaintext> => {
+        workspaceSyncDirtyRef.current = false;
+        vaultMutationVersionRef.current++;
+        try {
+          if (!options.background && source === "account" && passToUse) {
+            await verifyAccountPassword(gatewaySettings, passToUse);
+          }
+
+          let desiredPlain: VaultPlaintext = {
+            version: 1,
+            hosts: nextHosts,
+            snippets: nextSnippets,
+            sshKeys: nextSshKeys ?? sshKeysRef.current,
+            enforceKeyWhitelist: nextEnforceWhitelist ?? enforceKeyWhitelistRef.current,
+            workspace: buildCurrentWorkspaceState(undefined, undefined, nextHosts),
+          };
+
+          let baseRevision = syncRevisionRef.current;
+          let baseLocalEnvelope = pendingEnvelopeRef.current;
+          let envelope = await encryptVaultData(desiredPlain, passToUse);
+          envelope.keySource = source;
+
+          if (localCaps?.serverVault) {
+            let revision: string | null = null;
+            for (let attempt = 0; attempt < 3; attempt++) {
+              try {
+                revision = await saveRemoteVault(gatewaySettings, envelope, baseRevision);
+                break;
+              } catch (saveErr) {
+                const msg = saveErr instanceof Error ? saveErr.message : "";
+                if (attempt < 2 && /changed on another device/i.test(msg)) {
+                  const latestRemote = await fetchRemoteVault(gatewaySettings);
+                  if (latestRemote.envelope && latestRemote.revision) {
+                    const decryptPass =
+                      latestRemote.envelope.mode === "passphrase"
+                        ? activePassphrase ?? passToUse
+                        : null;
+                    const remotePlain = await decryptVaultEnvelope(
+                      latestRemote.envelope,
+                      decryptPass
+                    );
+                    desiredPlain = mergeVaultPlaintexts(
+                      lastSyncedPlainRef.current,
+                      desiredPlain,
+                      remotePlain
+                    );
+                    baseRevision = latestRemote.revision;
+                    baseLocalEnvelope = latestRemote.envelope;
+                    envelope = await encryptVaultData(desiredPlain, passToUse);
+                    envelope.keySource = source;
+                    continue;
+                  }
+                }
+                throw saveErr;
+              }
+            }
+            if (!revision) {
+              throw new Error("Could not save the encrypted vault.");
+            }
+            syncRevisionRef.current = revision;
+            const cachedClean = await cacheSyncedVaultIfUnchanged(
+              baseLocalEnvelope,
+              envelope,
+              revision
+            );
+            const cachedMerged = cachedClean || cacheSyncedVault(envelope, revision);
+            if (!cachedMerged) {
+              if (!options.background) {
+                setVaultSyncError(
+                  "Vault saved to shared storage, but this browser's local copy could not be cached."
+                );
+              }
+            } else {
+              bootLocalEnvelopeRef.current = envelope;
+              setVaultSyncError(null);
+            }
           } else {
+            await saveLocalVaultIfUnchanged(baseLocalEnvelope, envelope);
             bootLocalEnvelopeRef.current = envelope;
             setVaultSyncError(null);
           }
-        } else {
-          await saveLocalVaultIfUnchanged(baseLocalEnvelope, envelope);
-          bootLocalEnvelopeRef.current = envelope;
-          setVaultSyncError(null);
+
+          updatePendingEnvelope(envelope);
+          applyPlainVault(desiredPlain);
+          return desiredPlain;
+        } catch (error) {
+          let message = error instanceof Error ? error.message : "Could not save the encrypted vault.";
+          if (source === "account" && !explicitSource && /account password is incorrect/i.test(message)) {
+            setAccountVaultOutdated(true);
+            message = "The account password has changed. Update the vault to the current account password before saving.";
+          }
+          if (!options.background) {
+            setVaultSyncError(message);
+          }
+          throw new Error(message);
+        } finally {
+          vaultMutationVersionRef.current++;
         }
-        updatePendingEnvelope(envelope);
-      } catch (error) {
-        let message = error instanceof Error ? error.message : "Could not save the encrypted vault.";
-        if (source === "account" && !explicitSource && /account password is incorrect/i.test(message)) {
-          setAccountVaultOutdated(true);
-          message = "The account password has changed. Update the vault to the current account password before saving.";
-        }
-        setVaultSyncError(message);
-        throw new Error(message);
-      } finally {
-        vaultMutationVersionRef.current++;
-      }
+      };
+
+      const queued = vaultWriteChainRef.current.then(executeSave, executeSave);
+      vaultWriteChainRef.current = queued.then(() => undefined, () => undefined);
+      return queued;
     },
-    [activePassphrase, accountVaultOutdated, enforceKeyWhitelist, gatewaySettings, localCaps?.serverVault, sshKeys, updatePendingEnvelope, vaultKeySource, vaultMode]
+    [
+      accountVaultOutdated,
+      activePassphrase,
+      applyPlainVault,
+      buildCurrentWorkspaceState,
+      gatewaySettings,
+      localCaps?.serverVault,
+      updatePendingEnvelope,
+      vaultKeySource,
+      vaultMode,
+    ]
   );
+
+  const flushWorkspaceSync = useCallback(() => {
+    if (workspaceSyncTimerRef.current) {
+      clearTimeout(workspaceSyncTimerRef.current);
+      workspaceSyncTimerRef.current = null;
+    }
+    if (!workspaceSyncDirtyRef.current) return;
+    if (!vaultReadyRef.current || vaultLockedRef.current || accountVaultOutdated) return;
+    if (vaultMode === "passphrase" && !activePassphrase) return;
+    // Never create an initial empty shared vault before the user has saved or
+    // migrated their vault on a brand-new account.
+    if (
+      localCaps?.serverVault &&
+      syncRevisionRef.current === null &&
+      pendingEnvelopeRef.current === null
+    ) {
+      return;
+    }
+    workspaceSyncDirtyRef.current = false;
+    void persistVault(
+      hostsRef.current,
+      snippetsRef.current,
+      undefined,
+      undefined,
+      sshKeysRef.current,
+      enforceKeyWhitelistRef.current,
+      undefined,
+      { background: true }
+    ).catch(() => {
+      // Transient network errors during background tab/run sync retry on next change/focus.
+    });
+  }, [accountVaultOutdated, activePassphrase, localCaps?.serverVault, persistVault, vaultMode]);
+
+  const scheduleWorkspaceSync = useCallback(() => {
+    workspaceSyncDirtyRef.current = true;
+    if (workspaceSyncTimerRef.current) {
+      clearTimeout(workspaceSyncTimerRef.current);
+    }
+    workspaceSyncTimerRef.current = setTimeout(() => {
+      workspaceSyncTimerRef.current = null;
+      flushWorkspaceSync();
+    }, 600);
+  }, [flushWorkspaceSync]);
+
+  useEffect(() => {
+    scheduleWorkspaceSyncRef.current = scheduleWorkspaceSync;
+  }, [scheduleWorkspaceSync]);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || typeof document === "undefined") return;
+    const onHide = () => {
+      if (document.visibilityState === "hidden") {
+        flushWorkspaceSync();
+      }
+    };
+    const onPageHide = () => flushWorkspaceSync();
+    document.addEventListener("visibilitychange", onHide);
+    window.addEventListener("pagehide", onPageHide);
+    return () => {
+      document.removeEventListener("visibilitychange", onHide);
+      window.removeEventListener("pagehide", onPageHide);
+    };
+  }, [flushWorkspaceSync]);
 
   const refreshSharedVault = useCallback(async function refreshSharedVault() {
     if (!localCaps?.serverVault || !syncEligibleRef.current) return;
@@ -683,9 +1134,16 @@ export function SushiWorkspace() {
         throw new Error("The shared vault changed and needs a different password or device key. Reload the latest vault to unlock it; local data was not replaced.");
       }
       if (!syncEligibleRef.current || version !== vaultMutationVersionRef.current || baseRevision !== syncRevisionRef.current) return;
-      const cached = await cacheSyncedVaultIfUnchanged(localBase, remote.envelope, remote.revision);
+      const cached =
+        (await cacheSyncedVaultIfUnchanged(localBase, remote.envelope, remote.revision)) ||
+        cacheSyncedVault(remote.envelope, remote.revision);
       if (!syncEligibleRef.current || version !== vaultMutationVersionRef.current || baseRevision !== syncRevisionRef.current) return;
-      if (remote.envelope.keySource === "account" && pass && accountPasswordRef.current !== pass) {
+      if (
+        remote.envelope.keySource === "account" &&
+        pass &&
+        accountPasswordRef.current !== null &&
+        accountPasswordRef.current !== pass
+      ) {
         setAccountVaultOutdated(true);
         setVaultSyncError("The updated vault needs your current account password before it can be edited.");
       } else {
@@ -734,7 +1192,12 @@ export function SushiWorkspace() {
         syncRefreshRequestedRef.current = true;
         return;
       }
-      if (local.keySource === "account" && pass && accountPasswordRef.current !== pass) {
+      if (
+        local.keySource === "account" &&
+        pass &&
+        accountPasswordRef.current !== null &&
+        accountPasswordRef.current !== pass
+      ) {
         setAccountVaultOutdated(true);
         setVaultSyncError("The updated vault needs your current account password before it can be edited.");
       } else {
@@ -766,11 +1229,20 @@ export function SushiWorkspace() {
 
   useEffect(() => {
     if (!localCaps || !syncEligibleRef.current) return;
-    // Catch changes that arrived while an editor was open, and listen for
-    // subsequent same-browser writes without waiting for the polling timer.
+    // Catch changes that arrived while an editor was open, and poll every 5s
+    // (plus immediate focus/visibility/storage events) so cross-device updates appear fast.
     void refreshVault();
-    return subscribeVaultChanges(() => void refreshVault());
+    return subscribeVaultChanges(() => void refreshVault(), 5_000);
   }, [localCaps, vaultReady, vaultLocked, hostModalOpen, vaultModalOpen, accountModalOpen, gatewayModalOpen, refreshVault]);
+
+  const selectActiveTab = useCallback(
+    (nextTabId: string) => {
+      setActiveTabId(nextTabId);
+      persistTabsLocally(tabsRef.current, nextTabId, true);
+      scheduleWorkspaceSync();
+    },
+    [persistTabsLocally, scheduleWorkspaceSync]
+  );
 
   const openSessionTab = useCallback(
     (
@@ -799,6 +1271,7 @@ export function SushiWorkspace() {
       }
       setWhitelistBannerError(null);
 
+      const now = Date.now();
       const tabId = `tab-${randomUUID()}`;
       const newTab: SessionTab = {
         id: tabId,
@@ -806,17 +1279,20 @@ export function SushiWorkspace() {
         protocol: proto,
         profile: resolved.profile,
         initialPath: overrideInitialPath ?? profile.initialPath,
-        createdAt: Date.now(),
+        createdAt: now,
       };
-      setTabs((prev) => [...prev, newTab]);
-      setActiveTabId(tabId);
+      tabUpdatedAtMapRef.current[tabId] = now;
       if (resumeRun) {
-        // The terminal reads this once and then reports the run back to us, so the
-        // tab reattaches to the command that is already running on the host.
+        tabRunIdsRef.current[tabId] = resumeRun.id;
         setTabResumes((prev) => ({ ...prev, [tabId]: resumeRun }));
       }
+      const nextTabs = [...tabsRef.current, newTab];
+      setTabs(nextTabs);
+      setActiveTabId(tabId);
+      persistTabsLocally(nextTabs, tabId, true);
+      scheduleWorkspaceSync();
     },
-    [enforceKeyWhitelist, sshKeys]
+    [enforceKeyWhitelist, persistTabsLocally, scheduleWorkspaceSync, sshKeys]
   );
 
   // ---------------------------------------------------------------------------
@@ -842,32 +1318,45 @@ export function SushiWorkspace() {
       setRecentHosts(
         recordRecentHost(profile, { isSaved: Boolean(savedHostId ?? hosts.some((h) => h.id === profile.id)) })
       );
+      scheduleWorkspaceSync();
       const runs = loadResumableRuns();
       setResumableRuns(runs);
-      const prompt = buildResumePrompt(runs);
+      const activeRunIds = new Set<string>(
+        Object.values(tabRunIdsRef.current).filter((v): v is string => Boolean(v))
+      );
+      const unclaimed = runs.filter((r) => !activeRunIds.has(r.id));
+      const prompt = buildResumePrompt(unclaimed);
       if (!prompt) return;
       if (dismissedResumeRef.current.has(prompt.run.id)) return;
       // The tab that is running it right now does not need to be offered it.
       if (resumePrompt && resumePrompt.run.id === prompt.run.id) return;
       setResumePrompt(prompt);
     },
-    [hosts, resumePrompt]
+    [hosts, resumePrompt, scheduleWorkspaceSync]
   );
 
   /** A tab started / finished / updated a command: keep the run in the history. */
   const handleRunUpdated = useCallback((run: ResumableRun | null, tabId: string) => {
     if (!run) {
       // The tab forgot its run (new command, reconnect…): nothing to offer for it.
+      delete tabRunIdsRef.current[tabId];
+      tabUpdatedAtMapRef.current[tabId] = Date.now();
       setTabResumes((prev) => {
         if (!(tabId in prev)) return prev;
         const next = { ...prev };
         delete next[tabId];
         return next;
       });
+      persistTabsLocally(tabsRef.current, activeTabIdRef.current);
+      scheduleWorkspaceSync();
       return;
     }
+    tabRunIdsRef.current[tabId] = run.running ? run.id : null;
+    tabUpdatedAtMapRef.current[tabId] = Date.now();
     setResumableRuns(upsertResumableRun(run));
-  }, []);
+    persistTabsLocally(tabsRef.current, activeTabIdRef.current);
+    scheduleWorkspaceSync();
+  }, [persistTabsLocally, scheduleWorkspaceSync]);
 
   /** Closes the card, drops the run from history (its log stays on the host). */
   const dismissResumePrompt = useCallback(() => {
@@ -875,16 +1364,31 @@ export function SushiWorkspace() {
       if (current) {
         dismissedResumeRef.current.add(current.run.id);
         setResumableRuns(removeResumableRun(current.run.id));
+        scheduleWorkspaceSync();
       }
       return null;
     });
-  }, []);
+  }, [scheduleWorkspaceSync]);
 
-  /** "Go back": reopen that host in a tab that attaches to the running command. */
+  /** "Go back": reopen or focus that host in a tab that attaches to the running command. */
   const resumeRunInTab = useCallback(
     (run: ResumableRun) => {
       dismissedResumeRef.current.add(run.id);
       setResumePrompt(null);
+      const runKey = hostHistoryKey(run.profile);
+      const existingTab = tabsRef.current.find(
+        (t) =>
+          t.protocol === "ssh" &&
+          hostHistoryKey(t.profile) === runKey &&
+          (!tabRunIdsRef.current[t.id] || tabRunIdsRef.current[t.id] === run.id)
+      );
+      if (existingTab) {
+        tabRunIdsRef.current[existingTab.id] = run.id;
+        tabUpdatedAtMapRef.current[existingTab.id] = Date.now();
+        setTabResumes((prev) => ({ ...prev, [existingTab.id]: run }));
+        selectActiveTab(existingTab.id);
+        return;
+      }
       // Prefer the saved vault entry (fresh credentials) over the stored snapshot.
       const saved = hosts.find(
         (h) =>
@@ -895,7 +1399,7 @@ export function SushiWorkspace() {
       );
       openSessionTab(saved ?? run.profile, "ssh", undefined, undefined, run);
     },
-    [hosts, openSessionTab]
+    [hosts, openSessionTab, selectActiveTab]
   );
 
   /** "Just open the host" from the resume card: a normal session, no resume. */
@@ -918,16 +1422,25 @@ export function SushiWorkspace() {
   /** Opens a host from the "Recently connected" list (saved entry when there is one). */
   const openRecentHost = useCallback(
     (entry: RecentHostEntry) => {
-      const saved = hosts.find((h) => h.id === entry.profileId);
+      const saved =
+        hosts.find((h) => h.id === entry.profileId) ??
+        hosts.find(
+          (h) =>
+            h.protocol === entry.protocol &&
+            h.host.toLowerCase() === entry.host.toLowerCase() &&
+            Number(h.port) === Number(entry.port) &&
+            h.username === entry.username
+        );
       openSessionTab(saved ?? entry.profile);
     },
     [hosts, openSessionTab]
   );
 
-  /** Forget one host in the recent list (does not touch the vault). */
+  /** Forget one host in the recent list (does not touch saved vault hosts). */
   const forgetRecentHost = useCallback((key: string) => {
     setRecentHosts(removeRecentHost(key));
-  }, []);
+    scheduleWorkspaceSync();
+  }, [scheduleWorkspaceSync]);
 
   /**
    * Opens the same machine as a desktop: one click from a host row, a host card,
@@ -953,7 +1466,7 @@ export function SushiWorkspace() {
           t.profile.username === companion.username
       );
       if (existing) {
-        setActiveTabId(existing.id);
+        selectActiveTab(existing.id);
         return;
       }
       openSessionTab(
@@ -990,26 +1503,29 @@ export function SushiWorkspace() {
   const closeSessionTab = (tabId: string, e?: React.MouseEvent) => {
     e?.stopPropagation();
     // Closing the tab does not stop the command: its run stays in the history so the
-    // "go back?" prompt (or the launchpad list) can reopen it.
+    // "go back?" prompt (or the launchpad list) can reopen it on any device.
+    const now = Date.now();
+    localClosedTabIdsRef.current.add(tabId);
+    delete tabRunIdsRef.current[tabId];
+    delete tabUpdatedAtMapRef.current[tabId];
+    recordClosedTab(tabId, now);
     setTabResumes((prev) => {
       if (!(tabId in prev)) return prev;
       const next = { ...prev };
       delete next[tabId];
       return next;
     });
-    setTabs((prev) => {
-      const idx = prev.findIndex((t) => t.id === tabId);
-      const next = prev.filter((t) => t.id !== tabId);
-      if (activeTabId === tabId) {
-        if (next.length === 0) {
-          setActiveTabId("launchpad");
-        } else {
-          const fallback = next[Math.max(0, idx - 1)];
-          setActiveTabId(fallback.id);
-        }
-      }
-      return next;
-    });
+    const prev = tabsRef.current;
+    const idx = prev.findIndex((t) => t.id === tabId);
+    const next = prev.filter((t) => t.id !== tabId);
+    let nextActive = activeTabIdRef.current;
+    if (activeTabIdRef.current === tabId) {
+      nextActive = next.length === 0 ? "launchpad" : next[Math.max(0, idx - 1)].id;
+      setActiveTabId(nextActive);
+    }
+    setTabs(next);
+    persistTabsLocally(next, nextActive, activeTabIdRef.current === tabId);
+    scheduleWorkspaceSync();
   };
 
   const handleSaveHostProfile = async (
@@ -1028,8 +1544,8 @@ export function SushiWorkspace() {
       if (!merge) return;
     }
     const nextHosts = change.conflict ? applyIdentityChange(hosts, profile, { moveSiblings: true }).hosts : change.hosts;
-    await persistVault(nextHosts, snippets);
-    setHosts(nextHosts);
+    const saved = await persistVault(nextHosts, snippets);
+    setHosts(saved.hosts);
     setHostModalOpen(false);
     setEditingProfile(null);
     setHostModalIntent(null);
@@ -1075,8 +1591,8 @@ export function SushiWorkspace() {
       nextHosts = hosts.filter((h) => h.id !== id);
     }
     try {
-      await persistVault(nextHosts, snippets);
-      setHosts(nextHosts);
+      const saved = await persistVault(nextHosts, snippets);
+      setHosts(saved.hosts);
     } catch {
       // persistVault displays the failure; leave the original host intact.
     }
@@ -1518,7 +2034,7 @@ export function SushiWorkspace() {
             <button
               type="button"
               onClick={() => {
-                setActiveTabId("launchpad");
+                selectActiveTab("launchpad");
                 setMobileSidebarOpen(false);
               }}
               className="flex items-center gap-2.5 text-left"
@@ -1769,7 +2285,7 @@ export function SushiWorkspace() {
           {/* Launchpad Tab */}
           <button
             type="button"
-            onClick={() => setActiveTabId("launchpad")}
+            onClick={() => selectActiveTab("launchpad")}
             className={`flex shrink-0 items-center gap-2 rounded-lg px-3 py-1.5 text-xs font-medium transition ${
               activeTabId === "launchpad"
                 ? "bg-[#171d2b] text-white shadow-xs"
@@ -1817,12 +2333,24 @@ export function SushiWorkspace() {
               >
                 <button
                   type="button"
-                  onClick={() => setActiveTabId(tab.id)}
+                  onClick={() => selectActiveTab(tab.id)}
                   aria-current={active ? "page" : undefined}
                   className="flex min-w-0 items-center gap-2 text-left"
                 >
                   <Icon className={`h-3.5 w-3.5 shrink-0 ${iconColor}`} />
                   <span className="truncate font-medium">{tab.title}</span>
+                  {tab.protocol === "ssh" &&
+                    resumableRuns.some(
+                      (r) =>
+                        r.running &&
+                        (r.id === tabRunIdsRef.current[tab.id] ||
+                          hostHistoryKey(r.profile) === hostHistoryKey(tab.profile))
+                    ) && (
+                      <span
+                        className="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-emerald-400"
+                        title="Command running on remote host"
+                      />
+                    )}
                   <span className="font-mono-code text-[10px] uppercase opacity-60">
                     {tab.protocol}
                   </span>
@@ -2674,7 +3202,7 @@ export function SushiWorkspace() {
         enforceKeyWhitelist={enforceKeyWhitelist}
         onAddWhitelistedKey={async (newKey) => {
           const nextKeys = [...sshKeys, newKey];
-          await persistVault(
+          const saved = await persistVault(
             hosts,
             snippets,
             undefined,
@@ -2682,7 +3210,7 @@ export function SushiWorkspace() {
             nextKeys,
             enforceKeyWhitelist
           );
-          setSshKeys(nextKeys);
+          setSshKeys(saved.sshKeys || nextKeys);
         }}
         onClose={() => {
           setHostModalOpen(false);
@@ -2765,7 +3293,7 @@ export function SushiWorkspace() {
           const plain = await decryptVaultEnvelope(env, pass);
           const nextKeys = plain.sshKeys || [];
           const nextEnforce = Boolean(plain.enforceKeyWhitelist);
-          await persistVault(
+          const saved = await persistVault(
             plain.hosts,
             plain.snippets,
             undefined,
@@ -2773,13 +3301,13 @@ export function SushiWorkspace() {
             nextKeys,
             nextEnforce
           );
-          setHosts(plain.hosts);
-          setSnippets(plain.snippets);
-          setSshKeys(nextKeys);
-          setEnforceKeyWhitelist(nextEnforce);
+          setHosts(saved.hosts);
+          setSnippets(saved.snippets);
+          setSshKeys(saved.sshKeys || []);
+          setEnforceKeyWhitelist(Boolean(saved.enforceKeyWhitelist));
         }}
         onUpdateKeychain={async (nextKeys, nextEnforce) => {
-          await persistVault(
+          const saved = await persistVault(
             hosts,
             snippets,
             undefined,
@@ -2787,8 +3315,8 @@ export function SushiWorkspace() {
             nextKeys,
             nextEnforce
           );
-          setSshKeys(nextKeys);
-          setEnforceKeyWhitelist(nextEnforce);
+          setSshKeys(saved.sshKeys || []);
+          setEnforceKeyWhitelist(Boolean(saved.enforceKeyWhitelist));
         }}
         onApplyTermixImport={async (
           importedHosts,
@@ -2857,7 +3385,7 @@ export function SushiWorkspace() {
             }
           }
 
-          await persistVault(
+          const saved = await persistVault(
             mergedHosts,
             mergedSnippets,
             undefined,
@@ -2865,9 +3393,9 @@ export function SushiWorkspace() {
             mergedKeys,
             enforceKeyWhitelist
           );
-          setHosts(mergedHosts);
-          setSshKeys(mergedKeys);
-          setSnippets(mergedSnippets);
+          setHosts(saved.hosts);
+          setSshKeys(saved.sshKeys || []);
+          setSnippets(saved.snippets);
           return {
             addedHosts: newHosts.length,
             skippedHosts,
@@ -2921,6 +3449,18 @@ export function SushiWorkspace() {
           setAccountVaultOutdated(false);
         }}
         onSignedOut={() => {
+          if (workspaceSyncTimerRef.current) {
+            clearTimeout(workspaceSyncTimerRef.current);
+            workspaceSyncTimerRef.current = null;
+          }
+          workspaceSyncDirtyRef.current = false;
+          tabsHydratedRef.current = false;
+          lastSyncedPlainRef.current = null;
+          localClosedTabIdsRef.current.clear();
+          tabRunIdsRef.current = {};
+          tabUpdatedAtMapRef.current = {};
+          tabsRef.current = [];
+          activeTabIdRef.current = "launchpad";
           setAccountModalOpen(false);
           setTabs([]);
           setActiveTabId("launchpad");

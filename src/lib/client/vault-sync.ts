@@ -52,7 +52,7 @@ export function sameOptionalVaultEnvelope(a: EncryptedVaultEnvelope | null, b: E
 }
 
 /** Watch local changes immediately and poll the shared store while visible. */
-export function subscribeVaultChanges(refresh: () => void): () => void {
+export function subscribeVaultChanges(refresh: () => void, pollIntervalMs = 15000): () => void {
   const onStorage = (event: StorageEvent) => {
     if (event.key === VAULT_STORAGE_KEY || event.key === null) refresh();
   };
@@ -62,7 +62,7 @@ export function subscribeVaultChanges(refresh: () => void): () => void {
   window.addEventListener("storage", onStorage);
   document.addEventListener("visibilitychange", refreshIfVisible);
   window.addEventListener("focus", refreshIfVisible);
-  const timer = window.setInterval(refreshIfVisible, 15000);
+  const timer = window.setInterval(refreshIfVisible, pollIntervalMs);
   return () => {
     window.removeEventListener("storage", onStorage);
     document.removeEventListener("visibilitychange", refreshIfVisible);

@@ -257,19 +257,20 @@ export function SshTerminalSession({
   /** Selected text open in the translate panel (null = panel closed). */
   const [translateSource, setTranslateSource] = useState<string | null>(null);
   /**
-   * No-timeout mode for serverless commands: prompts wait forever, and if the
-   * internet drops the command keeps running on the host (output logged to /tmp,
-   * keystrokes still accepted through its FIFO). Persisted per browser.
+   * No-timeout mode for serverless commands (enabled by default so commands
+   * stay running across disconnects, reloads, and device switches): prompts wait
+   * forever, output is logged to /tmp, and keystrokes reach the FIFO.
    */
   const [noTimeout, setNoTimeout] = useState<boolean>(() => {
     try {
-      return localStorage.getItem("sushi.noTimeout") === "1";
+      return localStorage.getItem("sushi.noTimeout") !== "0";
     } catch {
-      return false;
+      return true;
     }
   });
-  const noTimeoutRef = useRef(false);
+  const noTimeoutRef = useRef(true);
   noTimeoutRef.current = noTimeout;
+  const userCancelledExecRef = useRef(false);
   /** A no-timeout command still running on the host after our request died. */
   const [detachedRun, setDetachedRun] = useState<(ExecKeyChannel & { runLog?: string }) | null>(
     null
@@ -608,11 +609,6 @@ export function SshTerminalSession({
                 if (typeof evt.runLog === "string" && evt.runLog) {
                   runLogPath = evt.runLog;
                   updateRunRef.current({ runLog: evt.runLog });
-                  if (noTimeoutRef.current) {
-                    options.stream?.(
-                      `\r\n\x1b[90mno-timeout run: output is also logged to ${evt.runLog}, and keys still reach it via ${evt.keyChannel ?? "the key channel"} — the command survives a disconnect.\x1b[0m\r\n`
-                    );
-                  }
                 }
                 if (typeof evt.fingerprint === "string") setFingerprint(evt.fingerprint);
               } else if (evt.type === "data" && typeof evt.data === "string") {
@@ -624,8 +620,8 @@ export function SshTerminalSession({
               } else if (evt.type === "meta") {
                 gotMeta = true;
                 exitCode = Number(evt.exitCode ?? 0);
-                // The command ended inside this tab: nothing left to resume.
-                if (!noTimeoutRef.current) updateRunRef.current({ running: false, exitCode });
+                // The command ended inside this tab (with or without noTimeout): mark finished.
+                updateRunRef.current({ running: false, exitCode });
                 if (typeof evt.cwd === "string" && evt.cwd) {
                   cwdRef.current = evt.cwd;
                   setCurrentCwd(evt.cwd);
@@ -648,6 +644,9 @@ export function SshTerminalSession({
           if (!gotMeta && noTimeoutRef.current && keyPath) {
             // The request ended without an exit marker: in no-timeout mode the
             // command is (by design) still running on the host.
+            options.stream?.(
+              `\r\n\x1b[90m↳ command continues running on the host${runLogPath ? ` (log: ${runLogPath})` : ""} — keys still reach it via ${keyPath}.\x1b[0m\r\n`
+            );
             setDetachedRun({ path: keyPath, credentials, runLog: runLogPath || undefined });
             updateRunRef.current({
               running: true,
@@ -669,7 +668,20 @@ export function SshTerminalSession({
           }
           if ((err as Error)?.name === "AbortError") {
             exitCode = 130;
-            options.stream?.("^C");
+            if (userCancelledExecRef.current) {
+              userCancelledExecRef.current = false;
+              options.stream?.("^C");
+              updateRunRef.current({ running: false, exitCode: 130 });
+            } else if (noTimeoutRef.current && gotReady && keyPath) {
+              // Tab closed or unmounted: leave the detached run marked running so
+              // reloading or switching devices can reattach to it.
+              updateRunRef.current({
+                running: true,
+                detached: true,
+                keyChannel: keyPath,
+                ...(runLogPath ? { runLog: runLogPath } : {}),
+              });
+            }
           } else {
             const message =
               err instanceof Error ? err.message : "SSH stream interrupted.";
@@ -772,6 +784,7 @@ export function SshTerminalSession({
   const stopRunningCommand = useCallback(() => {
     const stdin = stdinRef.current;
     if (stdin?.canSendInput && stdin.sendSignal("INT")) return;
+    userCancelledExecRef.current = true;
     // In no-timeout mode the server never kills the remote command on abort, so
     // deliver the Ctrl+C through the keystroke FIFO explicitly.
     if (noTimeoutRef.current && keyChannelRef.current) {
@@ -779,6 +792,10 @@ export function SshTerminalSession({
     }
     abortExecRef.current?.abort();
   }, [gatewaySettings]);
+  const stopRunningCommandRef = useRef(stopRunningCommand);
+  useEffect(() => {
+    stopRunningCommandRef.current = stopRunningCommand;
+  }, [stopRunningCommand]);
 
   /** Sends keys to a no-timeout command that outlived its request (after a drop). */
   const sendDetachedKeys = useCallback(
@@ -842,8 +859,9 @@ export function SshTerminalSession({
   useEffect(() => {
     onConnectedRef.current = onConnected;
   }, [onConnected]);
-  /** A run handed over by the workspace, consumed once the session connects. */
+  /** A run handed over by the workspace, consumed once the session connects (or live while idle). */
   const resumeRunRef = useRef<ResumableRun | null>(resumeRun ?? null);
+  const lastAttachedRunIdRef = useRef<string | null>(null);
   useEffect(() => {
     resumeRunRef.current = resumeRun ?? null;
   }, [resumeRun]);
@@ -1450,6 +1468,29 @@ export function SshTerminalSession({
     submitWhileBusyRef.current = submitWhileBusy;
   }, [submitWhileBusy]);
 
+  const runServerlessCommandRef = useRef(runServerlessCommand);
+  useEffect(() => {
+    runServerlessCommandRef.current = runServerlessCommand;
+  }, [runServerlessCommand]);
+
+  /**
+   * Live cross-device attach: if another device starts a detached command on this
+   * host while this session is already connected and idle, attach to its run log
+   * and FIFO automatically so both devices see and control the same live command.
+   */
+  useEffect(() => {
+    if (!resumeRun || !resumeRun.running) return;
+    if (lastAttachedRunIdRef.current === resumeRun.id) return;
+    if (currentRunRef.current?.id === resumeRun.id) return;
+    const term = termRef.current;
+    if (!term || connectingRef.current || execBusyRef.current || reattached) return;
+    if (modeRef.current !== "serverless") return;
+    lastAttachedRunIdRef.current = resumeRun.id;
+    resumeRunRef.current = null;
+    term.write("\r\n");
+    void attachToRun(term, resumeRun);
+  }, [attachToRun, reattached, resumeRun, running]);
+
 
   // Initialize xterm and transport session
   useEffect(() => {
@@ -1568,9 +1609,9 @@ export function SshTerminalSession({
                 break;
               }
               if (prompt.action === "enter-root") {
-                void runServerlessCommand("sudo su", { password });
+                void runServerlessCommandRef.current("sudo su", { password });
               } else {
-                void runServerlessCommand(prompt.command, { password });
+                void runServerlessCommandRef.current(prompt.command, { password });
               }
             } else if (ch === "\x7f" || ch === "\b") {
               if (secretBufferRef.current.length > 0) {
@@ -1596,13 +1637,8 @@ export function SshTerminalSession({
         if (execBusyRef.current) {
           const stdin = stdinRef.current;
           if (data === "\x03") {
-            if (stdin?.canSendInput) {
-              // Real SIGINT so the remote command cleans up after itself.
-              stdin.sendSignal("INT");
-            } else {
-              busyInputRef.current = "";
-              abortExecRef.current?.abort();
-            }
+            busyInputRef.current = "";
+            stopRunningCommandRef.current();
             return;
           }
           if (stdin?.canSendInput) {
@@ -1718,7 +1754,7 @@ export function SshTerminalSession({
             historyIdxRef.current = -1;
             if (cmd.trim()) {
               historyRef.current.push(cmd);
-              void runServerlessCommand(cmd);
+              void runServerlessCommandRef.current(cmd);
             } else {
               writePrompt(term);
             }
@@ -1815,6 +1851,7 @@ export function SshTerminalSession({
             // "Go back": show the command again and take over the run if the host is
             // still executing it. The prompt is written once the attach finishes.
             const run = resumeRunRef.current;
+            lastAttachedRunIdRef.current = run.id;
             resumeRunRef.current = null;
             await attachToRun(term, run);
           } else {

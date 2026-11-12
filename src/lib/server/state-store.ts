@@ -1,12 +1,18 @@
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
+import {
+  compareAndSwapTursoAuthWithVaultGuard,
+  compareAndSwapTursoRecord,
+  readTursoRecord,
+  type TursoStoreConfig,
+} from "./turso-store";
 
 /** Small durable store for the single admin account and encrypted vault.
- * Vercel's filesystem is ephemeral; Redis or Firestore is required there.
+ * Vercel's filesystem is ephemeral; Turso, Redis, or Firestore is required there.
  */
 type RecordName = "auth" | "vault";
-export type StoreKind = "disk" | "redis" | "firestore" | "none";
+export type StoreKind = "disk" | "redis" | "turso" | "firestore" | "none";
 
 function storagePrefix(): string {
   const fallback = [
@@ -83,6 +89,69 @@ function redisConfig(): RedisConfig | null {
   return null;
 }
 
+function tursoConfig(): TursoStoreConfig | null {
+  const candidates = [
+    [process.env.SUSHI_TURSO_DATABASE_URL, process.env.SUSHI_TURSO_AUTH_TOKEN],
+    [process.env.TURSO_DATABASE_URL, process.env.TURSO_AUTH_TOKEN],
+  ];
+  for (const [rawUrl, rawToken] of candidates) {
+    const url = rawUrl?.trim() || "";
+    const token = rawToken?.trim() || "";
+    if (!url && !token) continue;
+    if (!url || !token) {
+      throw new Error("Shared storage is misconfigured: both the Turso database URL and auth token are required.");
+    }
+    const isLibsql = /^libsql:\/\//i.test(url);
+    const isWss = /^wss:\/\//i.test(url);
+    const normalizedInput = isLibsql || isWss ? url.replace(/^(libsql|wss):\/\//i, "https://") : url;
+    let parsed: URL;
+    try {
+      parsed = new URL(normalizedInput);
+    } catch {
+      throw new Error("Shared storage has an invalid Turso database URL.");
+    }
+    if (parsed.username || parsed.password || parsed.hash) {
+      throw new Error("Shared storage requires a Turso database URL without embedded credentials.");
+    }
+    let tlsParam: boolean | undefined;
+    for (const [key, val] of parsed.searchParams.entries()) {
+      if (key === "tls" && (val === "0" || val === "1")) {
+        tlsParam = val === "1";
+      } else {
+        throw new Error("Shared storage requires a Turso database URL without embedded credentials or unsupported query options.");
+      }
+    }
+    const isLoopback = ["localhost", "127.0.0.1", "[::1]"].includes(parsed.hostname);
+    let scheme: "http:" | "https:";
+    if (isLibsql) {
+      if (tlsParam === false) {
+        if (!isLoopback || !parsed.port) {
+          throw new Error("Shared storage requires TLS for non-local Turso database URLs.");
+        }
+        scheme = "http:";
+      } else {
+        scheme = "https:";
+      }
+    } else if (parsed.protocol === "https:") {
+      if (tlsParam === false) {
+        throw new Error("Shared storage has an invalid TLS setting on an https:// Turso database URL.");
+      }
+      scheme = "https:";
+    } else if (parsed.protocol === "http:" && isLoopback && tlsParam !== true) {
+      scheme = "http:";
+    } else {
+      throw new Error("Shared storage requires a libsql:// or https:// Turso database URL.");
+    }
+    const basePath = parsed.pathname.replace(/\/+$/, "");
+    return {
+      httpUrl: `${scheme}//${parsed.host}${basePath}`,
+      token,
+      prefix: storagePrefix(),
+    };
+  }
+  return null;
+}
+
 export function getStateStoreKind(): StoreKind {
   const selected = process.env.SUSHI_STORAGE_BACKEND?.trim().toLowerCase() || "auto";
   if (selected === "firestore") {
@@ -93,15 +162,25 @@ export function getStateStoreKind(): StoreKind {
     if (!redisConfig()) throw new Error("Shared storage is misconfigured: Redis REST URL and token are required.");
     return "redis";
   }
+  if (selected === "turso") {
+    if (!tursoConfig()) throw new Error("Shared storage is misconfigured: Turso database URL and auth token are required.");
+    return "turso";
+  }
   if (selected === "disk") {
-    if (process.env.VERCEL === "1") throw new Error("Disk storage is ephemeral on Vercel; configure Firestore or Redis instead.");
+    if (process.env.VERCEL === "1") throw new Error("Disk storage is ephemeral on Vercel; configure Turso, Firestore, or Redis instead.");
     return "disk";
   }
-  if (selected !== "auto") throw new Error("SUSHI_STORAGE_BACKEND must be auto, disk, redis, or firestore.");
+  if (selected !== "auto") throw new Error("SUSHI_STORAGE_BACKEND must be auto, disk, redis, turso, or firestore.");
   if (process.env.SUSHI_FIRESTORE_PROJECT_ID?.trim() || process.env.SUSHI_FIRESTORE_DATABASE_ID?.trim() || process.env.SUSHI_FIRESTORE_CREDENTIALS_JSON?.trim()) {
     throw new Error("Select SUSHI_STORAGE_BACKEND=firestore to enable the configured Firestore database.");
   }
-  if (redisConfig()) return "redis";
+  const hasRedis = Boolean(redisConfig());
+  const hasTurso = Boolean(tursoConfig());
+  if (hasRedis && hasTurso) {
+    throw new Error("Multiple shared storage backends (Redis and Turso) are configured; set SUSHI_STORAGE_BACKEND=redis or SUSHI_STORAGE_BACKEND=turso.");
+  }
+  if (hasRedis) return "redis";
+  if (hasTurso) return "turso";
   return process.env.VERCEL === "1" ? "none" : "disk";
 }
 
@@ -173,6 +252,7 @@ async function readDiskFile(name: RecordName): Promise<string | null> {
 export async function readStateRecord(name: RecordName): Promise<string | null> {
   const kind = getStateStoreKind();
   if (kind === "firestore") return (await firestoreStore()).read(name);
+  if (kind === "turso") return readTursoRecord(tursoConfig()!, name);
   if (kind === "redis") {
     const config = redisConfig()!;
     const result = await command(config, ["GET", redisKey(config, name)]);
@@ -230,6 +310,9 @@ export async function compareAndSwapAuthWithVaultGuard(
   if (kind === "firestore") {
     return (await firestoreStore()).compareAndSwapAuthWithVaultGuard(expectedAuth, nextAuth, expectedVault);
   }
+  if (kind === "turso") {
+    return compareAndSwapTursoAuthWithVaultGuard(tursoConfig()!, expectedAuth, nextAuth, expectedVault);
+  }
   if (kind === "redis") {
     const config = redisConfig()!;
     const script = `
@@ -268,6 +351,7 @@ export async function compareAndSwapStateRecord(
 ): Promise<boolean> {
   const kind = getStateStoreKind();
   if (kind === "firestore") return (await firestoreStore()).compareAndSwap(name, expected, next);
+  if (kind === "turso") return compareAndSwapTursoRecord(tursoConfig()!, name, expected, next);
   if (kind === "redis") {
     const config = redisConfig()!;
     const script = `

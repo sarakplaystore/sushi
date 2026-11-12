@@ -115,7 +115,7 @@ export async function POST(req: NextRequest) {
   } catch (err) {
     const message = err instanceof Error ? err.message : "Failed to initialize admin account.";
     const status = /already initialized/i.test(message) ? 409
-      : /storage|firestore|persistent account data/i.test(message) ? 503 : 400;
+      : /storage|firestore|turso|persistent account data/i.test(message) ? 503 : 400;
     return NextResponse.json({ ok: false, error: message }, { status, headers: cors });
   }
 }

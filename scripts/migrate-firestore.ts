@@ -13,9 +13,9 @@ async function main(): Promise<void> {
   const source = sourceArg?.slice("--source=".length);
   const apply = args.includes("--apply");
   const stopped = args.includes("--writers-stopped");
-  if ((source !== "disk" && source !== "redis") ||
+  if ((source !== "disk" && source !== "redis" && source !== "turso") ||
       args.some((arg) => arg !== sourceArg && arg !== "--apply" && arg !== "--writers-stopped")) {
-    throw new Error("Usage: npm run migrate:firestore -- --source=disk|redis [--apply --writers-stopped]");
+    throw new Error("Usage: npm run migrate:firestore -- --source=disk|redis|turso [--apply --writers-stopped]");
   }
   if (apply && !stopped) {
     throw new Error("Stop every Sushi writer first, then pass --writers-stopped with --apply. Read the migration instructions before proceeding.");

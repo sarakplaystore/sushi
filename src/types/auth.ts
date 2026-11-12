@@ -38,7 +38,7 @@ export interface AuthStatusResponse {
   canBootstrapOnDisk: boolean;
   canBootstrapInteractive: boolean;
   mode: "vps" | "vercel" | "gateway";
-  storage?: "disk" | "redis" | "firestore" | "none";
+  storage?: "disk" | "redis" | "turso" | "firestore" | "none";
   username?: string;
   passkeyCount: number;
   authorizedKeyCount: number;

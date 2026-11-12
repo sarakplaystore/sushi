@@ -2,7 +2,6 @@
 
 import { useMemo, useRef } from "react";
 import {
-  ArrowLeftRight,
   FolderKanban,
   Monitor,
   Pencil,
@@ -18,7 +17,6 @@ import {
   filterUnifiedHosts,
   filterUnifiedHostsByProtocol,
   groupUnifiedHosts,
-  hostAccessUrl,
   openableProtocols,
 } from "@/lib/client/unified-hosts";
 
@@ -322,17 +320,6 @@ function HostRow({
             </button>
           )}
         </div>
-        <a
-          href={hostAccessUrl(entry)}
-          onClick={(event) => event.stopPropagation()}
-          className={`rounded p-1 text-slate-400 hover:bg-white/10 hover:text-white ${
-            roomy ? "max-[380px]:hidden" : ""
-          }`}
-          aria-label={`Copy the one URL for ${entry.name}`}
-          title="One URL for this machine (opens it in Sushi)"
-        >
-          <ArrowLeftRight className="h-3 w-3" />
-        </a>
         <button
           type="button"
           onClick={(event) => {

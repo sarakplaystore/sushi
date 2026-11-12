@@ -76,7 +76,6 @@ import {
 } from "@/lib/client/vault-sync";
 import {
   type UnifiedHost,
-  hostAccessUrl,
   mergeHosts,
   openableProtocols,
   parseHostDeepLink,
@@ -2447,13 +2446,6 @@ export function SushiWorkspace() {
                             </div>
 
                             <div className="flex items-center gap-1">
-                              <a
-                                href={hostAccessUrl(h)}
-                                className="rounded-lg p-1.5 text-slate-400 hover:bg-white/8 hover:text-white"
-                                title={`One URL: ${hostAccessUrl(h)}`}
-                              >
-                                <ArrowLeftRight className="h-3.5 w-3.5" />
-                              </a>
                               <button
                                 type="button"
                                 onClick={() => {

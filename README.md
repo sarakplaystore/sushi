@@ -10,9 +10,9 @@ It is designed around a **Hybrid VPS + Serverless Architecture**:
 
 ## Features
 
-- **Username, Password, WebAuthn Passkey & Whitelisted Private Key Protection**
-  - One interactive admin account shared across devices: persistent disk on a VPS, or configured Firestore/Redis storage on a VPS or Vercel. Optional `SUSHI_AUTH_USERNAME` / `SUSHI_AUTH_PASSWORD` / `SUSHI_AUTHORIZED_KEYS` environment overrides remain available.
-  - **Whitelisted Private Key Login & SSH Keychain**: Sign in to Sushi using an `ed25519` / `rsa` / `ecdsa` private key verified via cryptographic challenge signature against whitelisted public keys, and optionally enforce a strict **Vault SSH Key Whitelist** across all SSH/SFTP server connections
+- **Username, Password & WebAuthn Passkey Protection**
+  - One interactive admin account shared across devices: persistent disk on a VPS, or configured Turso/Firestore/Redis storage on a VPS or Vercel. Optional `SUSHI_AUTH_USERNAME` / `SUSHI_AUTH_PASSWORD` environment overrides remain available.
+  - **SSH Keychain & Vault Key Whitelist**: Store encrypted `ed25519` / `rsa` / `ecdsa` SSH keys in the Vault Keychain, and optionally enforce a strict **Vault SSH Key Whitelist** across all SSH/SFTP server connections
   - **FIDO2 / WebAuthn Passkeys** (`@simplewebauthn/server` & `@simplewebauthn/browser`) for Touch ID, Face ID, Windows Hello, and YubiKey
 - **SSH Client Import & Export**
   - Import OpenSSH config, Termius-compatible CSV, PuTTY registry exports, MobaXterm, WinSCP, Tabby, Xshell, SecureCRT sessions, mRemoteNG connections, SSHBorg and 7 Term backups, and simple SSH-host JSON, plus Termix (`Termix-SSH/Termix`) JSON and SQLite databases
@@ -71,14 +71,14 @@ data until migration is complete.
 
 New shared vaults use the **account password** in the browser for PBKDF2 and
 AES-256-GCM. It is kept in memory while unlocked, not stored as plaintext in
-browser storage. A reload, Passkey or private-key sign-in may still ask for the
+browser storage. A reload or Passkey sign-in may still ask for the
 account password to decrypt the vault. Use a long, unique password: anyone with
 an encrypted vault copy can attempt to guess it offline. Sushi sends the account
 password to its server for normal sign-in and password verification, so this is
 **not zero-knowledge encryption**. The server serves the browser code, and a
 compromised server could capture the password. Use HTTPS and trust both your
 server and storage provider. The shared store contains the account password
-hash/session signing secret, public login keys/passkeys, and encrypted vault—not
+hash/session signing secret, public passkeys, and encrypted vault—not
 plaintext saved SSH passwords or private keys.
 
 **Existing vaults:** After enabling shared storage, open the **original browser
@@ -93,7 +93,7 @@ If the browser has a different local vault from the shared vault, Sushi asks you
 to download its encrypted copy before opening the shared one; it does not merge
 conflicting vaults automatically. Restoring a backup replaces the current vault.
 
-**Changing the account password:** Use **Account & Login Keys → Password** while
+**Changing the account password:** Use **Account & Passkeys → Password** while
 the vault is unlocked. Sushi first keeps the vault decryptable with the old
 password, changes the account, then re-encrypts the vault with the new password.
 Keep the old password until the final step succeeds. If the update is interrupted,

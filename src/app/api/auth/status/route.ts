@@ -1,10 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
 import {
   getEffectiveAuthConfig,
-  mergeAuthorizedKeys,
   mergePasskeySummaries,
   verifyAdminSession,
-  verifySignedAuthorizedKeyCertificates,
   verifySignedPasskeyCertificates,
 } from "@/lib/server/auth";
 import { getCorsHeaders } from "@/lib/server/security";
@@ -23,7 +21,6 @@ export async function OPTIONS(req: NextRequest) {
 async function buildStatusResponse(
   req: NextRequest,
   signedCertificates?: string[],
-  signedKeyCertificates?: string[],
   adminProfileCert?: string
 ) {
   const cors = getCorsHeaders(req.headers.get("origin"));
@@ -43,15 +40,6 @@ async function buildStatusResponse(
     : [];
   const mergedPasskeys = mergePasskeySummaries(cfg.serverPasskeys, certPasskeys);
 
-  const certAuthKeys = cfg.initialized
-    ? verifySignedAuthorizedKeyCertificates(
-        signedKeyCertificates,
-        cfg.username,
-        cfg.authSecret
-      )
-    : [];
-  const mergedAuthKeys = mergeAuthorizedKeys(cfg.authorizedKeys, certAuthKeys);
-
   return NextResponse.json(
     {
       ok: true,
@@ -64,7 +52,6 @@ async function buildStatusResponse(
       storage: getStateStoreKind(),
       username: authCheck.ok ? authCheck.username || cfg.username : undefined,
       passkeyCount: mergedPasskeys.length,
-      authorizedKeyCount: mergedAuthKeys.length,
     },
     { headers: cors }
   );
@@ -82,22 +69,19 @@ export async function GET(req: NextRequest) {
 
 export async function POST(req: NextRequest) {
   let certs: string[] | undefined;
-  let keyCerts: string[] | undefined;
   let adminProfileCert: string | undefined;
   try {
     const body = (await req.json()) as {
       signedCertificates?: string[];
-      signedKeyCertificates?: string[];
       adminProfileCert?: string;
     };
     certs = body?.signedCertificates;
-    keyCerts = body?.signedKeyCertificates;
     adminProfileCert = body?.adminProfileCert;
   } catch {
     // ignore empty body
   }
   try {
-    return await buildStatusResponse(req, certs, keyCerts, adminProfileCert);
+    return await buildStatusResponse(req, certs, adminProfileCert);
   } catch (error) {
     return NextResponse.json({ ok: false, error: error instanceof Error ? error.message : "Account storage is unavailable." }, {
       status: 503, headers: getCorsHeaders(req.headers.get("origin")),

@@ -221,7 +221,6 @@ function HostRow({
   const protocols = openableProtocols(entry);
   const primary = entry.primary;
   const machineHasManyProfiles = Object.values(entry.protocols).filter(Boolean).length > 1;
-  const order = (protocol: ProtocolType) => protocols.indexOf(protocol);
 
   return (
     <div className="group flex min-w-0 items-center gap-1 rounded-xl px-2 py-1.5 transition hover:bg-white/[0.06]">
@@ -286,12 +285,12 @@ function HostRow({
             <Monitor className="h-3 w-3" />
           </button>
         )}
-        <div
-          className={`${order("sftp") >= 0 || order("ssh") >= 0 ? "flex" : "hidden"} items-center gap-0.5 ${
-            roomy ? "" : "hidden group-hover:flex group-focus-within:flex [@media(hover:none)]:flex"
-          }`}
-        >
-          {protocols.includes("sftp") && (
+        {protocols.includes("sftp") && (
+          <div
+            className={`items-center gap-0.5 ${
+              roomy ? "flex" : "hidden group-hover:flex group-focus-within:flex [@media(hover:none)]:flex"
+            }`}
+          >
             <button
               type="button"
               onClick={(event) => {
@@ -304,22 +303,8 @@ function HostRow({
             >
               <FolderKanban className="h-3 w-3" />
             </button>
-          )}
-          {protocols.includes("ssh") && (
-            <button
-              type="button"
-              onClick={(event) => {
-                event.stopPropagation();
-                onOpen(entry, "ssh");
-              }}
-              className="rounded p-1 text-slate-400 hover:bg-white/10 hover:text-emerald-300"
-              aria-label={`Open ${entry.name} as SSH`}
-              title="Open as SSH"
-            >
-              <Terminal className="h-3 w-3" />
-            </button>
-          )}
-        </div>
+          </div>
+        )}
         <button
           type="button"
           onClick={(event) => {

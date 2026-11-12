@@ -66,11 +66,12 @@ assert.match(list, /groupUnifiedHosts\(filtered\)/, "grouped like the vault fold
 assert.ok(!list.includes("ArrowLeftRight"), "row does not render the ArrowLeftRight URL icon button");
 assert.match(list, /onOpen\(entry, "rdp"\)/, "RDP action per row");
 assert.match(list, /onOpen\(entry, "sftp"\)/, "SFTP action per row");
-assert.match(list, /onOpen\(entry, "ssh"\)/, "SSH action per row");
+assert.ok(!list.includes('onOpen(entry, "ssh")'), "redundant SSH icon button is removed from host row");
 assert.match(list, /machineHasManyProfiles/, "deleting a merged row explains it removes every protocol");
-// Phones have no hover: the roomy variant must not hide the protocol buttons behind it.
-const sshButton = list.slice(list.indexOf('onOpen(entry, "ssh")') - 400, list.indexOf('onOpen(entry, "ssh")'));
-assert.ok(!sshButton.includes("group-hover"), "SSH action is always visible on the phone layout");
+// Phones have no hover: the roomy variant must not hide the SFTP button behind it.
+const sftpButton = list.slice(list.indexOf('onOpen(entry, "sftp")') - 120, list.indexOf('onOpen(entry, "sftp")'));
+assert.ok(!sftpButton.includes("group-hover"), "SFTP button itself does not gate on group-hover when roomy is active");
+assert.match(list, /roomy \? "flex" : "hidden group-hover:flex/, "roomy variant keeps secondary protocol button visible on phones");
 // Row content shrinks instead of pushing actions off-screen.
 assert.match(list, /min-w-0 flex-1 truncate text-xs font-medium/, "long host names truncate");
 

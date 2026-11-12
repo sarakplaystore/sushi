@@ -467,3 +467,155 @@ export function tailPreview(text: string, maxLines = 6, maxLineLength = 160): st
       line.length > maxLineLength ? `${line.slice(0, maxLineLength - 1)}…` : line
     );
 }
+
+export interface StopBackgroundProcessesResult {
+  stoppedCount: number;
+  cleanedChannels: number;
+  processes: string[];
+}
+
+export const STOP_BG_MARKER = "SUSHI_BG_STOPPED";
+
+/**
+ * Builds a safe POSIX shell script that stops all background SSH processes on
+ * the remote host without touching system boot services (`systemd`, `sshd`,
+ * `dockerd`, `nginx`, etc.) or live interactive login prompts:
+ *
+ * 1. Protects its own PID, `$PPID`, and full ancestor chain up to PID 1.
+ * 2. Removes all `/tmp/.sushi-keys-*` FIFOs and stops all Sushi detached /
+ *    no-timeout command wrappers (`SUSHI_META`, `/tmp/.sushi-run-*`).
+ * 3. Stops background jobs spawned from SSH sessions (`SSH_CONNECTION` /
+ *    `SSH_CLIENT` in `/proc/<pid>/environ`, plus POSIX `ps` fallback for
+ *    non-root orphaned processes) and recursively terminates their child /
+ *    `sudo` descendant trees (`SIGTERM` followed by `SIGKILL`).
+ */
+export function buildStopBackgroundProcessesScript(): string {
+  return [
+    "__uid=$(id -u 2>/dev/null || echo -1)",
+    '__prot=" $$ $PPID "',
+    "__cur=$PPID",
+    "__step=0",
+    'while [ -n "$__cur" ] && [ "$__cur" -gt 1 ] 2>/dev/null && [ "$__step" -lt 16 ]; do',
+    '  __next=$(ps -o ppid= -p "$__cur" 2>/dev/null | tr -d " ")',
+    '  if [ -z "$__next" ] || [ "$__next" = "$__cur" ]; then break; fi',
+    '  __prot="${__prot}${__next} "',
+    "  __cur=$__next",
+    "  __step=$((__step + 1))",
+    "done",
+    "__fifos=0",
+    "for __f in /tmp/.sushi-keys-*; do",
+    '  if [ -p "$__f" ]; then',
+    '    rm -f "$__f" 2>/dev/null && __fifos=$((__fifos + 1))',
+    "  fi",
+    "done",
+    '__targets=""',
+    "__add_target() {",
+    '  case " $__prot $__targets " in',
+    '    *" $1 "*) ;;',
+    '    *) __targets="${__targets} $1" ;;',
+    "  esac",
+    "}",
+    "for __p in $(ps -eo pid=,ppid=,args= 2>/dev/null | awk -v self=\"$$\" '$1 != self && $2 != self && (/\\/tmp\\/\\.sushi-keys-|\\/tmp\\/\\.sushi-run-|SUSHI_META/) {print $1}'); do",
+    '  [ -n "$__p" ] && __add_target "$__p"',
+    "done",
+    "if [ -d /proc ]; then",
+    "  for __d in /proc/[0-9]*; do",
+    "    __p=${__d#/proc/}",
+    '    case " $__prot " in *" $__p "*) continue ;; esac',
+    '    [ ! -r "$__d/status" ] && continue',
+    "    __ppid=$(awk '/^PPid:/ {print $2; exit}' \"$__d/status\" 2>/dev/null)",
+    '    [ "$__ppid" = "$$" ] && continue',
+    '    if [ "$__uid" != "0" ]; then',
+    "      __owner=$(awk '/^Uid:/ {print $2; exit}' \"$__d/status\" 2>/dev/null)",
+    '      [ -n "$__owner" ] && [ "$__owner" != "$__uid" ] && continue',
+    "    fi",
+    "    if tr '\\0' '\\n' < \"$__d/environ\" 2>/dev/null | grep -qE '^(SSH_CONNECTION|SSH_CLIENT|SUSHI_BG)='; then",
+    '      __comm=$(cat "$__d/comm" 2>/dev/null)',
+    '      case "$__comm" in',
+    '        sshd|sshd-session|systemd|"(sd-pam)"|ssh-agent|gpg-agent|dbus-daemon) continue ;;',
+    "      esac",
+      '      __stat=$(ps -o stat= -p "$__p" 2>/dev/null | tr -d " ")',
+      '      case "$__stat" in',
+      "        *+*) continue ;;",
+      "      esac",
+      '      __pcomm=""',
+    '      [ -n "$__ppid" ] && [ -r "/proc/$__ppid/comm" ] && __pcomm=$(cat "/proc/$__ppid/comm" 2>/dev/null)',
+    '      case "$__pcomm" in',
+    "        sshd|sshd-session)",
+    '          case "$__comm" in',
+    "            bash|sh|dash|zsh|fish|ash|ksh|tcsh|csh|-*)",
+    "              if ! tr '\\0' ' ' < \"$__d/cmdline\" 2>/dev/null | grep -qE 'SUSHI_META|/tmp/\\.sushi-'; then",
+    "                continue",
+    "              fi",
+    "              ;;",
+    "          esac",
+    "          ;;",
+    "      esac",
+    '      __add_target "$__p"',
+    "    fi",
+    "  done",
+    'elif [ "$__uid" != "0" ] && [ "$__uid" != "-1" ]; then',
+    "  for __p in $(ps -u \"$__uid\" -o pid=,ppid=,comm= 2>/dev/null | awk -v self=\"$$\" '$1 != self && $2 == 1 && $3 !~ /^(sshd|systemd|launchd|cfprefsd|UserEventAgent|ssh-agent|gpg-agent)$/ {print $1}'); do",
+    '    [ -n "$__p" ] && __add_target "$__p"',
+    "  done",
+    "fi",
+    'if [ -n "$__targets" ]; then',
+    "  __ps_tree=$(ps -eo pid=,ppid= 2>/dev/null)",
+    "  __added=1",
+    "  __iter=0",
+    '  while [ "$__added" -eq 1 ] && [ "$__iter" -lt 12 ]; do',
+    "    __added=0",
+    "    __iter=$((__iter + 1))",
+    "    for __child in $(printf '%s\\n' \"$__ps_tree\" | awk -v self=\"$$\" -v t=\" $__targets \" '$1 != self && $2 != self && index(t, \" \" $2 \" \") > 0 {print $1}'); do",
+    '      case " $__prot $__targets " in',
+    '        *" $__child "*) ;;',
+    '        *) __targets="${__targets} $__child"; __added=1 ;;',
+    "      esac",
+    "    done",
+    "  done",
+    "fi",
+    "__count=0",
+    '__names=""',
+    "for __p in $__targets; do",
+    '  if kill -0 "$__p" 2>/dev/null || sudo -n kill -0 "$__p" 2>/dev/null; then',
+    "    __cn=$(ps -o comm= -p \"$__p\" 2>/dev/null | tr -d ' ,;' | head -n 1)",
+    '    if [ -n "$__cn" ]; then',
+    '      case ",$__names," in',
+    '        *,"$__cn",*) ;;',
+    '        *) __names=${__names:+$__names,}$__cn ;;',
+    "      esac",
+    "    fi",
+    '    kill -TERM "$__p" 2>/dev/null || sudo -n kill -TERM "$__p" 2>/dev/null || true',
+    "    __count=$((__count + 1))",
+    "  fi",
+    "done",
+    'if [ "$__count" -gt 0 ]; then',
+    "  sleep 0.25 2>/dev/null || sleep 1",
+    "  for __p in $__targets; do",
+    '    if kill -0 "$__p" 2>/dev/null || sudo -n kill -0 "$__p" 2>/dev/null; then',
+    '      kill -KILL "$__p" 2>/dev/null || sudo -n kill -KILL "$__p" 2>/dev/null || true',
+    "    fi",
+    "  done",
+    "fi",
+    `printf '${STOP_BG_MARKER} count=%s fifos=%s names=%s\\n' "$__count" "$__fifos" "$__names"`,
+  ].join("\n");
+}
+
+export function parseStopBackgroundProcessesOutput(
+  output: string
+): StopBackgroundProcessesResult {
+  const match = output.match(
+    new RegExp(`${STOP_BG_MARKER}\\s+count=(\\d+)\\s+fifos=(\\d+)\\s+names=([^\\r\\n]*)`)
+  );
+  if (!match) {
+    return { stoppedCount: 0, cleanedChannels: 0, processes: [] };
+  }
+  const stoppedCount = Number(match[1]) || 0;
+  const cleanedChannels = Number(match[2]) || 0;
+  const processes = (match[3] || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .slice(0, 8);
+  return { stoppedCount, cleanedChannels, processes };
+}

@@ -15,7 +15,6 @@ import {
   PanelLeftClose,
   PanelLeftOpen,
   ArrowRight,
-  Lock,
   Sparkles,
   Server,
   Cloud,
@@ -34,6 +33,7 @@ import {
   CirclePlay,
   RotateCcw,
   Infinity as InfinityIcon,
+  Square,
 } from "lucide-react";
 import type { AuthStatusResponse } from "@/types/auth";
 import type {
@@ -48,7 +48,6 @@ import {
   DEFAULT_SNIPPETS,
   type EncryptedVaultEnvelope,
   type VaultPlaintext,
-  clearDeviceKey,
   decryptVaultEnvelope,
   encryptVaultData,
   loadLocalEnvelope,
@@ -67,7 +66,6 @@ import {
 import {
   cacheSyncedVault,
   cacheSyncedVaultIfUnchanged,
-  clearLocalSyncMetadata,
   fetchRemoteVault,
   getLocalSyncMetadata,
   sameVaultEnvelope,
@@ -111,6 +109,7 @@ import {
   buildRdpCompanionProfile,
   rdpCompanionTitle,
 } from "@/lib/client/rdp-companion";
+import { stopHostBackgroundProcesses } from "@/lib/client/run-status";
 import {
   type PersistedSessionTab,
   type RecentHostEntry,
@@ -163,23 +162,22 @@ export function SushiWorkspace() {
     gatewayToken: "",
   });
 
-  // Vault state
+  // Vault state (automatically unlocked for authenticated sessions)
   const [vaultReady, setVaultReady] = useState(false);
-  const [vaultLocked, setVaultLocked] = useState(false);
   const [vaultMode, setVaultMode] = useState<"device" | "passphrase">("device");
   const [activePassphrase, setActivePassphrase] = useState<string | null>(null);
-  const [vaultKeySource, setVaultKeySource] = useState<"account" | "independent">("independent");
+  const [vaultKeySource, setVaultKeySource] = useState<"account" | "independent" | "session">("independent");
   const [accountVaultOutdated, setAccountVaultOutdated] = useState(false);
-  const [needsInitialPassword, setNeedsInitialPassword] = useState(false);
-  const [localVaultToMigrate, setLocalVaultToMigrate] = useState<{ plain: VaultPlaintext; envelope: EncryptedVaultEnvelope } | null>(null);
+  const [authMigrationNotice, setAuthMigrationNotice] = useState<string | null>(null);
   const [vaultBootError, setVaultBootError] = useState<string | null>(null);
   const [vaultRecoveryEnvelope, setVaultRecoveryEnvelope] = useState<EncryptedVaultEnvelope | null>(null);
   const [vaultSyncError, setVaultSyncError] = useState<string | null>(null);
   const [vaultConflict, setVaultConflict] = useState<EncryptedVaultEnvelope | null>(null);
   const [conflictBackupDownloaded, setConflictBackupDownloaded] = useState(false);
   const syncRevisionRef = useRef<string | null>(null);
-  // The password is held only while this workspace is unlocked, never stored.
+  // Keys held only in memory while authenticated, never written to localStorage.
   const accountPasswordRef = useRef<string | null>(null);
+  const sessionVaultKeyRef = useRef<string | null>(null);
   const bootSequenceRef = useRef(0);
   const bootLocalEnvelopeRef = useRef<EncryptedVaultEnvelope | null>(null);
   const emptyPasswordRotationRef = useRef(false);
@@ -187,8 +185,6 @@ export function SushiWorkspace() {
   const syncRefreshInFlightRef = useRef(false);
   const syncRefreshRequestedRef = useRef(false);
   const syncEligibleRef = useRef(false);
-  const [unlockInput, setUnlockInput] = useState("");
-  const [unlockError, setUnlockError] = useState<string | null>(null);
   const [pendingEnvelope, setPendingEnvelope] =
     useState<EncryptedVaultEnvelope | null>(null);
   const pendingEnvelopeRef = useRef<EncryptedVaultEnvelope | null>(null);
@@ -196,6 +192,11 @@ export function SushiWorkspace() {
     pendingEnvelopeRef.current = envelope;
     setPendingEnvelope(envelope);
   }, []);
+  const [stoppingAllBg, setStoppingAllBg] = useState(false);
+  const [bgStopNotice, setBgStopNotice] = useState<{
+    tone: "success" | "error";
+    text: string;
+  } | null>(null);
 
   const [hosts, setHosts] = useState<HostProfile[]>([]);
   const [snippets, setSnippets] = useState<CommandSnippet[]>(DEFAULT_SNIPPETS);
@@ -248,8 +249,6 @@ export function SushiWorkspace() {
   // or unmount running terminal/SFTP/RDP sessions.
   const vaultReadyRef = useRef(false);
   vaultReadyRef.current = vaultReady;
-  const vaultLockedRef = useRef(false);
-  vaultLockedRef.current = vaultLocked;
   const hostsRef = useRef<HostProfile[]>([]);
   hostsRef.current = hosts;
   const snippetsRef = useRef<CommandSnippet[]>(DEFAULT_SNIPPETS);
@@ -286,8 +285,8 @@ export function SushiWorkspace() {
     useState<VaultModalTab>("security");
   const [vaultModalFocusBackup, setVaultModalFocusBackup] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  // Do not replace in-memory data while a form is being edited or a vault is locked.
-  syncEligibleRef.current = vaultReady && !vaultLocked && !hostModalOpen &&
+  // Do not replace in-memory data while a form is being edited.
+  syncEligibleRef.current = vaultReady && !hostModalOpen &&
     !vaultModalOpen && !accountModalOpen && !gatewayModalOpen;
 
   const searchInputRef = useRef<HTMLInputElement | null>(null);
@@ -704,32 +703,24 @@ export function SushiWorkspace() {
     }
   }, [buildCurrentWorkspaceState, buildPersistedTabs]);
 
-  const createAccountVault = useCallback(async (
+  const createSessionVault = useCallback(async (
     plain: VaultPlaintext,
-    password: string,
+    sessionKey: string,
     gw: GatewaySettings,
     baseRevision: string | null,
     shared: boolean,
     expectedLocal?: EncryptedVaultEnvelope | null
   ) => {
     const localBase = expectedLocal === undefined ? loadLocalEnvelope() : expectedLocal;
-    // A remembered password can become stale after another device changes the
-    // account password. Never publish a newly encrypted account vault unless
-    // the server has confirmed this is still the current password.
-    await verifyAccountPassword(gw, password);
-    const envelope = await encryptVaultData(plain, password);
-    envelope.keySource = "account";
+    const envelope = await encryptVaultData(plain, sessionKey);
+    envelope.keySource = "session";
     if (shared) {
       if (!sameOptionalVaultEnvelope(loadLocalEnvelope(), localBase)) {
         throw new Error("The browser vault changed in another tab. Reload it before enabling sync; no data was replaced.");
       }
       const revision = await saveRemoteVault(gw, envelope, baseRevision);
       syncRevisionRef.current = revision;
-      if (!await cacheSyncedVaultIfUnchanged(localBase, envelope, revision)) {
-        const latest = loadLocalEnvelope();
-        if (!sameOptionalVaultEnvelope(latest, localBase) && !sameOptionalVaultEnvelope(latest, envelope)) {
-          throw new Error("A shared snapshot was saved, but this browser's vault changed during sync. No local data was replaced; reload and keep a backup of the newer local copy.");
-        }
+      if (!(await cacheSyncedVaultIfUnchanged(localBase, envelope, revision)) && !cacheSyncedVault(envelope, revision)) {
         setVaultSyncError("Vault saved to shared storage, but this browser could not cache it locally.");
       } else {
         bootLocalEnvelopeRef.current = envelope;
@@ -740,9 +731,9 @@ export function SushiWorkspace() {
     }
     updatePendingEnvelope(envelope);
     setVaultMode("passphrase");
-    setVaultKeySource("account");
+    setVaultKeySource("session");
     setAccountVaultOutdated(false);
-    setActivePassphrase(password);
+    setActivePassphrase(sessionKey);
     return envelope;
   }, [updatePendingEnvelope]);
 
@@ -758,8 +749,6 @@ export function SushiWorkspace() {
     setVaultBootError(null);
     setVaultRecoveryEnvelope(null);
     setVaultConflict(null);
-    setNeedsInitialPassword(false);
-    setLocalVaultToMigrate(null);
     setVaultSyncError(null);
     const gw = loadGatewaySettings();
     setGatewaySettings(gw);
@@ -786,6 +775,10 @@ export function SushiWorkspace() {
       const remote = caps.serverVault ? await fetchRemoteVault(gw) : null;
       if (sequence !== bootSequenceRef.current) return;
       syncRevisionRef.current = remote?.revision ?? null;
+      const sessionVaultKey = remote?.vaultKey ?? sessionVaultKeyRef.current;
+      if (remote?.vaultKey) {
+        sessionVaultKeyRef.current = remote.vaultKey;
+      }
 
       let envelope = remote?.envelope ?? local;
       const isRemote = Boolean(remote?.envelope);
@@ -806,90 +799,118 @@ export function SushiWorkspace() {
         const empty: VaultPlaintext = { version: 1, hosts: [], snippets: DEFAULT_SNIPPETS, sshKeys: [], enforceKeyWhitelist: false };
         applyPlainVault(empty);
         updatePendingEnvelope(null);
-        setUnlockError(null);
         setAccountVaultOutdated(false);
-        if (caps.serverVault) {
-          if (!currentPassword) {
-            setVaultMode("passphrase");
-            setVaultKeySource("account");
-            setNeedsInitialPassword(true);
-            setVaultLocked(true);
-          } else {
-            // Do not publish an empty vault just because a new device signed
-            // in. The original browser may still need to upload its vault.
-            setVaultMode("passphrase");
-            setVaultKeySource("account");
-            setActivePassphrase(currentPassword);
-            setVaultLocked(false);
-          }
+        if (caps.serverVault && sessionVaultKey) {
+          setVaultMode("passphrase");
+          setVaultKeySource("session");
+          setActivePassphrase(sessionVaultKey);
+        } else if (caps.serverVault && currentPassword) {
+          setVaultMode("passphrase");
+          setVaultKeySource("account");
+          setActivePassphrase(currentPassword);
         } else {
           setVaultMode("device");
           setVaultKeySource("independent");
           setActivePassphrase(null);
-          setVaultLocked(false);
         }
+        setAuthMigrationNotice(null);
         setVaultReady(true);
         return;
       }
 
       updatePendingEnvelope(envelope);
-      setVaultMode(envelope.mode);
-      setVaultKeySource(envelope.keySource === "account" ? "account" : "independent");
       setAccountVaultOutdated(false);
-      setUnlockError(null);
-      if (envelope.mode === "passphrase" && !currentPassword) {
-        setActivePassphrase(null);
-        setVaultLocked(true);
-        setVaultReady(true);
-        return;
-      }
 
-      let plain: VaultPlaintext;
-      try {
-        plain = await decryptVaultEnvelope(envelope, envelope.mode === "passphrase" ? currentPassword : null);
-      } catch {
-        setActivePassphrase(null);
-        setVaultLocked(true);
-        setUnlockError(envelope.mode === "device"
-          ? "This device-key vault can only be opened on its original browser. Open it there and enable account-password sync."
-          : envelope.keySource === "account" && currentPassword
-            ? "The vault password may have changed. Enter the account password or the previous password used for this vault."
-            : "Enter the existing vault passphrase to unlock your saved data.");
-        setVaultReady(true);
-        return;
-      }
-      if (sequence !== bootSequenceRef.current) return;
-      if (caps.serverVault && !remote?.envelope && local) {
-        // Storage was enabled after this browser had already saved hosts. Do
-        // not create an empty shared vault or upload a device-only key.
-        if (!currentPassword) {
-          setLocalVaultToMigrate({ plain, envelope: local });
-          setNeedsInitialPassword(true);
-          setVaultMode("passphrase");
-          setVaultKeySource("account");
-          setActivePassphrase(null);
-          setVaultLocked(true);
-          setVaultReady(true);
-          return;
+      let plain: VaultPlaintext | null = null;
+      let usedKey: string | null = null;
+      if (envelope.mode === "device") {
+        try {
+          plain = await decryptVaultEnvelope(envelope, null);
+        } catch {
+          throw new Error("This device-key vault can only be opened on its original browser.");
         }
-        envelope = await createAccountVault(plain, currentPassword, gw, null, true, local);
-      } else if (caps.serverVault && currentPassword && envelope.keySource === undefined) {
-        envelope = await createAccountVault(plain, currentPassword, gw, remote?.revision ?? null, true, local);
       } else {
-        if (isRemote && remote?.revision) {
-          const cached = await cacheSyncedVaultIfUnchanged(local, envelope, remote.revision);
-          if (sequence !== bootSequenceRef.current) return;
-          if (!cached) {
-            setVaultSyncError("The shared vault opened, but this browser could not cache it locally.");
-          } else {
-            bootLocalEnvelopeRef.current = envelope;
+        const candidates = [sessionVaultKey, currentPassword].filter(
+          (v, idx, arr): v is string => Boolean(v) && arr.indexOf(v) === idx
+        );
+        for (const candidate of candidates) {
+          try {
+            plain = await decryptVaultEnvelope(envelope, candidate);
+            usedKey = candidate;
+            break;
+          } catch {
+            // Try next candidate
           }
         }
-        setActivePassphrase(envelope.mode === "passphrase" ? currentPassword : null);
+        if (!plain) {
+          // Pre-upgrade password-encrypted vault with no password in memory yet:
+          // ask for a one-time password sign-in on AuthGateScreen to auto-migrate.
+          await fetch("/api/auth/logout", {
+            method: "POST",
+            headers: getAuthHeaders(gw),
+          }).catch(() => {});
+          setStoredSessionToken(null);
+          accountPasswordRef.current = null;
+          setAuthMigrationNotice(
+            currentPassword
+              ? "The saved vault uses a previous password. Sign in with that password or restore a backup."
+              : "Sign in with your account password once to finish upgrading your encrypted vault for automatic unlock."
+          );
+          setAuthStatus((prev) => (prev ? { ...prev, authenticated: false } : null));
+          return;
+        }
+      }
+
+      if (sequence !== bootSequenceRef.current) return;
+      if (caps.serverVault && sessionVaultKey) {
+        if (!remote?.envelope && local) {
+          envelope = await createSessionVault(plain, sessionVaultKey, gw, null, true, local);
+        } else if (envelope.keySource !== "session" || usedKey !== sessionVaultKey) {
+          envelope = await createSessionVault(
+            plain,
+            sessionVaultKey,
+            gw,
+            remote?.revision ?? null,
+            true,
+            local
+          );
+        } else {
+          if (isRemote && remote?.revision) {
+            const cached =
+              (await cacheSyncedVaultIfUnchanged(local, envelope, remote.revision)) ||
+              cacheSyncedVault(envelope, remote.revision);
+            if (sequence !== bootSequenceRef.current) return;
+            if (!cached) {
+              setVaultSyncError("The shared vault opened, but this browser could not cache it locally.");
+            } else {
+              bootLocalEnvelopeRef.current = envelope;
+            }
+          }
+          setVaultMode("passphrase");
+          setVaultKeySource("session");
+          setActivePassphrase(sessionVaultKey);
+        }
+      } else {
+        if (isRemote && remote?.revision) {
+          const cached =
+            (await cacheSyncedVaultIfUnchanged(local, envelope, remote.revision)) ||
+            cacheSyncedVault(envelope, remote.revision);
+          if (sequence !== bootSequenceRef.current) return;
+          if (cached) bootLocalEnvelopeRef.current = envelope;
+        }
+        setVaultMode(envelope.mode);
+        setVaultKeySource(
+          envelope.keySource === "session"
+            ? "session"
+            : envelope.keySource === "account"
+              ? "account"
+              : "independent"
+        );
+        setActivePassphrase(envelope.mode === "passphrase" ? usedKey : null);
       }
       if (sequence !== bootSequenceRef.current) return;
+      setAuthMigrationNotice(null);
       applyPlainVault(plain);
-      setVaultLocked(false);
       setVaultReady(true);
     } catch (error) {
       if (sequence !== bootSequenceRef.current) return;
@@ -897,7 +918,7 @@ export function SushiWorkspace() {
       try { setVaultRecoveryEnvelope(loadLocalEnvelope()); } catch { /* preserve the unreadable local data */ }
       setVaultReady(false);
     }
-  }, [applyPlainVault, createAccountVault, updatePendingEnvelope]);
+  }, [applyPlainVault, createSessionVault, updatePendingEnvelope]);
 
   // Boot auth check + workspace. A stale async boot never wins over a later one.
   useEffect(() => {
@@ -916,14 +937,17 @@ export function SushiWorkspace() {
       explicitMode?: "device" | "passphrase",
       nextSshKeys?: WhitelistedSshKey[],
       nextEnforceWhitelist?: boolean,
-      explicitSource?: "account" | "independent",
+      explicitSource?: "account" | "independent" | "session",
       options: { background?: boolean } = {}
     ): Promise<VaultPlaintext> => {
       const targetMode = explicitMode ?? vaultMode;
       const source = targetMode === "passphrase" ? explicitSource ?? vaultKeySource : "independent";
-      const passToUse = targetMode === "passphrase" ? passphraseOverride ?? activePassphrase : null;
-      if (targetMode === "passphrase" && !passToUse) throw new Error("Unlock the vault before saving.");
-      if (accountVaultOutdated && explicitSource !== "account") {
+      const passToUse =
+        targetMode === "passphrase"
+          ? passphraseOverride ?? activePassphrase ?? sessionVaultKeyRef.current
+          : null;
+      if (targetMode === "passphrase" && !passToUse) throw new Error("Vault encryption key is unavailable. Reload and try again.");
+      if (accountVaultOutdated && explicitSource !== "account" && explicitSource !== "session") {
         throw new Error("Update the vault to the current account password before making changes.");
       }
 
@@ -950,7 +974,8 @@ export function SushiWorkspace() {
           envelope.keySource = source;
 
           if (localCaps?.serverVault) {
-            let revision: string | null = null;
+            let revision: string | null;
+            revision = null;
             for (let attempt = 0; attempt < 3; attempt++) {
               try {
                 revision = await saveRemoteVault(gatewaySettings, envelope, baseRevision);
@@ -959,10 +984,13 @@ export function SushiWorkspace() {
                 const msg = saveErr instanceof Error ? saveErr.message : "";
                 if (attempt < 2 && /changed on another device/i.test(msg)) {
                   const latestRemote = await fetchRemoteVault(gatewaySettings);
+                  if (latestRemote.vaultKey) {
+                    sessionVaultKeyRef.current = latestRemote.vaultKey;
+                  }
                   if (latestRemote.envelope && latestRemote.revision) {
                     const decryptPass =
                       latestRemote.envelope.mode === "passphrase"
-                        ? activePassphrase ?? passToUse
+                        ? latestRemote.vaultKey ?? activePassphrase ?? passToUse
                         : null;
                     const remotePlain = await decryptVaultEnvelope(
                       latestRemote.envelope,
@@ -1050,8 +1078,8 @@ export function SushiWorkspace() {
       workspaceSyncTimerRef.current = null;
     }
     if (!workspaceSyncDirtyRef.current) return;
-    if (!vaultReadyRef.current || vaultLockedRef.current || accountVaultOutdated) return;
-    if (vaultMode === "passphrase" && !activePassphrase) return;
+    if (!vaultReadyRef.current || accountVaultOutdated) return;
+    if (vaultMode === "passphrase" && !activePassphrase && !sessionVaultKeyRef.current) return;
     // Never create an initial empty shared vault before the user has saved or
     // migrated their vault on a brand-new account.
     if (
@@ -1116,6 +1144,7 @@ export function SushiWorkspace() {
     try {
       const localBase = loadLocalEnvelope();
       const remote = await fetchRemoteVault(gatewaySettings);
+      if (remote.vaultKey) sessionVaultKeyRef.current = remote.vaultKey;
       if (!syncEligibleRef.current || version !== vaultMutationVersionRef.current || baseRevision !== syncRevisionRef.current) return;
       if (!remote.envelope || !remote.revision) {
         // A brand-new account has no shared snapshot until its first save.
@@ -1123,35 +1152,34 @@ export function SushiWorkspace() {
         throw new Error("The shared vault is missing. No local data was changed; check your storage before saving.");
       }
       if (remote.revision === baseRevision) return;
-      const pass = remote.envelope.mode === "passphrase" ? activePassphrase : null;
+      const pass =
+        remote.envelope.mode === "passphrase"
+          ? remote.vaultKey ?? activePassphrase ?? sessionVaultKeyRef.current
+          : null;
       let plain: VaultPlaintext;
       try {
         plain = await decryptVaultEnvelope(remote.envelope, pass);
       } catch {
-        throw new Error("The shared vault changed and needs a different password or device key. Reload the latest vault to unlock it; local data was not replaced.");
+        throw new Error("The shared vault changed and needs a different key. Reload the latest vault; local data was not replaced.");
       }
       if (!syncEligibleRef.current || version !== vaultMutationVersionRef.current || baseRevision !== syncRevisionRef.current) return;
       const cached =
         (await cacheSyncedVaultIfUnchanged(localBase, remote.envelope, remote.revision)) ||
         cacheSyncedVault(remote.envelope, remote.revision);
       if (!syncEligibleRef.current || version !== vaultMutationVersionRef.current || baseRevision !== syncRevisionRef.current) return;
-      if (
-        remote.envelope.keySource === "account" &&
-        pass &&
-        accountPasswordRef.current !== null &&
-        accountPasswordRef.current !== pass
-      ) {
-        setAccountVaultOutdated(true);
-        setVaultSyncError("The updated vault needs your current account password before it can be edited.");
-      } else {
-        setAccountVaultOutdated(false);
-        setVaultSyncError(cached ? null : "The shared vault updated, but this browser's local copy changed or could not be cached.");
-      }
+      setAccountVaultOutdated(false);
+      setVaultSyncError(cached ? null : "The shared vault updated, but this browser's local copy changed or could not be cached.");
       syncRevisionRef.current = remote.revision;
       if (cached) bootLocalEnvelopeRef.current = remote.envelope;
       updatePendingEnvelope(remote.envelope);
       setVaultMode(remote.envelope.mode);
-      setVaultKeySource(remote.envelope.keySource === "account" ? "account" : "independent");
+      setVaultKeySource(
+        remote.envelope.keySource === "session"
+          ? "session"
+          : remote.envelope.keySource === "account"
+            ? "account"
+            : "independent"
+      );
       setActivePassphrase(pass);
       applyPlainVault(plain);
     } catch (error) {
@@ -1204,7 +1232,13 @@ export function SushiWorkspace() {
       bootLocalEnvelopeRef.current = local;
       updatePendingEnvelope(local);
       setVaultMode(local.mode);
-      setVaultKeySource(local.keySource === "account" ? "account" : "independent");
+      setVaultKeySource(
+        local.keySource === "session"
+          ? "session"
+          : local.keySource === "account"
+            ? "account"
+            : "independent"
+      );
       setActivePassphrase(pass);
       applyPlainVault(plain);
     } catch (error) {
@@ -1230,7 +1264,7 @@ export function SushiWorkspace() {
     // (plus immediate focus/visibility/storage events) so cross-device updates appear fast.
     void refreshVault();
     return subscribeVaultChanges(() => void refreshVault(), 5_000);
-  }, [localCaps, vaultReady, vaultLocked, hostModalOpen, vaultModalOpen, accountModalOpen, gatewayModalOpen, refreshVault]);
+  }, [localCaps, vaultReady, hostModalOpen, vaultModalOpen, accountModalOpen, gatewayModalOpen, refreshVault]);
 
   const selectActiveTab = useCallback(
     (nextTabId: string) => {
@@ -1617,107 +1651,195 @@ export function SushiWorkspace() {
     setQuickConnectInput("");
   };
 
-  const handleUnlockVault = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setUnlockError(null);
-    const input = unlockInput;
-    try {
-      if (needsInitialPassword) {
-        if (localVaultToMigrate) {
-          await createAccountVault(localVaultToMigrate.plain, input, gatewaySettings, syncRevisionRef.current, true, localVaultToMigrate.envelope);
-          applyPlainVault(localVaultToMigrate.plain);
-          setLocalVaultToMigrate(null);
-        } else {
-          // Verify the account password without creating an empty shared vault.
-          await verifyAccountPassword(gatewaySettings, input);
-          setVaultMode("passphrase");
-          setVaultKeySource("account");
-          setActivePassphrase(input);
+  const resolveSshProfileForHost = useCallback(
+    (source: HostProfile): HostProfile | null => {
+      const saved =
+        hosts.find(
+          (h) =>
+            (h.protocol === "ssh" || h.protocol === "sftp") &&
+            h.host.toLowerCase() === source.host.toLowerCase() &&
+            Number(h.port) === Number(source.port) &&
+            h.username === source.username
+        ) ??
+        hosts.find(
+          (h) =>
+            (h.protocol === "ssh" || h.protocol === "sftp") &&
+            h.host.toLowerCase() === source.host.toLowerCase() &&
+            h.username === source.username
+        ) ??
+        source;
+      const resolved = resolveProfileWithKeychain(
+        { ...saved, protocol: "ssh", port: Number(saved.port) || 22 },
+        sshKeys,
+        enforceKeyWhitelist
+      );
+      return resolved.ok ? resolved.profile : null;
+    },
+    [enforceKeyWhitelist, hosts, sshKeys]
+  );
+
+  const clearHostResumableRuns = useCallback(
+    (target: Pick<HostProfile, "host" | "port" | "username">) => {
+      const current = loadResumableRuns();
+      let next = current;
+      for (const run of current) {
+        if (
+          run.profile.host.toLowerCase() === target.host.toLowerCase() &&
+          Number(run.profile.port || 22) === Number(target.port || 22) &&
+          run.profile.username === target.username
+        ) {
+          dismissedResumeRef.current.add(run.id);
+          next = removeResumableRun(run.id);
         }
-        accountPasswordRef.current = input;
-        setNeedsInitialPassword(false);
-        setUnlockInput("");
-        setVaultLocked(false);
+      }
+      setResumableRuns(next);
+      setResumePrompt((prev) => {
+        if (
+          prev &&
+          prev.run.profile.host.toLowerCase() === target.host.toLowerCase() &&
+          Number(prev.run.profile.port || 22) === Number(target.port || 22) &&
+          prev.run.profile.username === target.username
+        ) {
+          return null;
+        }
+        return prev;
+      });
+      scheduleWorkspaceSync();
+    },
+    [scheduleWorkspaceSync]
+  );
+
+  const stopBackgroundForRunHost = useCallback(
+    async (run: ResumableRun) => {
+      if (stoppingAllBg) return;
+      const resolved = resolveSshProfileForHost(run.profile);
+      if (!resolved) {
+        setBgStopNotice({
+          tone: "error",
+          text: `Could not resolve SSH credentials for ${run.profile.username}@${run.profile.host}.`,
+        });
         return;
       }
-      if (!pendingEnvelope) return;
-      const plain = await decryptVaultEnvelope(pendingEnvelope, pendingEnvelope.mode === "passphrase" ? input : null);
-      let active = pendingEnvelope.mode === "passphrase" ? input : null;
-      let rewrapped = false;
-      const loginPassword = accountPasswordRef.current;
-      if (localCaps?.serverVault && !syncRevisionRef.current) {
-        // This is a local vault being migrated after shared storage was added.
-        // A separate old vault passphrase is not necessarily the account password.
-        let migrationPassword = loginPassword;
-        if (!migrationPassword && pendingEnvelope.keySource === "account" && active) {
-          try { await verifyAccountPassword(gatewaySettings, active); migrationPassword = active; }
-          catch { /* Ask for the current account password instead. */ }
+      setStoppingAllBg(true);
+      setBgStopNotice(null);
+      try {
+        const res = await stopHostBackgroundProcesses(resolved, gatewaySettings);
+        if (!res.ok) {
+          throw new Error(
+            res.error || `Failed to stop background SSH processes on ${resolved.host}.`
+          );
         }
-        const localBase = bootLocalEnvelopeRef.current ?? pendingEnvelope;
-        if (!migrationPassword) {
-          setLocalVaultToMigrate({ plain, envelope: localBase });
-          setNeedsInitialPassword(true);
-          setVaultMode("passphrase");
-          setVaultKeySource("account");
-          setUnlockInput("");
-          return;
-        }
-        await createAccountVault(plain, migrationPassword, gatewaySettings, null, true, localBase);
-        accountPasswordRef.current = migrationPassword;
-        applyPlainVault(plain);
-        setActivePassphrase(migrationPassword);
-        setUnlockInput("");
-        setVaultLocked(false);
-        return;
+        clearHostResumableRuns(resolved);
+        setBgStopNotice({
+          tone: "success",
+          text:
+            res.stoppedCount > 0
+              ? `Stopped ${res.stoppedCount} background process${res.stoppedCount === 1 ? "" : "es"} on ${resolved.username}@${resolved.host}.`
+              : `No active background SSH processes found on ${resolved.username}@${resolved.host}.`,
+        });
+      } catch (err) {
+        setBgStopNotice({
+          tone: "error",
+          text:
+            err instanceof Error
+              ? err.message
+              : `Failed to stop background SSH processes on ${resolved.host}.`,
+        });
+      } finally {
+        setStoppingAllBg(false);
       }
-      if (pendingEnvelope.keySource === "account" && active) {
-        // First check the password that actually decrypted the current vault.
-        // Another device may have changed the account since this tab signed in.
-        let inputIsCurrent = false;
-        try {
-          await verifyAccountPassword(gatewaySettings, active);
-          inputIsCurrent = true;
-        } catch { /* It may be a previous vault password, or storage may be offline. */ }
-        if (inputIsCurrent) {
-          accountPasswordRef.current = active;
-          setAccountVaultOutdated(false);
-        } else {
-          let rememberedIsCurrent = false;
-          if (loginPassword && loginPassword !== active) {
-            try {
-              await verifyAccountPassword(gatewaySettings, loginPassword);
-              rememberedIsCurrent = true;
-            } catch { /* Do not publish an unverified password. */ }
-          }
-          if (rememberedIsCurrent && loginPassword) {
-            await createAccountVault(plain, loginPassword, gatewaySettings, syncRevisionRef.current, Boolean(localCaps?.serverVault), bootLocalEnvelopeRef.current);
-            active = loginPassword;
-            rewrapped = true;
-          } else {
-            setAccountVaultOutdated(true);
-            setVaultSyncError("This vault unlocked with a previous or unverified account password. Update it to the current account password in Vault Security before editing.");
-          }
-        }
-      } else if (localCaps?.serverVault && loginPassword && pendingEnvelope.keySource === undefined) {
-        await createAccountVault(plain, loginPassword, gatewaySettings, syncRevisionRef.current, true, bootLocalEnvelopeRef.current);
-        active = loginPassword;
-        rewrapped = true;
+    },
+    [clearHostResumableRuns, gatewaySettings, resolveSshProfileForHost, stoppingAllBg]
+  );
+
+  const handleStopAllBackgroundSsh = useCallback(async () => {
+    if (stoppingAllBg) return;
+    const candidateMap = new Map<string, HostProfile>();
+    const pushCandidate = (p: HostProfile) => {
+      if (p.protocol !== "ssh" && p.protocol !== "sftp") return;
+      const resolved = resolveSshProfileForHost(p);
+      if (!resolved) return;
+      const key = `${resolved.username}@${resolved.host.toLowerCase()}:${resolved.port || 22}`;
+      if (!candidateMap.has(key)) {
+        candidateMap.set(key, resolved);
       }
-      if (!rewrapped && localCaps?.serverVault && syncRevisionRef.current) {
-        if (!await cacheSyncedVaultIfUnchanged(bootLocalEnvelopeRef.current, pendingEnvelope, syncRevisionRef.current)) {
-          setVaultSyncError("The shared vault opened, but this browser could not cache it locally.");
-        } else {
-          bootLocalEnvelopeRef.current = pendingEnvelope;
-        }
-      }
-      applyPlainVault(plain);
-      setActivePassphrase(active);
-      setUnlockInput("");
-      setVaultLocked(false);
-    } catch (error) {
-      setUnlockError(error instanceof Error ? error.message : "Could not unlock the vault.");
+    };
+
+    for (const run of resumableRunCandidates(resumableRuns)) {
+      pushCandidate(run.profile);
     }
-  };
+    for (const tab of tabsRef.current) {
+      if (tab.protocol === "ssh") pushCandidate(tab.profile);
+    }
+    if (candidateMap.size === 0) {
+      for (const h of hosts) {
+        if (h.protocol === "ssh" || h.protocol === "sftp") pushCandidate(h);
+      }
+    }
+
+    const targets = Array.from(candidateMap.values());
+    if (targets.length === 0) {
+      setBgStopNotice({
+        tone: "error",
+        text: "No SSH hosts with credentials are configured yet.",
+      });
+      return;
+    }
+
+    setStoppingAllBg(true);
+    setBgStopNotice(null);
+    let totalSignaled = 0;
+    let succeededHosts = 0;
+    const errors: string[] = [];
+
+    await Promise.all(
+      targets.map(async (target) => {
+        try {
+          const res = await stopHostBackgroundProcesses(target, gatewaySettings);
+          if (!res.ok) {
+            throw new Error(res.error || "Failed");
+          }
+          totalSignaled += res.stoppedCount;
+          succeededHosts += 1;
+          clearHostResumableRuns(target);
+        } catch (err) {
+          errors.push(
+            `${target.username}@${target.host}: ${
+              err instanceof Error ? err.message : "Failed"
+            }`
+          );
+        }
+      })
+    );
+
+    setStoppingAllBg(false);
+    if (errors.length > 0 && succeededHosts === 0) {
+      setBgStopNotice({
+        tone: "error",
+        text: `Failed to stop background SSH processes (${errors[0]}).`,
+      });
+    } else if (errors.length > 0) {
+      setBgStopNotice({
+        tone: "error",
+        text: `Stopped ${totalSignaled} process${totalSignaled === 1 ? "" : "es"} across ${succeededHosts}/${targets.length} host(s); failed on ${errors[0]}.`,
+      });
+    } else {
+      setBgStopNotice({
+        tone: "success",
+        text:
+          totalSignaled > 0
+            ? `Stopped ${totalSignaled} background SSH process${totalSignaled === 1 ? "" : "es"} across ${succeededHosts} host${succeededHosts === 1 ? "" : "s"}.`
+            : `Checked ${succeededHosts} SSH host${succeededHosts === 1 ? "" : "s"} — no running background SSH processes found.`,
+      });
+    }
+  }, [
+    clearHostResumableRuns,
+    gatewaySettings,
+    hosts,
+     resolveSshProfileForHost,
+    resumableRuns,
+    stoppingAllBg,
+  ]);
 
   const effectiveWsSsh = Boolean(
     remoteCaps ? remoteCaps.websocketSsh : localCaps?.websocketSsh
@@ -1762,15 +1884,15 @@ export function SushiWorkspace() {
   const unifiedHostsRef = useRef<UnifiedHost[]>([]);
 
   /**
-   * Runs once the vault is unlocked (that is when host names exist): a deep link is
+   * Runs once the vault is ready (that is when host names exist): a deep link is
    * applied, otherwise the URL is left alone.
    */
   useEffect(() => {
     if (deepLinkHandledRef.current) return;
-    if (!vaultReady || vaultLocked) return;
+    if (!vaultReady) return;
     if (!hosts.length) return;
     applyDeepLink(unifiedHostsRef.current);
-  }, [applyDeepLink, hosts.length, unifiedHostsRef, vaultLocked, vaultReady]);
+  }, [applyDeepLink, hosts.length, unifiedHostsRef, vaultReady]);
 
   /** `openRdpCompanion` is declared below; the merged-host action calls it lazily. */
   const openRdpCompanionRef = useRef<(profile: HostProfile) => void>(() => {});
@@ -1845,9 +1967,11 @@ export function SushiWorkspace() {
     return (
       <AuthGateScreen
         authStatus={authStatus}
+        initialNotice={authMigrationNotice}
         onAuthenticated={async (loggedInUser, accountPassword) => {
           setAuthUsername(loggedInUser);
           accountPasswordRef.current = accountPassword || null;
+          setAuthMigrationNotice(null);
           const status = await refreshAuthStatus();
           if (status?.authenticated) await bootAuthenticatedWorkspace(accountPassword);
         }}
@@ -1913,93 +2037,6 @@ export function SushiWorkspace() {
       <div role="status" className="flex h-full w-full items-center justify-center gap-2 bg-[#090b10] text-sm text-slate-400">
         <Loader2 className="h-5 w-5 animate-spin text-[#ff6b57]" />
         Loading vault…
-      </div>
-    );
-  }
-
-  // Vault Unlock Gate
-  if (vaultLocked) {
-    return (
-      <div className="flex h-full w-full overflow-y-auto bg-[#090b10] p-4">
-        <form
-          onSubmit={handleUnlockVault}
-          className="m-auto w-full max-w-md shrink-0 space-y-5 rounded-2xl border border-white/10 bg-[#0f131b] p-5 shadow-2xl sm:p-7"
-        >
-          <div className="flex items-center gap-3">
-            <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-[#ff6b57]/15 text-[#ff6b57]">
-              <Lock className="h-5 w-5" />
-            </div>
-            <div>
-              <h1 className="text-base font-semibold text-white">
-                Unlock Sushi Vault
-              </h1>
-              <p className="text-xs text-slate-400">
-                {needsInitialPassword ? (localVaultToMigrate ? "Enter your account password to sync this browser's saved connections" : "Enter your account password to set up encrypted sync") : vaultMode === "passphrase" ? (vaultKeySource === "account" ? "Unlock with your account password" : "Unlock with your existing master passphrase") : "Device-key vault could not be opened"}
-              </p>
-            </div>
-          </div>
-
-          {unlockError && (
-            <div role="alert" className="rounded-xl border border-rose-500/30 bg-rose-500/10 px-3.5 py-2 text-xs text-rose-300">
-              {unlockError}
-            </div>
-          )}
-          {localVaultToMigrate && <p className="text-xs text-slate-400">Your existing encrypted vault will be preserved while it is copied to shared storage. Keep this browser's data until you verify your connections on another device.</p>}
-
-          {vaultMode === "passphrase" && <input
-            type="password"
-            value={unlockInput}
-            onChange={(e) => setUnlockInput(e.target.value)}
-            placeholder={vaultKeySource === "account" || needsInitialPassword ? "Enter account password..." : "Enter master passphrase..."}
-            aria-label={vaultKeySource === "account" || needsInitialPassword ? "Account password" : "Master passphrase"}
-            autoFocus
-            className="w-full rounded-xl border border-white/12 bg-[#090b10] px-4 py-2.5 text-sm text-white placeholder-slate-500 outline-none focus:border-[#ff6b57]"
-          />}
-
-          <div className="flex flex-wrap items-center justify-between gap-3">
-            {localCaps?.serverVault && (
-              <button type="button" onClick={() => void bootAuthenticatedWorkspace()} className="text-xs text-slate-400 hover:text-white">
-                Check for updated vault
-              </button>
-            )}
-            <button type="button" onClick={async () => {
-              await fetch("/api/auth/logout", { method: "POST", headers: getAuthHeaders(gatewaySettings) }).catch(() => {});
-              setStoredSessionToken(null); accountPasswordRef.current = null; window.location.reload();
-            }} className="text-xs text-slate-400 hover:text-white">Sign out</button>
-            {!localCaps?.serverVault && <button
-              type="button"
-              onClick={() => {
-                if (
-                  window.confirm(
-                    "Reset local encrypted vault? Unbacked-up saved hosts in this browser will be cleared."
-                  )
-                ) {
-                  localStorage.removeItem("sushi_encrypted_vault_v1");
-                  clearLocalSyncMetadata();
-                  clearDeviceKey();
-                  setHosts([]);
-                  setSnippets(DEFAULT_SNIPPETS);
-                  setSshKeys([]);
-                  setEnforceKeyWhitelist(false);
-                  updatePendingEnvelope(null);
-                  setActivePassphrase(null);
-                  setUnlockError(null);
-                  setVaultMode("device");
-                  setVaultLocked(false);
-                }
-              }}
-              className="text-xs text-slate-500 hover:text-rose-400"
-            >
-              Reset Local Vault
-            </button>}
-            <button
-              type="submit"
-              className="rounded-xl bg-[#ff6b57] px-5 py-2 text-xs font-semibold text-white transition hover:bg-[#ff7f6e]"
-            >
-              {vaultMode === "passphrase" ? "Unlock Workspace" : "Retry Device Key"}
-            </button>
-          </div>
-        </form>
       </div>
     );
   }
@@ -2484,6 +2521,18 @@ export function SushiWorkspace() {
                           <CirclePlay className="h-3 w-3" />
                           {run.running ? "Go back to it" : "Open log"}
                         </button>
+                        {run.running && (
+                          <button
+                            type="button"
+                            disabled={stoppingAllBg}
+                            onClick={() => void stopBackgroundForRunHost(run)}
+                            className="inline-flex items-center gap-1 rounded-lg border border-rose-500/35 bg-rose-500/15 px-2.5 py-1 text-[11px] font-semibold text-rose-200 hover:bg-rose-500/25 disabled:opacity-50"
+                            title="Stop all background SSH processes on this host"
+                          >
+                            <Square className="h-2.5 w-2.5 fill-current" />
+                            Stop
+                          </button>
+                        )}
                         <button
                           type="button"
                           onClick={() => setResumableRuns(removeResumableRun(run.id))}
@@ -2632,6 +2681,18 @@ export function SushiWorkspace() {
                       <CirclePlay className="h-3 w-3" />
                       {resumePrompt.acceptLabel}
                     </button>
+                    {resumePrompt.run.running && (
+                      <button
+                        type="button"
+                        disabled={stoppingAllBg}
+                        onClick={() => void stopBackgroundForRunHost(resumePrompt.run)}
+                        className="inline-flex items-center gap-1 rounded-lg border border-rose-500/40 bg-rose-500/20 px-3 py-1 font-semibold text-rose-100 hover:bg-rose-500/30 disabled:opacity-50"
+                        title="Stop all background SSH processes on that host"
+                      >
+                        <Square className="h-2.5 w-2.5 fill-current" />
+                        Stop
+                      </button>
+                    )}
                     <button
                       type="button"
                       onClick={() => openRunHostFresh(resumePrompt.run)}
@@ -2652,29 +2713,40 @@ export function SushiWorkspace() {
                 </div>
               )}
 
+              {bgStopNotice && (
+                <div
+                  role="status"
+                  className={`flex items-center justify-between gap-3 rounded-xl border px-4 py-3 text-xs ${
+                    bgStopNotice.tone === "success"
+                      ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-100"
+                      : "border-rose-500/30 bg-rose-500/10 text-rose-200"
+                  }`}
+                >
+                  <span>{bgStopNotice.text}</span>
+                  <button
+                    type="button"
+                    onClick={() => setBgStopNotice(null)}
+                    className="rounded p-1 opacity-70 hover:opacity-100"
+                    aria-label="Dismiss notice"
+                  >
+                    <X className="h-3.5 w-3.5" />
+                  </button>
+                </div>
+              )}
+
               {vaultSyncError && (
                 <div role="alert" className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-xs text-rose-200">
                   <span>{vaultSyncError}</span>
-                  {accountVaultOutdated ? (
-                    <button type="button" onClick={() => { setVaultModalTab("security"); setVaultModalOpen(true); }} className="rounded-lg bg-rose-500/20 px-3 py-1 font-semibold">Update sync password</button>
-                  ) : (
-                    <button type="button" onClick={() => {
-                      if (!window.confirm("Reload the latest vault? Unsaved edits in open forms will be discarded.")) return;
-                      setHostModalOpen(false); setVaultModalOpen(false); setEditingProfile(null);
-                      void bootAuthenticatedWorkspace();
-                    }} className="rounded-lg bg-rose-500/20 px-3 py-1 font-semibold">Reload latest vault</button>
-                  )}
+                  <button type="button" onClick={() => {
+                    if (!window.confirm("Reload the latest vault? Unsaved edits in open forms will be discarded.")) return;
+                    setHostModalOpen(false); setVaultModalOpen(false); setEditingProfile(null);
+                    void bootAuthenticatedWorkspace();
+                  }} className="rounded-lg bg-rose-500/20 px-3 py-1 font-semibold">Reload latest vault</button>
                 </div>
               )}
               {localCaps && !localCaps.serverVault && (
                 <div role="status" className="rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-xs text-amber-100">
                   Shared vault storage is disabled or not configured. Saved connections can appear in other tabs of this browser, but not on other devices. {localCaps.mode === "vercel" ? "Connect Turso, Firestore, or persistent Redis REST storage to this Vercel project to enable cross-device sync. Keep this browser's data until migration is complete." : "Enable persistent shared vault storage to sync other devices."}
-                </div>
-              )}
-              {localCaps?.serverVault && vaultKeySource !== "account" && !vaultSyncError && (
-                <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-xs text-amber-100">
-                  <span>This vault uses {vaultMode === "device" ? "a device-only key" : "a separate passphrase"}. Use your account password to make saved connections available on your other devices.</span>
-                  <button type="button" onClick={() => { setVaultModalTab("security"); setVaultModalOpen(true); }} className="rounded-lg bg-amber-500/20 px-3 py-1 font-semibold">Enable account sync</button>
                 </div>
               )}
 
@@ -2711,6 +2783,20 @@ export function SushiWorkspace() {
                     </p>
                   </div>
                   <div className="flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      disabled={stoppingAllBg}
+                      onClick={() => void handleStopAllBackgroundSsh()}
+                      className="inline-flex items-center gap-1.5 rounded-xl border border-rose-500/30 bg-rose-500/10 px-3.5 py-2 text-xs font-medium text-rose-200 transition hover:bg-rose-500/20 disabled:opacity-50"
+                      title="Stop all background SSH processes on connected or saved SSH hosts"
+                    >
+                      {stoppingAllBg ? (
+                        <Loader2 className="h-3.5 w-3.5 animate-spin text-rose-300" />
+                      ) : (
+                        <Square className="h-3 w-3 fill-current text-rose-300" />
+                      )}
+                      Stop Background SSH
+                    </button>
                     <button
                       type="button"
                       onClick={() => {
@@ -2876,7 +2962,7 @@ export function SushiWorkspace() {
                       onClick={() => setVaultModalOpen(true)}
                       className="text-xs text-slate-400 hover:text-white"
                     >
-                      Backup / Lock Vault
+                      Vault &amp; Backup
                     </button>
                   </div>
 
@@ -3037,13 +3123,26 @@ export function SushiWorkspace() {
                             {describeRunState(run)}
                           </span>
                         </span>
-                        <button
-                          type="button"
-                          onClick={() => resumeRunInTab(run)}
-                          className="shrink-0 rounded-lg border border-amber-400/40 bg-amber-500/15 px-2 py-1 text-[11px] font-semibold text-amber-100 hover:bg-amber-500/25"
-                        >
-                          {run.running ? "Go back to it" : "Open log"}
-                        </button>
+                        <span className="flex shrink-0 items-center gap-1">
+                          <button
+                            type="button"
+                            onClick={() => resumeRunInTab(run)}
+                            className="shrink-0 rounded-lg border border-amber-400/40 bg-amber-500/15 px-2 py-1 text-[11px] font-semibold text-amber-100 hover:bg-amber-500/25"
+                          >
+                            {run.running ? "Go back to it" : "Open log"}
+                          </button>
+                          {run.running && (
+                            <button
+                              type="button"
+                              disabled={stoppingAllBg}
+                              onClick={() => void stopBackgroundForRunHost(run)}
+                              className="shrink-0 rounded-lg border border-rose-500/35 bg-rose-500/15 px-2 py-1 text-[11px] font-semibold text-rose-200 hover:bg-rose-500/25 disabled:opacity-50"
+                              title="Stop background SSH processes on this host"
+                            >
+                              Stop
+                            </button>
+                          )}
+                        </span>
                       </div>
                     ))}
 
@@ -3154,6 +3253,7 @@ export function SushiWorkspace() {
                     onOpenGatewayModal={() => setGatewayModalOpen(true)}
                     onConnected={() => handleSessionConnected(tab.profile, tab.profile.id)}
                     onRunChange={(run) => handleRunUpdated(run, tab.id)}
+                    onStopHostRuns={() => clearHostResumableRuns(tab.profile)}
                     resumeRun={tabResumes[tab.id] ?? null}
                   />
                 )}
@@ -3247,36 +3347,6 @@ export function SushiWorkspace() {
         enforceKeyWhitelist={enforceKeyWhitelist}
         gatewaySettings={gatewaySettings}
         onClose={() => { setVaultModalOpen(false); setVaultModalFocusBackup(false); }}
-        onSetPassphrase={async (pass) => {
-          if (pass) {
-            await persistVault(hosts, snippets, pass, "passphrase", undefined, undefined, "independent");
-            setVaultMode("passphrase");
-            setVaultKeySource("independent");
-            setAccountVaultOutdated(false);
-            setActivePassphrase(pass);
-          } else {
-            await persistVault(hosts, snippets, null, "device", undefined, undefined, "independent");
-            setVaultMode("device");
-            setVaultKeySource("independent");
-            setAccountVaultOutdated(false);
-            setActivePassphrase(null);
-          }
-        }}
-        onEnableAccountSync={async (password) => {
-          if (!localCaps?.serverVault) throw new Error("Persistent shared vault storage is not enabled.");
-          await persistVault(hosts, snippets, password, "passphrase", undefined, undefined, "account");
-          accountPasswordRef.current = password;
-          setVaultMode("passphrase");
-          setVaultKeySource("account");
-          setActivePassphrase(password);
-          setAccountVaultOutdated(false);
-          setVaultSyncError(null);
-        }}
-        onLockNow={() => {
-          accountPasswordRef.current = null;
-          setActivePassphrase(null);
-          setVaultLocked(true);
-        }}
         onExportPortableEnvelope={(passphrase) =>
           encryptVaultData({
             version: 1,
@@ -3463,8 +3533,8 @@ export function SushiWorkspace() {
           setActiveTabId("launchpad");
           setVaultReady(false);
           accountPasswordRef.current = null;
+          sessionVaultKeyRef.current = null;
           setActivePassphrase(null);
-          setUnlockInput("");
           updatePendingEnvelope(null);
           setHosts([]);
           setSnippets(DEFAULT_SNIPPETS);

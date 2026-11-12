@@ -26,6 +26,7 @@ const PASSKEY_HTTPS_REQUIRED =
 
 interface AuthGateScreenProps {
   authStatus: AuthStatusResponse;
+  initialNotice?: string | null;
   onAuthenticated: (username: string, accountPassword?: string) => void;
   onRefreshStatus: () => Promise<void>;
 }
@@ -43,6 +44,7 @@ function detectDevicePasskeyLabel(): string {
 
 export function AuthGateScreen({
   authStatus,
+  initialNotice,
   onAuthenticated,
   onRefreshStatus,
 }: AuthGateScreenProps) {
@@ -512,6 +514,13 @@ export function AuthGateScreen({
             </p>
           </div>
         </div>
+
+        {initialNotice && !error && (
+          <div className="flex items-start gap-2 rounded-xl border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-100">
+            <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-amber-400" />
+            <span>{initialNotice}</span>
+          </div>
+        )}
 
         {error && (
           <div className="flex items-start gap-2 rounded-xl border border-rose-500/30 bg-rose-500/10 p-3 text-xs text-rose-200">

@@ -104,16 +104,13 @@ interface VaultSecurityModalProps {
   initialTab?: VaultModalTab;
   initialSection?: "backup";
   vaultMode: "device" | "passphrase";
-  vaultKeySource: "account" | "independent";
+  vaultKeySource: "account" | "independent" | "session";
   serverVaultEnabled: boolean;
   hosts: HostProfile[];
   sshKeys: WhitelistedSshKey[];
   enforceKeyWhitelist: boolean;
   gatewaySettings: GatewaySettings;
   onClose: () => void;
-  onSetPassphrase: (passphrase: string | null) => Promise<void>;
-  onEnableAccountSync: (password: string) => Promise<void>;
-  onLockNow: () => void;
   onExportPortableEnvelope: (passphrase: string) => Promise<EncryptedVaultEnvelope>;
   onImportEnvelope: (
     envelope: EncryptedVaultEnvelope,
@@ -155,9 +152,6 @@ export function VaultSecurityModal({
   enforceKeyWhitelist,
   gatewaySettings,
   onClose,
-  onSetPassphrase,
-  onEnableAccountSync,
-  onLockNow,
   onExportPortableEnvelope,
   onImportEnvelope,
   onUpdateKeychain,
@@ -166,9 +160,6 @@ export function VaultSecurityModal({
   const [activeTab, setActiveTab] = useState<VaultModalTab>(initialTab);
 
   // Security / Encryption state
-  const [accountPass, setAccountPass] = useState("");
-  const [newPass, setNewPass] = useState("");
-  const [confirmPass, setConfirmPass] = useState("");
   const [importPass, setImportPass] = useState("");
   const [pendingImport, setPendingImport] =
     useState<EncryptedVaultEnvelope | null>(null);
@@ -177,7 +168,6 @@ export function VaultSecurityModal({
   const [backupConfirm, setBackupConfirm] = useState("");
   const [exportingBackup, setExportingBackup] = useState(false);
   const [restoringBackup, setRestoringBackup] = useState(false);
-  const [saving, setSaving] = useState(false);
   const fileRequest = useRef(0);
   const backupSectionRef = useRef<HTMLDivElement | null>(null);
   const backupFileRef = useRef<HTMLInputElement | null>(null);
@@ -229,9 +219,6 @@ export function VaultSecurityModal({
     setPendingImport(null);
     setPendingImportName("");
     setImportPass("");
-    setAccountPass("");
-    setNewPass("");
-    setConfirmPass("");
     setBackupPass("");
     setBackupConfirm("");
     setAnalyzingSqlite(false);
@@ -261,81 +248,6 @@ export function VaultSecurityModal({
   if (!isOpen) return null;
 
   // --- Security / Vault Handlers ---
-  const handleEnableAccountSync = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setStatus(null);
-    if (!accountPass) {
-      setStatus({ ok: false, msg: "Enter your account password." });
-      return;
-    }
-    setSaving(true);
-    try {
-      await onEnableAccountSync(accountPass);
-      setAccountPass("");
-      setStatus({ ok: true, msg: "Vault encrypted with your account password and saved for your other devices." });
-    } catch (error) {
-      setStatus({ ok: false, msg: error instanceof Error ? error.message : "Could not enable account sync." });
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  const handleApplyPassphrase = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setStatus(null);
-    if (!newPass || newPass.length < 6) {
-      setStatus({
-        ok: false,
-        msg: "Master passphrase must be at least 6 characters.",
-      });
-      return;
-    }
-    if (newPass !== confirmPass) {
-      setStatus({ ok: false, msg: "Passphrases do not match." });
-      return;
-    }
-    setSaving(true);
-    try {
-      await onSetPassphrase(newPass);
-      setNewPass("");
-      setConfirmPass("");
-      setStatus({
-        ok: true,
-        msg: "Vault re-encrypted with PBKDF2-SHA256 + AES-256-GCM master passphrase.",
-      });
-    } catch (err) {
-      setStatus({
-        ok: false,
-        msg:
-          err instanceof Error
-            ? err.message
-            : "Failed to update vault encryption.",
-      });
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  const handleSwitchToDeviceKey = async () => {
-    setSaving(true);
-    setStatus(null);
-    try {
-      if (serverVaultEnabled && !window.confirm("Device-key encryption cannot be unlocked on another device. Continue?")) return;
-      await onSetPassphrase(null);
-      setStatus({
-        ok: true,
-        msg: "Switched to automatic device-bound AES-256-GCM encryption. Other devices cannot unlock this vault.",
-      });
-    } catch (err) {
-      setStatus({
-        ok: false,
-        msg: err instanceof Error ? err.message : "Failed to switch mode.",
-      });
-    } finally {
-      setSaving(false);
-    }
-  };
-
   const handleExportSushiEnvelope = async () => {
     setStatus(null);
     if (backupPass.length < 8) {
@@ -1425,9 +1337,13 @@ export function VaultSecurityModal({
                   <span>
                     Protection Mode:{" "}
                     <strong className="text-white">
-                      {vaultKeySource === "account" ? "Account Password (PBKDF2)"
-                        : vaultMode === "passphrase" ? "Separate Master Passphrase (PBKDF2)"
-                        : "Device Key (AES-256-GCM)"}
+                      {vaultKeySource === "session"
+                        ? "Account Session Sync (AES-256-GCM · Auto Unlock)"
+                        : vaultKeySource === "account"
+                          ? "Account Password (PBKDF2)"
+                          : vaultMode === "passphrase"
+                            ? "Master Passphrase (PBKDF2)"
+                            : "Device Key (AES-256-GCM)"}
                     </strong>
                   </span>
                   <span className="font-mono-code text-slate-400">
@@ -1442,73 +1358,11 @@ export function VaultSecurityModal({
                     }
                   >
                     {serverVaultEnabled
-                      ? "Enabled"
+                      ? "Enabled — opens automatically when signed in"
                       : "Not configured — browser only"}
                   </span>
                 </div>
               </div>
-
-              {serverVaultEnabled && (
-                <form onSubmit={handleEnableAccountSync} className="space-y-3 rounded-xl border border-emerald-500/25 bg-emerald-500/5 p-3.5">
-                  <label htmlFor="vault-account-password" className="block text-xs font-semibold uppercase tracking-wider text-emerald-200">
-                    Account password sync
-                  </label>
-                  <p className="text-[11px] text-slate-300">Encrypt saved hosts, passwords, keys and snippets with your account password, then open them on your other devices. Passkey sign-in or a browser reload still requires this password to unlock the vault.</p>
-                  <input id="vault-account-password" type="password" autoComplete="current-password" value={accountPass} onChange={(e) => setAccountPass(e.target.value)} placeholder="Current account password" className="w-full rounded-xl border border-white/10 bg-[#151a24] px-3.5 py-2 text-sm text-white placeholder-slate-500 focus:border-[#ff6b57] focus:outline-none" />
-                  <button type="submit" disabled={saving} className="rounded-xl bg-emerald-500/20 px-4 py-2 text-xs font-semibold text-emerald-100 hover:bg-emerald-500/30 disabled:opacity-50">
-                    {vaultKeySource === "account" ? "Update account-password encryption" : "Enable account-password sync"}
-                  </button>
-                </form>
-              )}
-
-              <form onSubmit={handleApplyPassphrase} className="space-y-3">
-                <label className="block text-xs font-semibold uppercase tracking-wider text-slate-400">
-                  Optional: use a separate master passphrase
-                </label>
-                <input
-                  type="password"
-                  value={newPass}
-                  onChange={(e) => setNewPass(e.target.value)}
-                  placeholder="New master passphrase (min 6 chars)"
-                  className="w-full rounded-xl border border-white/10 bg-[#151a24] px-3.5 py-2 text-sm text-white placeholder-slate-500 focus:border-[#ff6b57] focus:outline-none"
-                />
-                <input
-                  type="password"
-                  value={confirmPass}
-                  onChange={(e) => setConfirmPass(e.target.value)}
-                  placeholder="Confirm master passphrase"
-                  className="w-full rounded-xl border border-white/10 bg-[#151a24] px-3.5 py-2 text-sm text-white placeholder-slate-500 focus:border-[#ff6b57] focus:outline-none"
-                />
-                <div className="flex flex-wrap gap-2">
-                  <button
-                    type="submit"
-                    disabled={saving}
-                    className="inline-flex items-center gap-1.5 rounded-xl bg-[#ff6b57] px-4 py-2 text-xs font-semibold text-white hover:bg-[#ff7f6e]"
-                  >
-                    <Lock className="h-3.5 w-3.5" />
-                    Encrypt with Master Passphrase
-                  </button>
-                  {vaultMode === "passphrase" && (
-                    <>
-                      <button
-                        type="button"
-                        onClick={onLockNow}
-                        className="inline-flex items-center gap-1.5 rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-xs text-slate-200 hover:bg-white/10"
-                      >
-                        Lock Vault Now
-                      </button>
-                      <button
-                        type="button"
-                        onClick={handleSwitchToDeviceKey}
-                        className="inline-flex items-center gap-1.5 rounded-xl border border-white/10 px-3 py-2 text-xs text-slate-400 hover:text-white"
-                      >
-                        <Unlock className="h-3.5 w-3.5" />
-                        Use Automatic Device Key
-                      </button>
-                    </>
-                  )}
-                </div>
-              </form>
 
               <div ref={backupSectionRef} tabIndex={-1} className="space-y-3 border-t border-white/8 pt-4 focus:outline-none">
                 <span className="block text-xs font-semibold uppercase tracking-wider text-slate-400">

@@ -135,6 +135,25 @@ function deriveInstanceSecret(seedMaterial?: string): string {
   ).toString("hex");
 }
 
+/**
+ * Derives a stable 256-bit account vault encryption key from the server's
+ * account `authSecret`. Returned only to verified same-origin admin sessions so
+ * encrypted vaults in Turso / Firestore / Redis / Disk unlock automatically on
+ * Password sign-in, Passkey sign-in, and browser reloads without storing raw
+ * keys in localStorage or plaintext SSH secrets in shared storage.
+ */
+export function deriveAccountVaultKey(authSecret: string): string {
+  return Buffer.from(
+    crypto.hkdfSync(
+      "sha256",
+      authSecret,
+      "sushi-account-vault-salt-v1",
+      "sushi-account-vault-aes-key-v1",
+      32
+    )
+  ).toString("base64url");
+}
+
 // Remember the exact bytes read so concurrent account changes cannot overwrite
 // one another. The metadata is not serialized into the account record.
 const authRecordSources = new WeakMap<DiskAuthFile, string>();

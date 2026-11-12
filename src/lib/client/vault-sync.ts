@@ -7,6 +7,7 @@ const SYNC_METADATA_KEY = "sushi_vault_sync_v1";
 export interface RemoteVault {
   envelope: EncryptedVaultEnvelope | null;
   revision: string | null;
+  vaultKey?: string | null;
 }
 
 interface LocalSyncMetadata {
@@ -164,11 +165,12 @@ export async function fetchRemoteVault(settings: GatewaySettings): Promise<Remot
   if (!res.ok || !data.ok || !data.enabled) {
     throw new Error(typeof data.error === "string" ? data.error : "Could not read the shared vault. No data was changed.");
   }
-  if (data.envelope === null && data.revision === null) return { envelope: null, revision: null };
+  const vaultKey = typeof data.vaultKey === "string" && data.vaultKey ? data.vaultKey : null;
+  if (data.envelope === null && data.revision === null) return { envelope: null, revision: null, vaultKey };
   if (!data.envelope || typeof data.envelope !== "object" || typeof data.revision !== "string" || !data.revision) {
     throw new Error("The shared vault response is invalid. No data was changed.");
   }
-  return { envelope: data.envelope as EncryptedVaultEnvelope, revision: data.revision };
+  return { envelope: data.envelope as EncryptedVaultEnvelope, revision: data.revision, vaultKey };
 }
 
 export async function verifyAccountPassword(settings: GatewaySettings, password: string): Promise<void> {

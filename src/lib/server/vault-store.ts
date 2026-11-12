@@ -20,15 +20,15 @@ export function parseVaultEnvelope(input: unknown): EncryptedVaultEnvelope | nul
       typeof data.ciphertext !== "string" || !data.ciphertext ||
       typeof data.updatedAt !== "number" || !Number.isFinite(data.updatedAt) ||
       (data.mode === "passphrase" && (typeof data.salt !== "string" || !data.salt)) ||
-      (data.keySource !== undefined && data.keySource !== "account" && data.keySource !== "independent") ||
-      (data.keySource === "account" && data.mode !== "passphrase")) {
+      (data.keySource !== undefined && data.keySource !== "account" && data.keySource !== "independent" && data.keySource !== "session") ||
+      ((data.keySource === "account" || data.keySource === "session") && data.mode !== "passphrase")) {
     return null;
   }
   return {
     version: 1,
     mode: data.mode,
     ...(data.mode === "passphrase" ? { salt: data.salt as string } : {}),
-    ...(data.keySource === "account" || data.keySource === "independent" ? { keySource: data.keySource } : {}),
+    ...(data.keySource === "account" || data.keySource === "independent" || data.keySource === "session" ? { keySource: data.keySource } : {}),
     iv: data.iv,
     ciphertext: data.ciphertext,
     updatedAt: data.updatedAt,

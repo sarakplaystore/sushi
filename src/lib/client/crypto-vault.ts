@@ -30,9 +30,9 @@ export interface VaultPlaintext {
 export interface EncryptedVaultEnvelope {
   version: 1;
   mode: "device" | "passphrase";
-  // Account-password vaults are still passphrase envelopes for compatibility
-  // with portable backups and older clients.
-  keySource?: "account" | "independent";
+  // Account/session vaults are passphrase envelopes for compatibility with
+  // portable backups and existing encrypted storage.
+  keySource?: "account" | "independent" | "session";
   salt?: string; // base64 (required when mode === 'passphrase')
   iv: string; // base64
   ciphertext: string; // base64

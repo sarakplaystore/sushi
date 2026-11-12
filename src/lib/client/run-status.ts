@@ -88,3 +88,66 @@ export async function fetchRunStatus(
     clearTimeout(timer);
   }
 }
+
+export interface StopHostBackgroundResult {
+  ok: boolean;
+  stoppedCount: number;
+  cleanedChannels: number;
+  processes: string[];
+  error?: string;
+}
+
+/**
+ * Stops all background SSH processes and detached Sushi runs on a remote host.
+ */
+export async function stopHostBackgroundProcesses(
+  credentials: ConnectionCredentials,
+  settings: GatewaySettings,
+  options: { timeoutMs?: number } = {}
+): Promise<StopHostBackgroundResult> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), options.timeoutMs ?? 20000);
+  try {
+    const apiBase = resolveGatewayHttpBase(settings.gatewayUrl);
+    const res = await fetch(
+      apiBase ? `${apiBase}/api/ssh/exec/stop` : "/api/ssh/exec/stop",
+      {
+        method: "POST",
+        headers: getAuthHeaders(settings),
+        signal: controller.signal,
+        body: JSON.stringify({ credentials }),
+      }
+    );
+    const data = (await res.json().catch(() => ({}))) as Partial<StopHostBackgroundResult>;
+    if (!res.ok || data.ok === false) {
+      return {
+        ok: false,
+        stoppedCount: 0,
+        cleanedChannels: 0,
+        processes: [],
+        error: data.error || `HTTP ${res.status}`,
+      };
+    }
+    return {
+      ok: true,
+      stoppedCount: Number(data.stoppedCount ?? 0),
+      cleanedChannels: Number(data.cleanedChannels ?? 0),
+      processes: Array.isArray(data.processes)
+        ? data.processes.filter((p): p is string => typeof p === "string")
+        : [],
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      stoppedCount: 0,
+      cleanedChannels: 0,
+      processes: [],
+      error:
+        err instanceof Error
+          ? err.message
+          : "Could not stop background SSH processes.",
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}

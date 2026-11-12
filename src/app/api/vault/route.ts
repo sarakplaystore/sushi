@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getCorsHeaders } from "@/lib/server/security";
-import { verifyAdminSession } from "@/lib/server/auth";
+import { deriveAccountVaultKey, getEffectiveAuthConfig, verifyAdminSession } from "@/lib/server/auth";
 import { isServerVaultEnabled, parseVaultEnvelope, readStoredVault, saveStoredVault } from "@/lib/server/vault-store";
 import { getStateStoreKind } from "@/lib/server/state-store";
 
@@ -16,8 +16,10 @@ export async function GET(req: NextRequest) {
   try {
     const auth = await verifyAdminSession(req.headers);
     if (!auth.ok) return NextResponse.json({ ok: false, error: auth.error }, { status: 401, headers: cors });
+    const cfg = await getEffectiveAuthConfig(req.headers);
+    const vaultKey = deriveAccountVaultKey(cfg.authSecret);
     if (!isServerVaultEnabled()) {
-      return NextResponse.json({ ok: true, enabled: false, envelope: null, revision: null }, { headers: cors });
+      return NextResponse.json({ ok: true, enabled: false, envelope: null, revision: null, vaultKey }, { headers: cors });
     }
     const current = await readStoredVault();
     return NextResponse.json({
@@ -25,6 +27,7 @@ export async function GET(req: NextRequest) {
       enabled: true,
       envelope: current?.envelope ?? null,
       revision: current?.revision ?? null,
+      vaultKey,
     }, { headers: cors });
   } catch (error) {
     return NextResponse.json({

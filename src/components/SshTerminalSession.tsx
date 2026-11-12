@@ -25,6 +25,7 @@ import {
   Cpu,
   Languages,
   Infinity,
+  Square,
 } from "lucide-react";
 import type {
   CommandSnippet,
@@ -86,7 +87,7 @@ import {
   type SshConnectFailure,
 } from "@/lib/client/ssh-retry";
 import { SshConnectErrorCard } from "@/components/SshConnectErrorCard";
-import { fetchRunStatus } from "@/lib/client/run-status";
+import { fetchRunStatus, stopHostBackgroundProcesses } from "@/lib/client/run-status";
 import type { ResumableRun } from "@/lib/client/session-resume";
 import { TranslatePanel } from "@/components/TranslatePanel";
 
@@ -111,6 +112,11 @@ interface SshTerminalSessionProps {
    * stores it so the run survives a reload / a closed tab.
    */
   onRunChange?: (run: ResumableRun | null) => void;
+  /**
+   * Called after stopping all background SSH processes on this host so any
+   * persisted resumable runs for this host are also cleared in the workspace.
+   */
+  onStopHostRuns?: () => void;
   /**
    * A run to take over: the command line is replayed in the terminal and, when the
    * command is still alive on the host, its output log is redrawn and keystrokes are
@@ -194,8 +200,10 @@ export function SshTerminalSession({
   onOpenGatewayModal,
   onConnected,
   onRunChange,
+  onStopHostRuns,
   resumeRun,
 }: SshTerminalSessionProps) {
+  const [stoppingBg, setStoppingBg] = useState(false);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<import("@xterm/xterm").Terminal | null>(null);
   const fitAddonRef = useRef<import("@xterm/addon-fit").FitAddon | null>(null);
@@ -2133,6 +2141,85 @@ export function SshTerminalSession({
     }
   };
 
+  const handleStopBackgroundProcesses = async () => {
+    if (stoppingBg) return;
+    setStoppingBg(true);
+    try {
+      // Cancel any active command in this tab first.
+      if (execBusyRef.current) {
+        userCancelledExecRef.current = true;
+        try {
+          stdinRef.current?.sendSignal("INT");
+          stdinRef.current?.sendInput("\x03");
+          stdinRef.current?.close();
+        } catch {
+          // ignore
+        }
+        abortExecRef.current?.abort();
+      }
+      if (keyChannelRef.current) {
+        void sendKeyChannelInput(keyChannelRef.current, "\x03", gatewaySettings);
+      } else if (detachedRun) {
+        void sendKeyChannelInput(detachedRun, "\x03", gatewaySettings);
+      }
+
+      const result = await stopHostBackgroundProcesses(
+        {
+          host: profile.host,
+          port: profile.port,
+          username: profile.username,
+          authMethod: profile.authMethod,
+          password: profile.password,
+          privateKey: profile.privateKey,
+          passphrase: profile.passphrase,
+        },
+        gatewaySettings
+      );
+
+      setDetachedRun(null);
+      currentRunRef.current = null;
+      setCurrentRun(null);
+      setReattached(false);
+      setTrackingRun(false);
+      onRunChange?.(null);
+      onStopHostRuns?.();
+
+      const term = termRef.current;
+      if (term) {
+        if (!result.ok) {
+          term.write(
+            `\r\n\x1b[31m✗ Failed to stop background SSH processes: ${result.error || "connection error"}\x1b[0m\r\n`
+          );
+        } else if (result.stoppedCount > 0 || result.cleanedChannels > 0) {
+          const namesSuffix =
+            result.processes.length > 0
+              ? ` (${result.processes.join(", ")})`
+              : "";
+          term.write(
+            `\r\n\x1b[32m✓ Stopped ${result.stoppedCount} background SSH process${result.stoppedCount === 1 ? "" : "es"}${namesSuffix}.\x1b[0m`
+          );
+          if (modeRef.current === "serverless" && !execBusyRef.current) {
+            writePrompt(term);
+          } else {
+            term.write("\r\n");
+          }
+        } else {
+          term.write(
+            `\r\n\x1b[90m• No background SSH processes were running on ${profile.host}.\x1b[0m`
+          );
+          if (modeRef.current === "serverless" && !execBusyRef.current) {
+            writePrompt(term);
+          } else {
+            term.write("\r\n");
+          }
+        }
+        term.focus();
+      }
+    } finally {
+      setStoppingBg(false);
+    }
+  };
+
   return (
     <div
       className="flex h-full w-full flex-col overflow-hidden"
@@ -2510,6 +2597,23 @@ export function SshTerminalSession({
           >
             <Infinity className="h-3.5 w-3.5" />
             <span className="hidden sm:inline">No timeout</span>
+          </button>
+
+          {/* Stop all background SSH processes on this host */}
+          <button
+            type="button"
+            onClick={() => void handleStopBackgroundProcesses()}
+            disabled={stoppingBg}
+            className="flex items-center gap-1.5 rounded-lg border border-rose-500/35 bg-rose-500/12 px-2.5 py-1 text-xs font-medium text-rose-200 transition hover:bg-rose-500/22 disabled:opacity-50"
+            title="Stop all background SSH processes and detached commands on this host"
+          >
+            {stoppingBg ? (
+              <Loader2 className="h-3 w-3 animate-spin" />
+            ) : (
+              <Square className="h-3 w-3 fill-current" />
+            )}
+            <span className="hidden sm:inline">Stop Background</span>
+            <span className="sm:hidden">Stop BG</span>
           </button>
 
           {/* Reconnect */}

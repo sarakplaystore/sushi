@@ -23,11 +23,16 @@ import type { ConnectionCredentials, HostProfile } from "@/types/connection";
 
 export const RESUMABLE_RUNS_KEY = "sushi_resumable_runs_v1";
 export const RECENT_HOSTS_KEY = "sushi_recent_hosts_v1";
+export const OPEN_TABS_KEY = "sushi_open_tabs_v1";
+export const WORKSPACE_TOMBSTONES_KEY = "sushi_workspace_tombstones_v1";
 /** A finished run is remembered this long so "go back?" still works after lunch. */
 const MAX_RUN_AGE_MS = 1000 * 60 * 60 * 24 * 7;
 const MAX_RUNS = 20;
 /** Recently connected hosts shown on the launchpad (history, not saved hosts). */
 const MAX_RECENT_HOSTS = 8;
+/** Maximum open tabs persisted/synced across reloads and devices. */
+const MAX_OPEN_TABS = 24;
+const MAX_TOMBSTONES = 64;
 
 export type RunState = "running" | "finished";
 
@@ -195,6 +200,7 @@ export function upsertResumableRun(
 }
 
 export function removeResumableRun(id: string, now = Date.now()): ResumableRun[] {
+  recordDismissedRun(id, now);
   const runs = loadResumableRuns(now).filter((run) => run.id !== id);
   writeRuns(runs);
   return runs;
@@ -354,6 +360,7 @@ export function recordRecentHost(
 }
 
 export function removeRecentHost(key: string, now = Date.now()): RecentHostEntry[] {
+  recordRemovedRecentHost(key, now);
   const next = loadRecentHosts(now).filter((entry) => entry.key !== key);
   writeRecentHosts(next);
   return next;
@@ -361,6 +368,452 @@ export function removeRecentHost(key: string, now = Date.now()): RecentHostEntry
 
 export function clearRecentHosts(): void {
   storage()?.removeItem(RECENT_HOSTS_KEY);
+}
+
+// ---------------------------------------------------------------------------------
+// Cross-device & reload persistent workspace state (open tabs + runs + recent hosts)
+// ---------------------------------------------------------------------------------
+
+export interface PersistedSessionTab {
+  /** Stable tab id (`tab-<uuid>`), preserved across reloads and devices. */
+  id: string;
+  title: string;
+  protocol: HostProfile["protocol"];
+  /** Sanitized host snapshot (credentials resolved from the encrypted vault). */
+  profile: HostProfile;
+  /** Vault HostProfile.id when backed by a saved connection, `null` for ad-hoc. */
+  hostId?: string | null;
+  initialPath?: string;
+  createdAt: number;
+  updatedAt: number;
+  /** Active ResumableRun id tracked by this tab, if any. */
+  runId?: string | null;
+}
+
+export interface WorkspaceTombstones {
+  closedTabs: Record<string, number>;
+  dismissedRuns: Record<string, number>;
+  removedRecentHosts: Record<string, number>;
+}
+
+export interface SyncedWorkspaceState {
+  openTabs: PersistedSessionTab[];
+  activeTabId: string;
+  activeTabUpdatedAt: number;
+  closedTabs: Record<string, number>;
+  resumableRuns: ResumableRun[];
+  dismissedRuns: Record<string, number>;
+  recentHosts: RecentHostEntry[];
+  removedRecentHosts: Record<string, number>;
+}
+
+function sanitizeTimestampMap(
+  value: unknown,
+  now = Date.now(),
+  maxAgeMs = MAX_RUN_AGE_MS
+): Record<string, number> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const entries = Object.entries(value as Record<string, unknown>)
+    .filter(([k, ts]) => Boolean(k) && Number.isFinite(Number(ts)) && Number(ts) > 0 && now - Number(ts) <= maxAgeMs)
+    .map(([k, ts]) => [k, Number(ts)] as const)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, MAX_TOMBSTONES);
+  return Object.fromEntries(entries);
+}
+
+function mergeTimestampMaps(
+  a: Record<string, number> | undefined,
+  b: Record<string, number> | undefined,
+  now = Date.now()
+): Record<string, number> {
+  const combined: Record<string, number> = {};
+  for (const src of [a, b]) {
+    if (!src) continue;
+    for (const [key, rawTs] of Object.entries(src)) {
+      const ts = Number(rawTs);
+      if (!key || !Number.isFinite(ts) || ts <= 0 || now - ts > MAX_RUN_AGE_MS) continue;
+      combined[key] = Math.max(combined[key] || 0, ts);
+    }
+  }
+  return sanitizeTimestampMap(combined, now);
+}
+
+export function loadWorkspaceTombstones(now = Date.now()): WorkspaceTombstones {
+  const store = storage();
+  if (!store) return { closedTabs: {}, dismissedRuns: {}, removedRecentHosts: {} };
+  const parsed = safeParse(store.getItem(WORKSPACE_TOMBSTONES_KEY));
+  if (!parsed || typeof parsed !== "object") {
+    return { closedTabs: {}, dismissedRuns: {}, removedRecentHosts: {} };
+  }
+  const data = parsed as Record<string, unknown>;
+  return {
+    closedTabs: sanitizeTimestampMap(data.closedTabs, now),
+    dismissedRuns: sanitizeTimestampMap(data.dismissedRuns, now),
+    removedRecentHosts: sanitizeTimestampMap(data.removedRecentHosts, now),
+  };
+}
+
+function writeWorkspaceTombstones(tombstones: WorkspaceTombstones, now = Date.now()): void {
+  const store = storage();
+  if (!store) return;
+  try {
+    store.setItem(
+      WORKSPACE_TOMBSTONES_KEY,
+      JSON.stringify({
+        closedTabs: sanitizeTimestampMap(tombstones.closedTabs, now),
+        dismissedRuns: sanitizeTimestampMap(tombstones.dismissedRuns, now),
+        removedRecentHosts: sanitizeTimestampMap(tombstones.removedRecentHosts, now),
+      })
+    );
+  } catch {
+    // best effort
+  }
+}
+
+export function recordClosedTab(tabId: string, now = Date.now()): void {
+  if (!tabId) return;
+  const tombstones = loadWorkspaceTombstones(now);
+  tombstones.closedTabs[tabId] = now;
+  writeWorkspaceTombstones(tombstones, now);
+}
+
+export function recordDismissedRun(runId: string, now = Date.now()): void {
+  if (!runId) return;
+  const tombstones = loadWorkspaceTombstones(now);
+  tombstones.dismissedRuns[runId] = now;
+  writeWorkspaceTombstones(tombstones, now);
+}
+
+export function recordRemovedRecentHost(key: string, now = Date.now()): void {
+  if (!key) return;
+  const tombstones = loadWorkspaceTombstones(now);
+  tombstones.removedRecentHosts[key] = now;
+  writeWorkspaceTombstones(tombstones, now);
+}
+
+function sanitizePersistedTab(value: unknown): PersistedSessionTab | null {
+  if (!value || typeof value !== "object") return null;
+  const data = value as Record<string, unknown>;
+  if (typeof data.id !== "string" || !data.id.trim()) return null;
+  if (!isHostProfile(data.profile)) return null;
+  const protoRaw = data.protocol;
+  const protocol: HostProfile["protocol"] =
+    protoRaw === "sftp" || protoRaw === "rdp" || protoRaw === "ssh"
+      ? protoRaw
+      : data.profile.protocol || "ssh";
+  const createdAt = Number(data.createdAt);
+  const validCreatedAt = Number.isFinite(createdAt) && createdAt > 0 ? createdAt : Date.now();
+  const updatedAt = Number(data.updatedAt);
+  const validUpdatedAt = Number.isFinite(updatedAt) && updatedAt > 0 ? updatedAt : validCreatedAt;
+  return {
+    id: data.id,
+    title:
+      typeof data.title === "string" && data.title.trim()
+        ? data.title
+        : data.profile.name || `${data.profile.username}@${data.profile.host}`,
+    protocol,
+    profile: sanitizeProfile(data.profile),
+    hostId:
+      data.hostId === null
+        ? null
+        : typeof data.hostId === "string" && data.hostId
+          ? data.hostId
+          : data.profile.id || null,
+    initialPath: typeof data.initialPath === "string" ? data.initialPath : undefined,
+    createdAt: validCreatedAt,
+    updatedAt: validUpdatedAt,
+    runId: typeof data.runId === "string" && data.runId ? data.runId : null,
+  };
+}
+
+export function loadPersistedTabs(): {
+  openTabs: PersistedSessionTab[];
+  activeTabId: string;
+  activeTabUpdatedAt: number;
+} {
+  const store = storage();
+  if (!store) return { openTabs: [], activeTabId: "launchpad", activeTabUpdatedAt: 0 };
+  const parsed = safeParse(store.getItem(OPEN_TABS_KEY));
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { openTabs: [], activeTabId: "launchpad", activeTabUpdatedAt: 0 };
+  }
+  const data = parsed as Record<string, unknown>;
+  const openTabs = Array.isArray(data.openTabs)
+    ? data.openTabs
+        .map(sanitizePersistedTab)
+        .filter((tab): tab is PersistedSessionTab => Boolean(tab))
+        .slice(0, MAX_OPEN_TABS)
+    : [];
+  const rawActive = typeof data.activeTabId === "string" && data.activeTabId ? data.activeTabId : "launchpad";
+  const activeTabId =
+    rawActive === "launchpad" || openTabs.some((tab) => tab.id === rawActive)
+      ? rawActive
+      : "launchpad";
+  const activeTabUpdatedAt =
+    Number.isFinite(Number(data.activeTabUpdatedAt)) && Number(data.activeTabUpdatedAt) > 0
+      ? Number(data.activeTabUpdatedAt)
+      : 0;
+  return { openTabs, activeTabId, activeTabUpdatedAt };
+}
+
+export function savePersistedTabs(
+  tabs: PersistedSessionTab[],
+  activeTabId: string,
+  activeTabUpdatedAt = Date.now()
+): void {
+  const store = storage();
+  if (!store) return;
+  const sanitized = tabs
+    .slice(0, MAX_OPEN_TABS)
+    .map((tab) => ({ ...tab, profile: sanitizeProfile(tab.profile) }));
+  const validActive =
+    activeTabId === "launchpad" || sanitized.some((tab) => tab.id === activeTabId)
+      ? activeTabId
+      : "launchpad";
+  try {
+    store.setItem(
+      OPEN_TABS_KEY,
+      JSON.stringify({
+        openTabs: sanitized,
+        activeTabId: validActive,
+        activeTabUpdatedAt,
+      })
+    );
+  } catch {
+    // best effort
+  }
+}
+
+export function normalizeSyncedWorkspaceState(
+  value: unknown,
+  now = Date.now()
+): SyncedWorkspaceState | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const data = value as Record<string, unknown>;
+  const closedTabs = sanitizeTimestampMap(data.closedTabs, now);
+  const dismissedRuns = sanitizeTimestampMap(data.dismissedRuns, now);
+  const removedRecentHosts = sanitizeTimestampMap(data.removedRecentHosts, now);
+
+  const openTabs = (Array.isArray(data.openTabs) ? data.openTabs : [])
+    .map(sanitizePersistedTab)
+    .filter((tab): tab is PersistedSessionTab => Boolean(tab))
+    .filter((tab) => (closedTabs[tab.id] ?? 0) < tab.updatedAt)
+    .sort((a, b) => a.createdAt - b.createdAt || a.id.localeCompare(b.id))
+    .slice(0, MAX_OPEN_TABS);
+
+  const resumableRuns = (Array.isArray(data.resumableRuns) ? data.resumableRuns : [])
+    .map(sanitizeRun)
+    .filter((run): run is ResumableRun => Boolean(run))
+    .filter((run) => now - run.startedAt <= MAX_RUN_AGE_MS && (dismissedRuns[run.id] ?? 0) < run.updatedAt)
+    .sort((a, b) => b.updatedAt - a.updatedAt)
+    .slice(0, MAX_RUNS);
+
+  const recentHosts = (Array.isArray(data.recentHosts) ? data.recentHosts : [])
+    .map(sanitizeRecent)
+    .filter((entry): entry is RecentHostEntry => Boolean(entry))
+    .filter(
+      (entry) =>
+        now - entry.lastConnectedAt <= MAX_RUN_AGE_MS &&
+        (removedRecentHosts[entry.key] ?? 0) < entry.lastConnectedAt
+    )
+    .sort((a, b) => b.lastConnectedAt - a.lastConnectedAt)
+    .slice(0, MAX_RECENT_HOSTS);
+
+  const rawActive = typeof data.activeTabId === "string" && data.activeTabId ? data.activeTabId : "launchpad";
+  const activeTabId =
+    rawActive === "launchpad" || openTabs.some((tab) => tab.id === rawActive)
+      ? rawActive
+      : "launchpad";
+  const activeTabUpdatedAt =
+    Number.isFinite(Number(data.activeTabUpdatedAt)) && Number(data.activeTabUpdatedAt) > 0
+      ? Number(data.activeTabUpdatedAt)
+      : 0;
+
+  return {
+    openTabs,
+    activeTabId,
+    activeTabUpdatedAt,
+    closedTabs,
+    resumableRuns,
+    dismissedRuns,
+    recentHosts,
+    removedRecentHosts,
+  };
+}
+
+/**
+ * Commutative, associative, idempotent merge of two devices' workspace states.
+ * Neither device loses open tabs, running commands, or recent hosts when changes
+ * happen concurrently across devices.
+ */
+export function mergeWorkspaceStates(
+  a?: Partial<SyncedWorkspaceState> | null,
+  b?: Partial<SyncedWorkspaceState> | null,
+  now = Date.now()
+): SyncedWorkspaceState {
+  const closedTabs = mergeTimestampMaps(a?.closedTabs, b?.closedTabs, now);
+  const dismissedRuns = mergeTimestampMaps(a?.dismissedRuns, b?.dismissedRuns, now);
+  const removedRecentHosts = mergeTimestampMaps(a?.removedRecentHosts, b?.removedRecentHosts, now);
+
+  const tabMap = new Map<string, PersistedSessionTab>();
+  for (const raw of [...(a?.openTabs ?? []), ...(b?.openTabs ?? [])]) {
+    const tab = sanitizePersistedTab(raw);
+    if (!tab) continue;
+    const prev = tabMap.get(tab.id);
+    if (!prev) {
+      tabMap.set(tab.id, tab);
+    } else {
+      const newer = tab.updatedAt >= prev.updatedAt ? tab : prev;
+      const older = newer === tab ? prev : tab;
+      tabMap.set(tab.id, {
+        ...newer,
+        createdAt: Math.min(prev.createdAt, tab.createdAt),
+        runId: newer.runId !== undefined ? newer.runId : older.runId,
+      });
+    }
+  }
+  const openTabs = [...tabMap.values()]
+    .filter((tab) => (closedTabs[tab.id] ?? 0) < tab.updatedAt)
+    .sort((x, y) => x.createdAt - y.createdAt || x.id.localeCompare(y.id))
+    .slice(0, MAX_OPEN_TABS);
+
+  const runMap = new Map<string, ResumableRun>();
+  for (const raw of [...(a?.resumableRuns ?? []), ...(b?.resumableRuns ?? [])]) {
+    const run = sanitizeRun(raw);
+    if (!run || now - run.startedAt > MAX_RUN_AGE_MS) continue;
+    const prev = runMap.get(run.id);
+    if (!prev) {
+      runMap.set(run.id, run);
+    } else {
+      const newer =
+        run.updatedAt > prev.updatedAt
+          ? run
+          : run.updatedAt < prev.updatedAt
+            ? prev
+            : !run.running
+              ? run
+              : prev;
+      const older = newer === run ? prev : run;
+      runMap.set(run.id, {
+        ...newer,
+        startedAt: Math.min(prev.startedAt, run.startedAt),
+        updatedAt: Math.max(prev.updatedAt, run.updatedAt),
+        keyChannel: newer.keyChannel ?? older.keyChannel,
+        runLog: newer.runLog ?? older.runLog,
+        detached: Boolean(prev.detached || run.detached),
+        exitCode: newer.running ? undefined : (newer.exitCode ?? older.exitCode),
+      });
+    }
+  }
+  const resumableRuns = [...runMap.values()]
+    .filter((run) => (dismissedRuns[run.id] ?? 0) < run.updatedAt)
+    .sort((x, y) => y.updatedAt - x.updatedAt || x.id.localeCompare(y.id))
+    .slice(0, MAX_RUNS);
+
+  const recentMap = new Map<string, RecentHostEntry>();
+  for (const raw of [...(a?.recentHosts ?? []), ...(b?.recentHosts ?? [])]) {
+    const entry = sanitizeRecent(raw);
+    if (!entry || now - entry.lastConnectedAt > MAX_RUN_AGE_MS) continue;
+    const prev = recentMap.get(entry.key);
+    if (!prev) {
+      recentMap.set(entry.key, entry);
+    } else {
+      const newer = entry.lastConnectedAt >= prev.lastConnectedAt ? entry : prev;
+      recentMap.set(entry.key, {
+        ...newer,
+        connects: Math.max(prev.connects, entry.connects),
+      });
+    }
+  }
+  const recentHosts = [...recentMap.values()]
+    .filter((entry) => (removedRecentHosts[entry.key] ?? 0) < entry.lastConnectedAt)
+    .sort((x, y) => y.lastConnectedAt - x.lastConnectedAt || x.key.localeCompare(y.key))
+    .slice(0, MAX_RECENT_HOSTS);
+
+  const aTs = Number(a?.activeTabUpdatedAt) || 0;
+  const bTs = Number(b?.activeTabUpdatedAt) || 0;
+  const preferredActive = bTs > aTs ? b?.activeTabId : a?.activeTabId;
+  const fallbackActive = bTs > aTs ? a?.activeTabId : b?.activeTabId;
+  const isValidTab = (id?: string | null) =>
+    Boolean(id && (id === "launchpad" || openTabs.some((t) => t.id === id)));
+  const activeTabId = isValidTab(preferredActive)
+    ? preferredActive!
+    : isValidTab(fallbackActive)
+      ? fallbackActive!
+      : openTabs[openTabs.length - 1]?.id ?? "launchpad";
+  const activeTabUpdatedAt = Math.max(aTs, bTs);
+
+  return {
+    openTabs,
+    activeTabId,
+    activeTabUpdatedAt,
+    closedTabs,
+    resumableRuns,
+    dismissedRuns,
+    recentHosts,
+    removedRecentHosts,
+  };
+}
+
+export function readLocalWorkspaceState(now = Date.now()): SyncedWorkspaceState {
+  const tabsState = loadPersistedTabs();
+  const tombstones = loadWorkspaceTombstones(now);
+  return mergeWorkspaceStates(
+    {
+      openTabs: tabsState.openTabs,
+      activeTabId: tabsState.activeTabId,
+      activeTabUpdatedAt: tabsState.activeTabUpdatedAt,
+      closedTabs: tombstones.closedTabs,
+      resumableRuns: loadResumableRuns(now),
+      dismissedRuns: tombstones.dismissedRuns,
+      recentHosts: loadRecentHosts(now),
+      removedRecentHosts: tombstones.removedRecentHosts,
+    },
+    null,
+    now
+  );
+}
+
+export function writeLocalWorkspaceState(state: SyncedWorkspaceState, now = Date.now()): void {
+  writeWorkspaceTombstones(
+    {
+      closedTabs: state.closedTabs,
+      dismissedRuns: state.dismissedRuns,
+      removedRecentHosts: state.removedRecentHosts,
+    },
+    now
+  );
+  savePersistedTabs(state.openTabs, state.activeTabId, state.activeTabUpdatedAt);
+  writeRuns(state.resumableRuns);
+  writeRecentHosts(state.recentHosts);
+}
+
+/**
+ * Finds a still-running command on the remote host that belongs to an SSH tab,
+ * either via its explicit `runId` or by matching `protocol + user + host + port`.
+ */
+export function matchRunningCommandForTab(
+  tab: { protocol: HostProfile["protocol"]; profile: HostProfile; runId?: string | null },
+  runs: ResumableRun[],
+  claimedRunIds?: Set<string>
+): ResumableRun | null {
+  if (tab.protocol !== "ssh") return null;
+  if (tab.runId) {
+    const exact = runs.find(
+      (run) => run.id === tab.runId && run.running && !claimedRunIds?.has(run.id)
+    );
+    if (exact) return exact;
+  }
+  const targetKey = hostHistoryKey(tab.profile);
+  const byHost = runs
+    .filter(
+      (run) =>
+        run.running &&
+        !claimedRunIds?.has(run.id) &&
+        hostHistoryKey(run.profile) === targetKey
+    )
+    .sort((a, b) => b.updatedAt - a.updatedAt)[0];
+  return byHost ?? null;
 }
 
 // ---------------------------------------------------------------------------------

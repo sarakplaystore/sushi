@@ -1,4 +1,10 @@
 import { OS_COMMAND_SNIPPETS } from "./os-commands";
+import {
+  mergeWorkspaceStates,
+  normalizeSyncedWorkspaceState,
+  type PersistedSessionTab,
+  type SyncedWorkspaceState,
+} from "./session-resume";
 import type {
   CommandSnippet,
   HostProfile,
@@ -17,6 +23,8 @@ export interface VaultPlaintext {
   snippets: CommandSnippet[];
   sshKeys?: WhitelistedSshKey[];
   enforceKeyWhitelist?: boolean;
+  /** Encrypted cross-device workspace state (open tabs, running commands, recent hosts). */
+  workspace?: SyncedWorkspaceState;
 }
 
 export interface EncryptedVaultEnvelope {
@@ -178,6 +186,7 @@ export async function decryptVaultEnvelope(
   try {
     const decrypted = await aesGcmDecrypt(key, iv, ciphertext);
     const parsed = JSON.parse(new TextDecoder().decode(decrypted)) as VaultPlaintext;
+    const workspace = normalizeSyncedWorkspaceState(parsed.workspace);
     return {
       version: 1,
       hosts: Array.isArray(parsed.hosts) ? parsed.hosts : [],
@@ -187,6 +196,7 @@ export async function decryptVaultEnvelope(
           : DEFAULT_SNIPPETS,
       sshKeys: Array.isArray(parsed.sshKeys) ? parsed.sshKeys : [],
       enforceKeyWhitelist: Boolean(parsed.enforceKeyWhitelist),
+      ...(workspace ? { workspace } : {}),
     };
   } catch {
     throw new Error(
@@ -281,3 +291,188 @@ export function resolveProfileWithKeychain(
 
   return { ok: true, profile };
 }
+
+/**
+ * Resolves a persisted/synced workspace tab back into a live `HostProfile` using
+ * the unlocked Vault (`hosts` + `sshKeys`). Returns `null` if the tab's host was
+ * deleted and no longer has usable SSH/SFTP credentials.
+ */
+export function resolvePersistedTabProfile(
+  tab: PersistedSessionTab,
+  hosts: HostProfile[],
+  sshKeys: WhitelistedSshKey[],
+  enforceKeyWhitelist = false
+): HostProfile | null {
+  const targetId = tab.hostId ?? tab.profile.id;
+  const targetHost = (tab.profile.host || "").trim().toLowerCase();
+  const targetPort = Number(tab.profile.port || (tab.protocol === "rdp" ? 3389 : 22));
+  const targetUser = (tab.profile.username || "").trim();
+
+  const exactIdAndProto = targetId
+    ? hosts.find((h) => h.id === targetId && h.protocol === tab.protocol)
+    : undefined;
+  const sameIdSibling =
+    !exactIdAndProto && targetId && (tab.protocol === "ssh" || tab.protocol === "sftp")
+      ? hosts.find(
+          (h) => h.id === targetId && (h.protocol === "ssh" || h.protocol === "sftp")
+        )
+      : undefined;
+  const exactIdentity =
+    !exactIdAndProto && !sameIdSibling
+      ? hosts.find(
+          (h) =>
+            h.protocol === tab.protocol &&
+            h.host.trim().toLowerCase() === targetHost &&
+            Number(h.port) === targetPort &&
+            h.username.trim() === targetUser
+        )
+      : undefined;
+  const siblingIdentity =
+    !exactIdAndProto &&
+    !sameIdSibling &&
+    !exactIdentity &&
+    (tab.protocol === "ssh" || tab.protocol === "sftp")
+      ? hosts.find(
+          (h) =>
+            (h.protocol === "ssh" || h.protocol === "sftp") &&
+            h.host.trim().toLowerCase() === targetHost &&
+            Number(h.port) === targetPort &&
+            h.username.trim() === targetUser
+        )
+      : undefined;
+
+  const saved = exactIdAndProto ?? sameIdSibling ?? exactIdentity ?? siblingIdentity;
+  const candidate: HostProfile = saved
+    ? {
+        ...saved,
+        protocol: tab.protocol,
+        initialPath: tab.initialPath ?? saved.initialPath,
+      }
+    : {
+        ...tab.profile,
+        protocol: tab.protocol,
+        initialPath: tab.initialPath ?? tab.profile.initialPath,
+      };
+
+  // Unsaved SSH/SFTP tabs have no persisted secrets outside the vault; skip
+  // restoring them if no saved entry supplies credentials.
+  if (!saved && (tab.protocol === "ssh" || tab.protocol === "sftp")) {
+    const needsSecret =
+      candidate.authMethod === "privateKey"
+        ? !candidate.sshKeyId && !candidate.privateKey
+        : !candidate.password;
+    if (needsSecret) return null;
+  }
+
+  const resolved = resolveProfileWithKeychain(candidate, sshKeys, enforceKeyWhitelist);
+  return resolved.ok ? resolved.profile : null;
+}
+
+function mergeCollectionById<T extends { id: string }>(
+  baseItems: T[] | undefined,
+  localItems: T[],
+  remoteItems: T[],
+  getTimestamp: (item: T) => number
+): T[] {
+  const baseMap = new Map((baseItems ?? []).map((item) => [item.id, item]));
+  const localMap = new Map(localItems.map((item) => [item.id, item]));
+  const remoteMap = new Map(remoteItems.map((item) => [item.id, item]));
+
+  const orderedIds: string[] = [];
+  const seen = new Set<string>();
+  for (const item of [...localItems, ...remoteItems]) {
+    if (!seen.has(item.id)) {
+      seen.add(item.id);
+      orderedIds.push(item.id);
+    }
+  }
+
+  const merged: T[] = [];
+  for (const id of orderedIds) {
+    const b = baseMap.get(id);
+    const l = localMap.get(id);
+    const r = remoteMap.get(id);
+
+    if (l && r) {
+      const lJson = JSON.stringify(l);
+      const rJson = JSON.stringify(r);
+      if (lJson === rJson) {
+        merged.push(l);
+        continue;
+      }
+      const bJson = b ? JSON.stringify(b) : null;
+      if (bJson !== null && lJson === bJson) {
+        merged.push(r);
+      } else if (bJson !== null && rJson === bJson) {
+        merged.push(l);
+      } else {
+        merged.push(getTimestamp(l) >= getTimestamp(r) ? l : r);
+      }
+    } else if (l && !r) {
+      if (!b) {
+        merged.push(l);
+      } else if (JSON.stringify(l) !== JSON.stringify(b)) {
+        merged.push(l);
+      }
+    } else if (!l && r) {
+      if (!b) {
+        merged.push(r);
+      } else if (JSON.stringify(r) !== JSON.stringify(b)) {
+        merged.push(r);
+      }
+    }
+  }
+
+  return merged;
+}
+
+/**
+ * 3-way non-destructive merge of two concurrent `VaultPlaintext` snapshots so
+ * edits or session updates on another device never cause lost data or blocking
+ * conflicts.
+ */
+export function mergeVaultPlaintexts(
+  base: VaultPlaintext | null,
+  local: VaultPlaintext,
+  remote: VaultPlaintext,
+  now = Date.now()
+): VaultPlaintext {
+  const hosts = mergeCollectionById(
+    base?.hosts,
+    local.hosts,
+    remote.hosts,
+    (h) => h.updatedAt || h.createdAt || 0
+  );
+  const sshKeys = mergeCollectionById(
+    base?.sshKeys,
+    local.sshKeys ?? [],
+    remote.sshKeys ?? [],
+    (k) => k.createdAt || 0
+  );
+  const snippets = mergeCollectionById(
+    base?.snippets,
+    local.snippets,
+    remote.snippets,
+    () => 0
+  );
+  const enforceKeyWhitelist = base
+    ? Boolean(local.enforceKeyWhitelist) !== Boolean(base.enforceKeyWhitelist)
+      ? Boolean(local.enforceKeyWhitelist)
+      : Boolean(remote.enforceKeyWhitelist)
+    : Boolean(local.enforceKeyWhitelist || remote.enforceKeyWhitelist);
+
+  const workspace =
+    local.workspace || remote.workspace
+      ? mergeWorkspaceStates(remote.workspace, local.workspace, now)
+      : undefined;
+
+  return {
+    version: 1,
+    hosts,
+    snippets: snippets.length > 0 ? snippets : DEFAULT_SNIPPETS,
+    sshKeys,
+    enforceKeyWhitelist,
+    ...(workspace ? { workspace } : {}),
+  };
+}
+

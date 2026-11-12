@@ -63,7 +63,7 @@ assert.ok(!/filterUnifiedHostsByProtocol\(unifiedHosts/.test(workspace), "filter
 const list = read("src/components/HostNavList.tsx");
 assert.match(list, /filterUnifiedHostsByProtocol\(hosts, protocolFilter\)/, "filter applies to merged hosts");
 assert.match(list, /groupUnifiedHosts\(filtered\)/, "grouped like the vault folders");
-assert.match(list, /hostAccessUrl\(entry\)/, "each row keeps its one URL");
+assert.ok(!list.includes("ArrowLeftRight"), "row does not render the ArrowLeftRight URL icon button");
 assert.match(list, /onOpen\(entry, "rdp"\)/, "RDP action per row");
 assert.match(list, /onOpen\(entry, "sftp"\)/, "SFTP action per row");
 assert.match(list, /onOpen\(entry, "ssh"\)/, "SSH action per row");

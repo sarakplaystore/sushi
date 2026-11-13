@@ -1577,11 +1577,71 @@ export function SushiWorkspace() {
     const nextHosts = change.conflict ? applyIdentityChange(hosts, profile, { moveSiblings: true }).hosts : change.hosts;
     const saved = await persistVault(nextHosts, snippets);
     setHosts(saved.hosts);
+
+    // Keep any already-open tabs for this host (including unsaved `rdp-companion-*`
+    // desktop tabs upgraded via "Edit desktop credentials") synchronized in-place so
+    // live sessions reconnect immediately with the updated account/port/password.
+    const savedById = new Map(saved.hosts.map((h) => [h.id, h]));
+    const normalizedSavedHost = profile.host.trim().toLowerCase();
+    let matchedActiveRdpTabId: string | null = null;
+    let anyTabUpdated = false;
+    const syncedTabs = tabsRef.current.map((tab) => {
+      const direct = savedById.get(tab.profile.id);
+      if (direct && direct.protocol === tab.protocol) {
+        const resolved = resolveProfileWithKeychain(direct, sshKeys, enforceKeyWhitelist);
+        const nextProfile = resolved.ok ? resolved.profile : direct;
+        if (JSON.stringify(nextProfile) !== JSON.stringify(tab.profile)) {
+          anyTabUpdated = true;
+          tabUpdatedAtMapRef.current[tab.id] = Date.now();
+          if (tab.protocol === "rdp" && profile.id === direct.id) {
+            matchedActiveRdpTabId = tab.id;
+          }
+          return {
+            ...tab,
+            title: nextProfile.name || tab.title,
+            profile: nextProfile,
+          };
+        }
+        if (tab.protocol === "rdp" && profile.id === direct.id) {
+          matchedActiveRdpTabId = tab.id;
+        }
+        return tab;
+      }
+
+      if (
+        profile.protocol === "rdp" &&
+        tab.protocol === "rdp" &&
+        tab.profile.id.startsWith("rdp-companion-") &&
+        tab.profile.host.trim().toLowerCase() === normalizedSavedHost
+      ) {
+        const savedRdp = savedById.get(profile.id) ?? profile;
+        anyTabUpdated = true;
+        matchedActiveRdpTabId = tab.id;
+        tabUpdatedAtMapRef.current[tab.id] = Date.now();
+        return {
+          ...tab,
+          title: savedRdp.name || tab.title,
+          profile: savedRdp,
+        };
+      }
+      return tab;
+    });
+
+    if (anyTabUpdated) {
+      setTabs(syncedTabs);
+      persistTabsLocally(syncedTabs, activeTabIdRef.current, false);
+      scheduleWorkspaceSync();
+    }
+
     setHostModalOpen(false);
     setEditingProfile(null);
     setHostModalIntent(null);
     if (connectAfterSave) {
-      openSessionTab(profile);
+      if (matchedActiveRdpTabId) {
+        selectActiveTab(matchedActiveRdpTabId);
+      } else {
+        openSessionTab(profile);
+      }
     }
   };
 
@@ -1846,6 +1906,13 @@ export function SushiWorkspace() {
   );
   const effectiveRdpGuacd = Boolean(
     remoteCaps ? remoteCaps.rdpGuacd : localCaps?.rdpGuacd
+  );
+  const effectiveRdpCleanPath = Boolean(
+    remoteCaps
+      ? remoteCaps.rdpCleanPath
+      : localCaps
+        ? (localCaps.rdpCleanPath ?? true)
+        : true
   );
 
   // ---------------------------------------------------------------------------
@@ -2875,7 +2942,7 @@ export function SushiWorkspace() {
                     <CheckCircle2 className="h-3 w-3" />
                     {effectiveRdpGuacd
                       ? "RDP: Live HTML5 Desktop (guacd)"
-                      : "RDP: X.224/TLS Probe + .rdp / Gateway"}
+                      : "RDP: Live HTML5 Desktop (IronRDP)"}
                   </span>
                   <span className="inline-flex items-center gap-1.5 rounded-lg border border-white/10 bg-white/5 px-2.5 py-1 text-slate-300">
                     <Shield className="h-3 w-3 text-emerald-400" />
@@ -2944,8 +3011,8 @@ export function SushiWorkspace() {
                     New RDP Remote Desktop
                   </h3>
                   <p className="mt-1 text-xs leading-relaxed text-slate-400">
-                    Windows &amp; Linux xrdp streaming via guacd, X.224/NLA probe,
-                    clipboard sync, and .rdp export.
+                    Live HTML5 Windows &amp; Linux xrdp desktop (IronRDP WASM &amp;
+                    guacd), NLA/TLS auth, clipboard sync, and .rdp export.
                   </p>
                 </button>
               </div>
@@ -3273,6 +3340,8 @@ export function SushiWorkspace() {
                     profile={tab.profile}
                     isActive={isActive}
                     guacdAvailable={effectiveRdpGuacd}
+                    websocketAvailable={effectiveWsSsh}
+                    rdpCleanPathAvailable={effectiveRdpCleanPath}
                     gatewaySettings={gatewaySettings}
                     onOpenGatewayModal={() => setGatewayModalOpen(true)}
                     onEditCredentials={() => editRdpConnection(tab)}

@@ -167,6 +167,7 @@ export interface SystemCapabilities {
   serverlessSshExec: boolean;
   serverlessSftp: boolean;
   rdpGuacd: boolean;
+  rdpCleanPath?: boolean;
   rdpProbe: boolean;
   serverVault: boolean;
   storageBackend?: "disk" | "redis" | "turso" | "firestore" | "none";

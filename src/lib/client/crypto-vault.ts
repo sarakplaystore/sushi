@@ -342,17 +342,66 @@ export function resolvePersistedTabProfile(
       : undefined;
 
   const saved = exactIdAndProto ?? sameIdSibling ?? exactIdentity ?? siblingIdentity;
+
+  // Derived "Open via RDP" companion tabs (`rdp-companion-<sourceId>`) strip their
+  // password when persisted; recover credentials from any saved RDP host on that
+  // machine or from the source SSH/SFTP host in the Vault.
+  const companionSourceId =
+    !saved && tab.protocol === "rdp" && targetId?.startsWith("rdp-companion-")
+      ? targetId.slice("rdp-companion-".length)
+      : null;
+  const savedRdpOnSameHost =
+    !saved && tab.protocol === "rdp"
+      ? hosts.find(
+          (h) =>
+            h.protocol === "rdp" &&
+            h.host.trim().toLowerCase() === targetHost &&
+            (h.username.trim() === targetUser || Number(h.port) === targetPort)
+        ) ??
+        (companionSourceId
+          ? hosts.find(
+              (h) => h.protocol === "rdp" && h.host.trim().toLowerCase() === targetHost
+            )
+          : undefined)
+      : undefined;
+  const companionSource =
+    !saved && !savedRdpOnSameHost && companionSourceId
+      ? hosts.find((h) => h.id === companionSourceId) ??
+        hosts.find(
+          (h) =>
+            (h.protocol === "ssh" || h.protocol === "sftp") &&
+            h.host.trim().toLowerCase() === targetHost &&
+            h.username.trim() === targetUser
+        )
+      : undefined;
+
   const candidate: HostProfile = saved
     ? {
         ...saved,
         protocol: tab.protocol,
         initialPath: tab.initialPath ?? saved.initialPath,
       }
-    : {
-        ...tab.profile,
-        protocol: tab.protocol,
-        initialPath: tab.initialPath ?? tab.profile.initialPath,
-      };
+    : savedRdpOnSameHost
+      ? {
+          ...savedRdpOnSameHost,
+          protocol: "rdp",
+        }
+      : companionSource
+        ? {
+            ...tab.profile,
+            protocol: "rdp",
+            authMethod: "password",
+            password:
+              tab.profile.password ??
+              (companionSource.authMethod === "password"
+                ? companionSource.password
+                : undefined),
+          }
+        : {
+            ...tab.profile,
+            protocol: tab.protocol,
+            initialPath: tab.initialPath ?? tab.profile.initialPath,
+          };
 
   // Unsaved SSH/SFTP tabs have no persisted secrets outside the vault; skip
   // restoring them if no saved entry supplies credentials.

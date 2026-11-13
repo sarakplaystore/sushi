@@ -11,7 +11,16 @@ const nextConfig: NextConfig = {
   env: {
     NEXT_PUBLIC_SUSHI_BUILD_ID: buildId,
   },
-  serverExternalPackages: ["ssh2", "ws", "@simplewebauthn/server", "@google-cloud/firestore"],
+  serverExternalPackages: [
+    "ssh2",
+    "ws",
+    "@simplewebauthn/server",
+    "@google-cloud/firestore",
+    "ironrdp-wasm",
+  ],
+  outputFileTracingIncludes: {
+    "/api/rdp/wasm": ["./node_modules/ironrdp-wasm/pkg/rdp_client_bg.wasm"],
+  },
   allowedDevOrigins: ["*.e2b.app", "*.vercel.app"],
   reactStrictMode: true,
   poweredByHeader: false,

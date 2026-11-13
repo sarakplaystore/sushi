@@ -59,7 +59,7 @@ export function resolveGatewayHttpBase(gatewayUrl?: string): string {
  * Uses relative window.location.host when no external gateway URL is set.
  */
 export function buildWebSocketUrl(
-  wsPath: "/ws/ssh" | "/ws/rdp",
+  wsPath: "/ws/ssh" | "/ws/rdp" | "/ws/rdp-cleanpath",
   settings: GatewaySettings
 ): string {
   const raw = settings.gatewayUrl.trim().replace(/\/+$/, "");

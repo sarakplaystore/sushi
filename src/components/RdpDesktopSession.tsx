@@ -33,9 +33,16 @@ import {
   type GatewaySettings,
   buildWebSocketUrl,
   getAuthHeaders,
+  resolveGatewayHttpBase,
 } from "@/lib/client/gateway";
 import { getStoredSessionToken } from "@/lib/client/auth-storage";
 import { downloadRdpFile } from "@/lib/client/rdp-file";
+import {
+  type ActiveIronRdpHandle,
+  connectIronRdpSession,
+  describeIronRdpError,
+} from "@/lib/client/ironrdp-engine";
+import { buildServerlessRdpProxyUrl } from "@/lib/client/rdp-serverless-ws";
 import {
   type RdpPrefs,
   describeRdpStatus,
@@ -53,6 +60,8 @@ interface RdpDesktopSessionProps {
   profile: HostProfile;
   isActive: boolean;
   guacdAvailable: boolean;
+  websocketAvailable?: boolean;
+  rdpCleanPathAvailable?: boolean;
   gatewaySettings: GatewaySettings;
   onOpenGatewayModal: () => void;
   /** Adjust the desktop credentials (Windows user / domain / port). */
@@ -116,13 +125,17 @@ export function RdpDesktopSession({
   profile,
   isActive,
   guacdAvailable,
+  websocketAvailable = false,
+  rdpCleanPathAvailable = true,
   gatewaySettings,
   onOpenGatewayModal,
   onEditCredentials,
 }: RdpDesktopSessionProps) {
   const stageRef = useRef<HTMLDivElement | null>(null);
   const displayHostRef = useRef<HTMLDivElement | null>(null);
+  const ironCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const clientRef = useRef<import("guacamole-common-js").Client | null>(null);
+  const ironHandleRef = useRef<ActiveIronRdpHandle | null>(null);
   const keyboardRef = useRef<import("guacamole-common-js").Keyboard | null>(null);
   /** Root of the drive guacd redirects into the session (upload target). */
   const filesystemRef = useRef<import("guacamole-common-js").GuacamoleObject | null>(null);
@@ -150,9 +163,15 @@ export function RdpDesktopSession({
   });
   const prefsRef = useRef(prefs);
 
-  const shouldAttemptStreamDefault = Boolean(
-    guacdAvailable || gatewaySettings.gatewayUrl.trim()
-  );
+  // Built-in IronRDP WASM + RDCleanPath works on both Vercel Serverless and VPS,
+  // so every valid RDP host connects live in-browser immediately.
+  const shouldAttemptStreamDefault = Boolean((profile.host || "").trim());
+
+  const [guacdFallback, setGuacdFallback] = useState(false);
+  const activeEngine: "guacd" | "ironrdp" =
+    guacdAvailable && !guacdFallback ? "guacd" : "ironrdp";
+  const activeEngineRef = useRef(activeEngine);
+  activeEngineRef.current = activeEngine;
 
   const [streamEnabled, setStreamEnabled] = useState<boolean>(shouldAttemptStreamDefault);
   const [connState, setConnState] = useState<
@@ -198,7 +217,10 @@ export function RdpDesktopSession({
   const setCaptured = useCallback((value: boolean) => {
     keyboardCapturedRef.current = value;
     setKeyboardCaptured(value);
-    if (!value) keyboardRef.current?.reset();
+    if (!value) {
+      keyboardRef.current?.reset();
+      ironHandleRef.current?.releaseAllInputs();
+    }
   }, []);
 
   useEffect(() => {
@@ -211,7 +233,7 @@ export function RdpDesktopSession({
 
   /** Unlocks the Web Audio context; browsers only allow that after a real click. */
   const unlockAudio = useCallback(async () => {
-    if (!prefsRef.current.audio) return;
+    if (!prefsRef.current.audio || activeEngineRef.current !== "guacd") return;
     try {
       const GuacamoleMod = await import("guacamole-common-js");
       const Guacamole = GuacamoleMod.default || GuacamoleMod;
@@ -227,7 +249,8 @@ export function RdpDesktopSession({
   const runProbe = useCallback(async () => {
     setProbing(true);
     try {
-      const res = await fetch("/api/rdp/probe", {
+      const httpBase = resolveGatewayHttpBase(gatewaySettings.gatewayUrl);
+      const res = await fetch(`${httpBase}/api/rdp/probe`, {
         method: "POST",
         headers: getAuthHeaders(gatewaySettings),
         body: JSON.stringify({
@@ -259,22 +282,37 @@ export function RdpDesktopSession({
   }, [runProbe]);
 
   useEffect(() => {
-    if (guacdAvailable || gatewaySettings.gatewayUrl.trim()) {
-      setStreamEnabled(true);
+    if (guacdAvailable) {
+      setGuacdFallback(false);
     }
-  }, [guacdAvailable, gatewaySettings.gatewayUrl]);
+  }, [guacdAvailable]);
 
   const recalcScale = useCallback(() => {
-    const client = clientRef.current;
     const stage = stageRef.current;
-    if (!client || !stage) return;
+    if (!stage) return;
+
+    const availW = Math.max(200, stage.clientWidth - 16);
+    const availH = Math.max(200, stage.clientHeight - 16);
+
+    if (activeEngineRef.current === "ironrdp") {
+      const canvas = ironCanvasRef.current;
+      if (!canvas || !canvas.width || !canvas.height) return;
+      const dw = canvas.width;
+      const dh = canvas.height;
+      const scale = prefsRef.current.fitWindow
+        ? Math.min(1, availW / dw, availH / dh)
+        : Math.min(availW / dw, availH / dh, 1.5);
+      canvas.style.width = `${Math.max(1, Math.round(dw * scale))}px`;
+      canvas.style.height = `${Math.max(1, Math.round(dh * scale))}px`;
+      return;
+    }
+
+    const client = clientRef.current;
+    if (!client) return;
     const display = client.getDisplay();
     const dw = display.getWidth();
     const dh = display.getHeight();
     if (!dw || !dh) return;
-
-    const availW = Math.max(200, stage.clientWidth - 16);
-    const availH = Math.max(200, stage.clientHeight - 16);
 
     if (!prefsRef.current.fitWindow) {
       // Fixed resolution: scale the picture down (or up to 1.5×) to fit the pane.
@@ -288,20 +326,34 @@ export function RdpDesktopSession({
   }, []);
 
   /**
-   * Asks the desktop to match the pane (guacd `resize-method: display-update`).
+   * Asks the desktop to match the pane (`display-update` / IronRDP Display Control).
    * Debounced by the caller; skipped when the change is only a pixel or two.
    */
   const applyRemoteSize = useCallback(
     (force = false) => {
-      const client = clientRef.current;
       const stage = stageRef.current;
-      if (!client || !stage || !connectedRef.current) return;
-      if (!prefsRef.current.fitWindow) return;
+      if (!stage || !connectedRef.current || !prefsRef.current.fitWindow) return;
 
-      const display = client.getDisplay();
       const pane = { width: stage.clientWidth - 8, height: stage.clientHeight - 8 };
-      // Compare against both what we asked for and what the desktop currently is, so
-      // a resize that does not change the picture cannot trigger the next one.
+
+      if (activeEngineRef.current === "ironrdp") {
+        const iron = ironHandleRef.current;
+        const canvas = ironCanvasRef.current;
+        if (!iron || !canvas) return;
+        const target =
+          nextRemoteSize(lastSentSizeRef.current, pane) ??
+          (force
+            ? nextRemoteSize({ width: canvas.width, height: canvas.height }, pane)
+            : null);
+        if (!target) return;
+        lastSentSizeRef.current = target;
+        iron.resize(target.width, target.height);
+        return;
+      }
+
+      const client = clientRef.current;
+      if (!client) return;
+      const display = client.getDisplay();
       const target =
         nextRemoteSize(lastSentSizeRef.current, pane) ??
         (force ? nextRemoteSize({ width: display.getWidth(), height: display.getHeight() }, pane) : null);
@@ -337,7 +389,7 @@ export function RdpDesktopSession({
         setReconnectAttempt(0);
         setConnState("error");
         setErrorMessage(
-          `The desktop stayed unreachable after ${MAX_RECONNECT_ATTEMPTS} automatic retries. Check the VPS gateway and try again.`
+          `The desktop stayed unreachable after ${MAX_RECONNECT_ATTEMPTS} automatic retries. Verify Remote Desktop / port ${profile.port || 3389} is reachable and try again.`
         );
         return;
       }
@@ -358,10 +410,52 @@ export function RdpDesktopSession({
         setConnectSeq((value) => value + 1);
       }, delay);
     },
-    [clearReconnectTimers]
+    [clearReconnectTimers, profile.port]
   );
 
-  // Connect Guacamole HTML5 RDP Client
+  // Reconnect automatically whenever host/account/password/security settings are edited.
+  const profileSignature = useMemo(
+    () =>
+      [
+        profile.host,
+        profile.port || 3389,
+        profile.username,
+        profile.password || "",
+        profile.domain || "",
+        profile.rdpSecurity || "any",
+        profile.ignoreCert !== false ? "1" : "0",
+        profile.rdpWidth || 1280,
+        profile.rdpHeight || 720,
+      ].join("\u0000"),
+    [
+      profile.domain,
+      profile.host,
+      profile.ignoreCert,
+      profile.password,
+      profile.port,
+      profile.rdpHeight,
+      profile.rdpSecurity,
+      profile.rdpWidth,
+      profile.username,
+    ]
+  );
+  const prevProfileSigRef = useRef(profileSignature);
+  useEffect(() => {
+    if (prevProfileSigRef.current === profileSignature) return;
+    prevProfileSigRef.current = profileSignature;
+    clearReconnectTimers();
+    reconnectAttemptRef.current = 0;
+    setReconnectAttempt(0);
+    setErrorMessage(null);
+    setGuacdFallback(false);
+    if ((profile.host || "").trim()) {
+      setStreamEnabled(true);
+      setConnState("connecting");
+      setConnectSeq((value) => value + 1);
+    }
+  }, [clearReconnectTimers, profile.host, profileSignature]);
+
+  // Connect HTML5 RDP Client (Guacamole `guacd` when available, otherwise built-in IronRDP WASM)
   useEffect(() => {
     if (!streamEnabled) return;
 
@@ -369,6 +463,160 @@ export function RdpDesktopSession({
     let resizeObserver: ResizeObserver | null = null;
     let guacKeyboard: import("guacamole-common-js").Keyboard | null = null;
     let resizeTimer: number | null = null;
+
+    const attachResizeObserver = () => {
+      const stageEl = stageRef.current;
+      if (!stageEl) return;
+      resizeObserver = new ResizeObserver(() => {
+        recalcScale();
+        if (resizeTimer) window.clearTimeout(resizeTimer);
+        resizeTimer = window.setTimeout(() => applyRemoteSize(), 350);
+      });
+      resizeObserver.observe(stageEl);
+    };
+
+    async function startIronRdpSession() {
+      const canvasEl = ironCanvasRef.current;
+      if (!canvasEl) return;
+      setConnState("connecting");
+      setErrorMessage(null);
+      connectedRef.current = false;
+
+      const stageEl = stageRef.current;
+      const initial =
+        prefsRef.current.fitWindow && stageEl
+          ? fitRemoteSize(stageEl.clientWidth - 8, stageEl.clientHeight - 8)
+          : {
+              width: profile.rdpWidth || 1280,
+              height: profile.rdpHeight || 720,
+            };
+      lastSentSizeRef.current = initial;
+
+      const useNativeWs =
+        websocketAvailable &&
+        (!gatewaySettings.gatewayUrl.trim() || rdpCleanPathAvailable !== false);
+
+      let proxyAddress: string;
+      if (useNativeWs) {
+        const wsBase = buildWebSocketUrl("/ws/rdp-cleanpath", gatewaySettings);
+        const qp = new URLSearchParams();
+        qp.set("ignoreCert", profile.ignoreCert === false ? "0" : "1");
+        const sessionToken = getStoredSessionToken();
+        if (sessionToken) qp.set("session", sessionToken);
+        if (gatewaySettings.gatewayToken) qp.set("token", gatewaySettings.gatewayToken);
+        proxyAddress = `${wsBase}?${qp.toString()}`;
+      } else {
+        proxyAddress = buildServerlessRdpProxyUrl({
+          httpBase: resolveGatewayHttpBase(gatewaySettings.gatewayUrl),
+          gatewaySettings,
+          ignoreCert: profile.ignoreCert !== false,
+        });
+      }
+
+      const httpBase = resolveGatewayHttpBase(gatewaySettings.gatewayUrl);
+      const wasmUrl = `${httpBase}/api/rdp/wasm`;
+
+      try {
+        const handle = await connectIronRdpSession({
+          canvas: canvasEl,
+          proxyAddress,
+          wasmUrl,
+          host: profile.host,
+          port: profile.port || 3389,
+          username: profile.username,
+          password: profile.password || "",
+          domain: profile.domain || "",
+          rdpSecurity: profile.rdpSecurity || "any",
+          width: initial.width,
+          height: initial.height,
+          isReadOnly: () => prefsRef.current.readOnly,
+          isKeyboardCaptured: () => keyboardCapturedRef.current && isActiveRef.current && !isTypingInField(),
+          onReleaseCapture: () => {
+            setCaptured(false);
+            pushToast("Keyboard released to the browser");
+          },
+          onSyncPasteShortcut: async () => {
+            try {
+              const localText = await navigator.clipboard?.readText();
+              if (localText && ironHandleRef.current) {
+                await ironHandleRef.current.pushClipboardText(localText);
+              }
+            } catch {
+              // Clipboard permission not granted; Clipboard popover remains available
+            }
+          },
+          onRemoteClipboardText: (text) => {
+            setClipboardText(text);
+            if (navigator.clipboard?.writeText && document.hasFocus()) {
+              navigator.clipboard.writeText(text).then(
+                () => pushToast(`Desktop clipboard copied to your clipboard (${text.length} chars)`),
+                () => pushToast("Desktop clipboard updated — open Clipboard to copy it")
+              );
+            }
+          },
+          onDesktopSize: (w, h) => {
+            setRemoteSize({ w, h });
+            recalcScale();
+          },
+          onUploadProgress: (progress) => setUpload(progress),
+          onToast: (msg) => pushToast(msg),
+          onTerminated: ({ clean, reason, error }) => {
+            if (disposed) return;
+            const wasConnected = connectedRef.current;
+            connectedRef.current = false;
+            ironHandleRef.current = null;
+
+            if (!clean && error) {
+              const diag = describeIronRdpError(error);
+              setConnState("error");
+              setErrorMessage(`${diag.title} — ${diag.detail}`);
+              if (diag.retryable) {
+                scheduleReconnect(0);
+              }
+              return;
+            }
+
+            setConnState("closed");
+            setErrorMessage(reason || "The remote desktop session ended.");
+            if (wasConnected) {
+              // Seamless reconnect if a serverless HTTP stream hit its 5-minute window
+              // or a transient network drop occurred while the desktop was live.
+              scheduleReconnect(0);
+            }
+          },
+        });
+
+        if (disposed) {
+          handle.shutdown();
+          return;
+        }
+
+        ironHandleRef.current = handle;
+        connectedRef.current = true;
+        reconnectAttemptRef.current = 0;
+        setReconnectAttempt(0);
+        setDriveLabel("Clipboard");
+        setConnState("connected");
+        setCaptured(true);
+        recalcScale();
+        attachResizeObserver();
+        window.setTimeout(() => {
+          if (!disposed) {
+            canvasEl.focus({ preventScroll: true });
+            applyRemoteSize(false);
+          }
+        }, 80);
+      } catch (err) {
+        if (disposed) return;
+        connectedRef.current = false;
+        const diag = describeIronRdpError(err);
+        setConnState("error");
+        setErrorMessage(`${diag.title} — ${diag.detail}`);
+        if (diag.retryable) {
+          scheduleReconnect(0);
+        }
+      }
+    }
 
     async function startGuacSession() {
       if (!displayHostRef.current) return;
@@ -398,6 +646,15 @@ export function RdpDesktopSession({
       tunnel.onerror = (status) => {
         if (disposed) return;
         connectedRef.current = false;
+        if (
+          (status.code === 0x0202 || status.code === 0x0206 || status.code === 514 || status.code === 518) &&
+          profile.rdpSecurity !== "rdp"
+        ) {
+          // guacd daemon or /ws/rdp was unreachable: switch seamlessly to built-in IronRDP WASM.
+          setGuacdFallback(true);
+          setConnectSeq((value) => value + 1);
+          return;
+        }
         setConnState("error");
         setErrorMessage(describeRdpStatus(status.code, status.message));
         scheduleReconnect(status.code);
@@ -573,18 +830,14 @@ export function RdpDesktopSession({
       }
 
       client.connect(queryParts.join("&"));
-
-      if (stageEl) {
-        resizeObserver = new ResizeObserver(() => {
-          recalcScale();
-          if (resizeTimer) window.clearTimeout(resizeTimer);
-          resizeTimer = window.setTimeout(() => applyRemoteSize(), 350);
-        });
-        resizeObserver.observe(stageEl);
-      }
+      attachResizeObserver();
     }
 
-    void startGuacSession();
+    if (activeEngine === "guacd") {
+      void startGuacSession();
+    } else {
+      void startIronRdpSession();
+    }
 
     return () => {
       disposed = true;
@@ -595,6 +848,12 @@ export function RdpDesktopSession({
       resizeObserver?.disconnect();
       guacKeyboard?.reset();
       try {
+        ironHandleRef.current?.shutdown();
+      } catch {
+        // ignore
+      }
+      ironHandleRef.current = null;
+      try {
         clientRef.current?.disconnect();
       } catch {
         // ignore
@@ -602,7 +861,7 @@ export function RdpDesktopSession({
       clientRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [streamEnabled, connectSeq]);
+  }, [streamEnabled, connectSeq, activeEngine]);
 
   useEffect(() => {
     recalcScale();
@@ -620,6 +879,11 @@ export function RdpDesktopSession({
       const text = event.clipboardData?.getData("text/plain");
       if (!text) return;
       event.preventDefault();
+      if (ironHandleRef.current) {
+        void ironHandleRef.current.pushClipboardText(text);
+        pushToast("Pasted into the desktop clipboard");
+        return;
+      }
       const client = clientRef.current;
       if (!client) return;
       void (async () => {
@@ -679,6 +943,14 @@ export function RdpDesktopSession({
   const uploadFiles = useCallback(
     async (files: File[]) => {
       if (!files.length) return;
+      if (ironHandleRef.current) {
+        try {
+          await ironHandleRef.current.uploadFiles(files);
+        } catch (err) {
+          pushToast(err instanceof Error ? err.message : "Upload failed.");
+        }
+        return;
+      }
       const object = filesystemRef.current;
       if (!object) {
         pushToast("This desktop did not offer a drive, so uploads are unavailable.");
@@ -719,6 +991,11 @@ export function RdpDesktopSession({
   );
 
   const sendKeyCombo = (keys: number[]) => {
+    if (ironHandleRef.current) {
+      ironHandleRef.current.sendKeyCombo(keys);
+      setShowSpecialKeys(false);
+      return;
+    }
     const client = clientRef.current;
     if (!client) return;
     for (const k of keys) client.sendKeyEvent(1, k);
@@ -727,6 +1004,10 @@ export function RdpDesktopSession({
   };
 
   const pushClipboardToRemote = async (text: string) => {
+    if (ironHandleRef.current) {
+      await ironHandleRef.current.pushClipboardText(text);
+      return;
+    }
     const client = clientRef.current;
     if (!client) return;
     const GuacamoleMod = await import("guacamole-common-js");
@@ -738,9 +1019,13 @@ export function RdpDesktopSession({
   };
 
   const captureScreenshot = () => {
-    const client = clientRef.current;
-    if (!client) return;
-    const canvas = client.getDisplay().flatten();
+    let canvas: HTMLCanvasElement | null = null;
+    if (activeEngineRef.current === "ironrdp") {
+      canvas = ironCanvasRef.current;
+    } else if (clientRef.current) {
+      canvas = clientRef.current.getDisplay().flatten();
+    }
+    if (!canvas) return;
     const url = canvas.toDataURL("image/png");
     const a = document.createElement("a");
     a.href = url;
@@ -875,13 +1160,16 @@ export function RdpDesktopSession({
                 onClick={() => {
                   const nextFit = !prefs.fitWindow;
                   applyPrefs({ fitWindow: nextFit });
-                  const client = clientRef.current;
-                  if (!nextFit && client) {
+                  if (!nextFit) {
                     // Back to the resolution stored on the host.
                     const width = profile.rdpWidth || 1280;
                     const height = profile.rdpHeight || 720;
                     lastSentSizeRef.current = { width, height };
-                    client.sendSize(width, height);
+                    if (ironHandleRef.current) {
+                      ironHandleRef.current.resize(width, height);
+                    } else if (clientRef.current) {
+                      clientRef.current.sendSize(width, height);
+                    }
                   } else {
                     window.setTimeout(() => applyRemoteSize(true), 80);
                   }
@@ -1252,8 +1540,8 @@ export function RdpDesktopSession({
         onDrop={(event) => {
           event.preventDefault();
           setDragging(false);
-          if (!filesystemRef.current) {
-            pushToast("This desktop did not offer a drive, so uploads are unavailable.");
+          if (!ironHandleRef.current && !filesystemRef.current) {
+            pushToast("This desktop did not offer a file transfer channel, so uploads are unavailable.");
             return;
           }
           void uploadFiles(Array.from(event.dataTransfer.files));
@@ -1271,7 +1559,16 @@ export function RdpDesktopSession({
           ref={displayHostRef}
           tabIndex={-1}
           className={`flex items-center justify-center outline-none ${
-            showDiagnosticsPanel ? "hidden" : "block"
+            showDiagnosticsPanel || activeEngine !== "guacd" ? "hidden" : "block"
+          }`}
+        />
+
+        {/* Built-in IronRDP WebAssembly Canvas */}
+        <canvas
+          ref={ironCanvasRef}
+          tabIndex={0}
+          className={`outline-none ${
+            showDiagnosticsPanel || activeEngine !== "ironrdp" ? "hidden" : "block"
           }`}
         />
 
@@ -1282,8 +1579,9 @@ export function RdpDesktopSession({
               Connecting HTML5 RDP Desktop to {profile.host}:{profile.port || 3389}...
             </div>
             <div className="mt-1 text-xs text-slate-400">
-              Negotiating X.224 / {profile.rdpSecurity?.toUpperCase() || "ANY"} via guacd ·{" "}
-              {performanceLabel} quality
+              Negotiating X.224 / {profile.rdpSecurity?.toUpperCase() || "ANY"} via{" "}
+              {activeEngine === "guacd" ? "guacd" : "IronRDP WebAssembly"} · {performanceLabel}{" "}
+              quality
             </div>
           </div>
         )}
@@ -1473,14 +1771,23 @@ export function RdpDesktopSession({
               </div>
 
               {/* Launch Actions */}
-              <div className="mt-5 grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <div className="mt-5 grid grid-cols-1 gap-3 sm:grid-cols-3">
+                <button
+                  type="button"
+                  onClick={reconnectNow}
+                  className="flex items-center justify-center gap-2 rounded-xl bg-[#ff6b57] px-4 py-3 text-xs font-semibold text-white shadow-lg shadow-[#ff6b57]/20 transition hover:bg-[#ff7f6e]"
+                >
+                  <RotateCw className="h-4 w-4" />
+                  Connect Live in Browser
+                </button>
+
                 <button
                   type="button"
                   onClick={() => downloadRdpFile(profile)}
-                  className="flex items-center justify-center gap-2 rounded-xl bg-[#ff6b57] px-4 py-3 text-xs font-semibold text-white shadow-lg shadow-[#ff6b57]/20 transition hover:bg-[#ff7f6e]"
+                  className="flex items-center justify-center gap-2 rounded-xl border border-white/12 bg-white/6 px-4 py-3 text-xs font-semibold text-white transition hover:bg-white/12"
                 >
                   <Download className="h-4 w-4" />
-                  Launch Native .rdp Client
+                  Download .rdp Client
                 </button>
 
                 <button
@@ -1489,17 +1796,16 @@ export function RdpDesktopSession({
                   className="flex items-center justify-center gap-2 rounded-xl border border-white/12 bg-white/6 px-4 py-3 text-xs font-semibold text-white transition hover:bg-white/12"
                 >
                   <Radio className="h-4 w-4 text-emerald-400" />
-                  Configure VPS Gateway (guacd)
+                  VPS Gateway (Optional)
                 </button>
               </div>
 
               <p className="mt-4 text-[11px] leading-relaxed text-slate-400">
-                Live browser RDP streaming uses Apache Guacamole&apos;s{" "}
-                <code className="font-mono-code text-slate-300">guacd</code> daemon
-                included in <code className="font-mono-code text-slate-300">docker-compose.yml</code>.
-                Self-host on a VPS with <code className="font-mono-code text-slate-300">docker compose up -d</code>{" "}
-                or attach your VPS Gateway URL to stream full desktop sessions directly inside
-                this tab.
+                Live in-browser HTML5 RDP runs out of the box via{" "}
+                <code className="font-mono-code text-slate-300">IronRDP WebAssembly</code>{" "}
+                (TLS &amp; CredSSP/NLA) on both Vercel Serverless and Node, and automatically
+                accelerates with <code className="font-mono-code text-slate-300">guacd</code>{" "}
+                when a self-hosted Docker Compose or VPS Gateway is connected.
               </p>
             </div>
           </div>

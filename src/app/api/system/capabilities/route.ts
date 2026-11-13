@@ -31,6 +31,7 @@ export async function GET(req: NextRequest) {
     serverlessSshExec: true,
     serverlessSftp: true,
     rdpGuacd: guacdOk,
+    rdpCleanPath: true,
     rdpProbe: true,
     serverVault: isServerVaultEnabled(),
     storageBackend: getStateStoreKind(),

@@ -13,6 +13,7 @@ import type {
 import {
   aesGcmDecrypt,
   aesGcmEncrypt,
+  isNativeWebCryptoAvailable,
   pbkdf2Sha256,
   randomBytes,
 } from "./web-crypto";
@@ -91,11 +92,13 @@ export const DEFAULT_SNIPPETS: CommandSnippet[] = [
 ];
 
 function bytesToBase64(bytes: Uint8Array): string {
-  let binary = "";
-  for (let i = 0; i < bytes.byteLength; i++) {
-    binary += String.fromCharCode(bytes[i]);
+  const CHUNK_SIZE = 0x2000;
+  const parts: string[] = [];
+  for (let i = 0; i < bytes.byteLength; i += CHUNK_SIZE) {
+    const slice = bytes.subarray(i, i + CHUNK_SIZE);
+    parts.push(String.fromCharCode(...slice));
   }
-  return btoa(binary);
+  return btoa(parts.join(""));
 }
 
 function base64ToBytes(b64: string): Uint8Array {
@@ -122,22 +125,47 @@ async function getOrCreateDeviceKey(): Promise<Uint8Array> {
   return key;
 }
 
+const DERIVED_KEY_CACHE_LIMIT = 8;
+const derivedKeyCache = new Map<string, Uint8Array>();
+
 export async function derivePassphraseKey(
   passphrase: string,
   saltBytes: Uint8Array
 ): Promise<Uint8Array> {
-  return pbkdf2Sha256(passphrase, saltBytes, 210000, 32);
+  const engineTag = isNativeWebCryptoAvailable() ? "native" : "pure";
+  const cacheKey = `${engineTag}:${bytesToBase64(saltBytes)}:${passphrase}`;
+  const cached = derivedKeyCache.get(cacheKey);
+  if (cached) {
+    derivedKeyCache.delete(cacheKey);
+    derivedKeyCache.set(cacheKey, cached);
+    return cached;
+  }
+
+  const derived = await pbkdf2Sha256(passphrase, saltBytes, 210000, 32);
+  if (derivedKeyCache.size >= DERIVED_KEY_CACHE_LIMIT) {
+    const oldestKey = derivedKeyCache.keys().next().value;
+    if (oldestKey !== undefined) derivedKeyCache.delete(oldestKey);
+  }
+  derivedKeyCache.set(cacheKey, derived);
+  return derived;
 }
 
 export async function encryptVaultData(
   data: VaultPlaintext,
-  passphrase?: string | null
+  passphrase?: string | null,
+  options?: { reuseSalt?: string | null }
 ): Promise<EncryptedVaultEnvelope> {
   const iv = randomBytes(12);
   const encoded = new TextEncoder().encode(JSON.stringify(data));
 
   if (passphrase && passphrase.length > 0) {
-    const salt = randomBytes(16);
+    let salt: Uint8Array;
+    if (options?.reuseSalt) {
+      const parsed = base64ToBytes(options.reuseSalt);
+      salt = parsed.byteLength >= 16 ? parsed : randomBytes(16);
+    } else {
+      salt = randomBytes(16);
+    }
     const key = await derivePassphraseKey(passphrase, salt);
     const encrypted = await aesGcmEncrypt(key, iv, encoded);
     return {

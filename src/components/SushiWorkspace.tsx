@@ -969,7 +969,15 @@ export function SushiWorkspace() {
 
           let baseRevision = syncRevisionRef.current;
           let baseLocalEnvelope = pendingEnvelopeRef.current;
-          let envelope = await encryptVaultData(desiredPlain, passToUse);
+          const canReuseExistingSalt =
+            passphraseOverride === undefined &&
+            explicitMode === undefined &&
+            explicitSource === undefined &&
+            baseLocalEnvelope?.mode === "passphrase" &&
+            (baseLocalEnvelope.keySource ?? "independent") === source;
+          let envelope = await encryptVaultData(desiredPlain, passToUse, {
+            reuseSalt: canReuseExistingSalt ? baseLocalEnvelope?.salt : null,
+          });
           envelope.keySource = source;
 
           if (localCaps?.serverVault) {
@@ -1002,7 +1010,12 @@ export function SushiWorkspace() {
                     );
                     baseRevision = latestRemote.revision;
                     baseLocalEnvelope = latestRemote.envelope;
-                    envelope = await encryptVaultData(desiredPlain, passToUse);
+                    envelope = await encryptVaultData(desiredPlain, passToUse, {
+                      reuseSalt:
+                        canReuseExistingSalt && latestRemote.envelope.mode === "passphrase"
+                          ? latestRemote.envelope.salt
+                          : null,
+                    });
                     envelope.keySource = source;
                     continue;
                   }
@@ -2124,11 +2137,13 @@ export function SushiWorkspace() {
         aria-modal={mobileSidebarOpen || undefined}
         aria-label="Host navigation"
         className={`workspace-sidebar fixed inset-y-0 left-0 z-50 flex w-[min(20rem,calc(100vw-3rem))] shrink-0 flex-col border-r border-white/8 bg-[#0d1118] pt-[env(safe-area-inset-top)] pb-[env(safe-area-inset-bottom)] pl-[env(safe-area-inset-left)] transition-transform duration-200 motion-reduce:transition-none md:relative md:inset-auto md:z-auto md:h-full md:w-68 md:translate-x-0 md:p-0 ${
-          mobileSidebarOpen ? "translate-x-0" : "invisible -translate-x-full md:visible"
+          mobileSidebarOpen
+            ? "pointer-events-auto translate-x-0"
+            : "pointer-events-none invisible -translate-x-full md:pointer-events-auto md:visible"
         } ${sidebarOpen ? "md:flex" : "md:hidden"}`}
       >
           {/* Brand Header */}
-          <div className="flex items-center justify-between border-b border-white/8 px-4 py-3.5">
+          <div className="flex shrink-0 items-center justify-between border-b border-white/8 px-4 py-3.5">
             <button
               type="button"
               onClick={() => {
@@ -2184,7 +2199,7 @@ export function SushiWorkspace() {
           {/* The mobile drawer leads with the list, so it carries no second search box. */}
           {isPhoneLayout ? (
             <>
-              <div className="p-3 pb-1.5">
+              <div className="shrink-0 p-3 pb-1.5">
                 <button
                   type="button"
                   onClick={() => {
@@ -2199,7 +2214,7 @@ export function SushiWorkspace() {
                   New Connection
                 </button>
               </div>
-              <div className="pb-2">
+              <div className="flex min-h-0 flex-1 flex-col overflow-hidden px-3 pb-2">
                 <HostNavList
                   variant="page"
                   hosts={unifiedHosts}
@@ -2232,7 +2247,7 @@ export function SushiWorkspace() {
           )}
 
           {/* Sidebar Bottom Controls */}
-          <div className="space-y-1.5 border-t border-white/8 p-3">
+          <div className="shrink-0 space-y-1.5 border-t border-white/8 p-3">
             <button
               type="button"
               onClick={() => {
@@ -2480,7 +2495,9 @@ export function SushiWorkspace() {
           <div
             className={
               activeTabId === "launchpad"
-                ? "h-full w-full overflow-y-auto overscroll-contain p-3 pb-6 sm:p-8"
+                ? isPhoneLayout && mobileHome === "hosts"
+                  ? "flex h-full w-full flex-col overflow-hidden p-3 pb-3 sm:p-8"
+                  : "h-full w-full overflow-y-auto overscroll-contain p-3 pb-6 sm:p-8"
                 : "hidden"
             }
           >
@@ -3139,9 +3156,9 @@ export function SushiWorkspace() {
             </div>
 
             {isPhoneLayout && mobileHome === "hosts" && (
-              <div className="flex h-full flex-col">
+              <div className="flex min-h-0 flex-1 flex-col">
                 {/* Recently connected stays on top on a phone too. */}
-                <div className="mb-3 space-y-2 rounded-2xl border border-white/8 bg-[#0c1017] p-3">
+                <div className="mb-3 max-h-[34dvh] shrink-0 space-y-2 overflow-y-auto rounded-2xl border border-white/8 bg-[#0c1017] p-3">
                   <div className="flex items-center justify-between">
                     <h2 className="flex items-center gap-1.5 text-xs font-semibold text-white">
                       <Clock className="h-3.5 w-3.5 text-slate-400" />

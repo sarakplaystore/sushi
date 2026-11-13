@@ -26,6 +26,7 @@ body {
   height: 100%;
   margin: 0;
   padding: 0;
+  overscroll-behavior: none;
   background-color: var(--bg-canvas);
   color: var(--text-primary);
   font-family:
@@ -38,6 +39,18 @@ body {
     sans-serif;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+  -webkit-tap-highlight-color: transparent;
+}
+
+button,
+a,
+summary,
+[role="button"],
+[role="tab"],
+input,
+select,
+textarea {
+  touch-action: manipulation;
 }
 
 /* Standalone iOS web apps can extend behind the notch and home indicator. */

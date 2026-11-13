@@ -346,6 +346,7 @@ export interface ConnectIronRdpOptions {
 export interface ActiveIronRdpHandle {
   resize: (width: number, height: number) => void;
   sendKeyCombo: (keysyms: number[]) => void;
+  typeText: (text: string) => void;
   pushClipboardText: (text: string) => Promise<void>;
   uploadFiles: (files: File[]) => Promise<void>;
   releaseAllInputs: () => void;
@@ -700,21 +701,30 @@ export async function connectIronRdpSession(
     }
   };
 
-  const onMouseMove = (e: MouseEvent) => {
-    if (disposed || !activeSession || opts.isReadOnly()) return;
+  let lastTouchEventAt = 0;
+
+  const clientToCanvasCoords = (clientX: number, clientY: number) => {
     const rect = canvas.getBoundingClientRect();
-    if (rect.width <= 0 || rect.height <= 0) return;
+    if (rect.width <= 0 || rect.height <= 0) return null;
     const x = Math.max(
       0,
-      Math.min(canvas.width - 1, Math.round(((e.clientX - rect.left) / rect.width) * canvas.width))
+      Math.min(canvas.width - 1, Math.round(((clientX - rect.left) / rect.width) * canvas.width))
     );
     const y = Math.max(
       0,
-      Math.min(canvas.height - 1, Math.round(((e.clientY - rect.top) / rect.height) * canvas.height))
+      Math.min(canvas.height - 1, Math.round(((clientY - rect.top) / rect.height) * canvas.height))
     );
+    return { x, y };
+  };
+
+  const onMouseMove = (e: MouseEvent) => {
+    if (Date.now() - lastTouchEventAt < 600) return;
+    if (disposed || !activeSession || opts.isReadOnly()) return;
+    const pt = clientToCanvasCoords(e.clientX, e.clientY);
+    if (!pt) return;
     try {
       const tx = new InputTransaction();
-      tx.addEvent(DeviceEvent.mouseMove(x, y));
+      tx.addEvent(DeviceEvent.mouseMove(pt.x, pt.y));
       activeSession.applyInputs(tx);
     } catch {
       // ignore
@@ -722,6 +732,7 @@ export async function connectIronRdpSession(
   };
 
   const onMouseDown = (e: MouseEvent) => {
+    if (Date.now() - lastTouchEventAt < 600) return;
     if (disposed || !activeSession) return;
     e.preventDefault();
     canvas.focus({ preventScroll: true });
@@ -738,6 +749,8 @@ export async function connectIronRdpSession(
         // ignore
       }
       const tx = new InputTransaction();
+      const pt = clientToCanvasCoords(e.clientX, e.clientY);
+      if (pt) tx.addEvent(DeviceEvent.mouseMove(pt.x, pt.y));
       tx.addEvent(DeviceEvent.mouseButtonPressed(e.button));
       activeSession.applyInputs(tx);
     } catch {
@@ -746,6 +759,7 @@ export async function connectIronRdpSession(
   };
 
   const onMouseUp = (e: MouseEvent) => {
+    if (Date.now() - lastTouchEventAt < 600) return;
     if (disposed || !activeSession || opts.isReadOnly()) return;
     e.preventDefault();
     try {
@@ -754,6 +768,203 @@ export async function connectIronRdpSession(
       activeSession.applyInputs(tx);
     } catch {
       // ignore
+    }
+  };
+
+  // Mobile touch -> RDP pointer / right-click / drag / two-finger scroll
+  let touchStartAt = 0;
+  let touchStartX = 0;
+  let touchStartY = 0;
+  let touchMoved = false;
+  let touchRightClicked = false;
+  let touchDraggingButton0 = false;
+  let lastTapAt = 0;
+  let lastTapX = 0;
+  let lastTapY = 0;
+  let twoFingerPrevX = 0;
+  let twoFingerPrevY = 0;
+  let longPressTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const clearLongPress = () => {
+    if (longPressTimer !== null) {
+      clearTimeout(longPressTimer);
+      longPressTimer = null;
+    }
+  };
+
+  const onTouchStart = (e: TouchEvent) => {
+    if (disposed || !activeSession) return;
+    lastTouchEventAt = Date.now();
+    e.preventDefault();
+    if (opts.isReadOnly()) return;
+
+    if (e.touches.length === 2) {
+      clearLongPress();
+      if (touchDraggingButton0) {
+        touchDraggingButton0 = false;
+        try {
+          const tx = new InputTransaction();
+          tx.addEvent(DeviceEvent.mouseButtonReleased(0));
+          activeSession.applyInputs(tx);
+        } catch {
+          // ignore
+        }
+      }
+      twoFingerPrevX = (e.touches[0].clientX + e.touches[1].clientX) / 2;
+      twoFingerPrevY = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+      touchMoved = true;
+      return;
+    }
+
+    if (e.touches.length !== 1) return;
+    const t = e.touches[0];
+    const now = Date.now();
+    touchStartAt = now;
+    touchStartX = t.clientX;
+    touchStartY = t.clientY;
+    touchMoved = false;
+    touchRightClicked = false;
+
+    const pt = clientToCanvasCoords(t.clientX, t.clientY);
+    if (pt) {
+      try {
+        const tx = new InputTransaction();
+        tx.addEvent(DeviceEvent.mouseMove(pt.x, pt.y));
+        // Double-tap-and-hold starts a left-button drag (window move / text selection)
+        const isDoubleTapHold =
+          now - lastTapAt < 350 &&
+          Math.hypot(t.clientX - lastTapX, t.clientY - lastTapY) < 28;
+        if (isDoubleTapHold) {
+          touchDraggingButton0 = true;
+          tx.addEvent(DeviceEvent.mouseButtonPressed(0));
+        }
+        activeSession.applyInputs(tx);
+      } catch {
+        // ignore
+      }
+    }
+
+    clearLongPress();
+    if (!touchDraggingButton0) {
+      longPressTimer = setTimeout(() => {
+        longPressTimer = null;
+        if (disposed || !activeSession || touchMoved || opts.isReadOnly()) return;
+        touchRightClicked = true;
+        try {
+          if (typeof navigator !== "undefined" && typeof navigator.vibrate === "function") {
+            navigator.vibrate(15);
+          }
+          const tx = new InputTransaction();
+          tx.addEvent(DeviceEvent.mouseButtonPressed(2));
+          tx.addEvent(DeviceEvent.mouseButtonReleased(2));
+          activeSession.applyInputs(tx);
+        } catch {
+          // ignore
+        }
+      }, 480);
+    }
+  };
+
+  const onTouchMove = (e: TouchEvent) => {
+    if (disposed || !activeSession) return;
+    lastTouchEventAt = Date.now();
+    e.preventDefault();
+    if (opts.isReadOnly()) return;
+
+    if (e.touches.length === 2) {
+      clearLongPress();
+      const midX = (e.touches[0].clientX + e.touches[1].clientX) / 2;
+      const midY = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+      const dy = midY - twoFingerPrevY;
+      const dx = midX - twoFingerPrevX;
+      if (Math.abs(dy) >= 14) {
+        twoFingerPrevY = midY;
+        try {
+          const tx = new InputTransaction();
+          tx.addEvent(DeviceEvent.wheelRotations(true, dy > 0 ? 1 : -1, 1));
+          activeSession.applyInputs(tx);
+        } catch {
+          // ignore
+        }
+      }
+      if (Math.abs(dx) >= 14) {
+        twoFingerPrevX = midX;
+        try {
+          const tx = new InputTransaction();
+          tx.addEvent(DeviceEvent.wheelRotations(false, dx > 0 ? -1 : 1, 1));
+          activeSession.applyInputs(tx);
+        } catch {
+          // ignore
+        }
+      }
+      return;
+    }
+
+    if (e.touches.length !== 1) return;
+    const t = e.touches[0];
+    if (!touchMoved && Math.hypot(t.clientX - touchStartX, t.clientY - touchStartY) > 9) {
+      touchMoved = true;
+      clearLongPress();
+    }
+    const pt = clientToCanvasCoords(t.clientX, t.clientY);
+    if (!pt) return;
+    try {
+      const tx = new InputTransaction();
+      tx.addEvent(DeviceEvent.mouseMove(pt.x, pt.y));
+      activeSession.applyInputs(tx);
+    } catch {
+      // ignore
+    }
+  };
+
+  const onTouchEnd = (e: TouchEvent) => {
+    if (disposed || !activeSession) return;
+    lastTouchEventAt = Date.now();
+    e.preventDefault();
+    clearLongPress();
+    if (opts.isReadOnly()) return;
+
+    if (touchDraggingButton0 && e.touches.length === 0) {
+      touchDraggingButton0 = false;
+      try {
+        const tx = new InputTransaction();
+        tx.addEvent(DeviceEvent.mouseButtonReleased(0));
+        activeSession.applyInputs(tx);
+      } catch {
+        // ignore
+      }
+      return;
+    }
+
+    if (!touchMoved && !touchRightClicked && e.changedTouches.length === 1 && Date.now() - touchStartAt < 480) {
+      const t = e.changedTouches[0];
+      lastTapAt = Date.now();
+      lastTapX = t.clientX;
+      lastTapY = t.clientY;
+      const pt = clientToCanvasCoords(t.clientX, t.clientY);
+      try {
+        const tx = new InputTransaction();
+        if (pt) tx.addEvent(DeviceEvent.mouseMove(pt.x, pt.y));
+        tx.addEvent(DeviceEvent.mouseButtonPressed(0));
+        tx.addEvent(DeviceEvent.mouseButtonReleased(0));
+        activeSession.applyInputs(tx);
+      } catch {
+        // ignore
+      }
+    }
+  };
+
+  const onTouchCancel = () => {
+    clearLongPress();
+    if (touchDraggingButton0 && activeSession && !disposed) {
+      touchDraggingButton0 = false;
+      try {
+        const tx = new InputTransaction();
+        tx.addEvent(DeviceEvent.mouseButtonReleased(0));
+        activeSession.applyInputs(tx);
+      } catch {
+        // ignore
+      }
     }
   };
 
@@ -789,6 +1000,9 @@ export async function connectIronRdpSession(
     }
   };
 
+  if (canvas.style) {
+    canvas.style.touchAction = "none";
+  }
   if (typeof window !== "undefined") {
     window.addEventListener("keydown", onKeyDown, true);
     window.addEventListener("keyup", onKeyUp, true);
@@ -799,8 +1013,13 @@ export async function connectIronRdpSession(
   canvas.addEventListener("mouseup", onMouseUp);
   canvas.addEventListener("wheel", onWheel, { passive: false });
   canvas.addEventListener("contextmenu", onContextMenu);
+  canvas.addEventListener("touchstart", onTouchStart, { passive: false });
+  canvas.addEventListener("touchmove", onTouchMove, { passive: false });
+  canvas.addEventListener("touchend", onTouchEnd, { passive: false });
+  canvas.addEventListener("touchcancel", onTouchCancel);
 
   const detachListeners = () => {
+    clearLongPress();
     if (typeof window !== "undefined") {
       window.removeEventListener("keydown", onKeyDown, true);
       window.removeEventListener("keyup", onKeyUp, true);
@@ -811,6 +1030,10 @@ export async function connectIronRdpSession(
     canvas.removeEventListener("mouseup", onMouseUp);
     canvas.removeEventListener("wheel", onWheel);
     canvas.removeEventListener("contextmenu", onContextMenu);
+    canvas.removeEventListener("touchstart", onTouchStart);
+    canvas.removeEventListener("touchmove", onTouchMove);
+    canvas.removeEventListener("touchend", onTouchEnd);
+    canvas.removeEventListener("touchcancel", onTouchCancel);
   };
 
   // Start IronRDP event loop in background
@@ -869,6 +1092,30 @@ export async function connectIronRdpSession(
         activeSession.applyInputs(upTx);
       } catch {
         // ignore
+      }
+    },
+    typeText(text: string) {
+      if (disposed || !activeSession || opts.isReadOnly() || !text) return;
+      for (const ch of text) {
+        try {
+          const tx = new InputTransaction();
+          if (ch === "\r" || ch === "\n") {
+            tx.addEvent(DeviceEvent.keyPressed(0x1c));
+            tx.addEvent(DeviceEvent.keyReleased(0x1c));
+          } else if (ch === "\b" || ch === "\x7f") {
+            tx.addEvent(DeviceEvent.keyPressed(0x0e));
+            tx.addEvent(DeviceEvent.keyReleased(0x0e));
+          } else if (ch === "\t") {
+            tx.addEvent(DeviceEvent.keyPressed(0x0f));
+            tx.addEvent(DeviceEvent.keyReleased(0x0f));
+          } else {
+            tx.addEvent(DeviceEvent.unicodePressed(ch));
+            tx.addEvent(DeviceEvent.unicodeReleased(ch));
+          }
+          activeSession.applyInputs(tx);
+        } catch {
+          // ignore
+        }
       }
     },
     async pushClipboardText(text: string) {

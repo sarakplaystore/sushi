@@ -135,6 +135,8 @@ export function RdpDesktopSession({
   /** Root of the drive guacd redirects into the session (upload target). */
   const filesystemRef = useRef<import("guacamole-common-js").GuacamoleObject | null>(null);
   const uploadInputRef = useRef<HTMLInputElement | null>(null);
+  const mobileKeyboardRef = useRef<HTMLTextAreaElement | null>(null);
+  const [mobileKeyboardOpen, setMobileKeyboardOpen] = useState(false);
 
   /** Keyboard goes to the desktop only while the user has clicked into it. */
   const keyboardCapturedRef = useRef(false);
@@ -331,6 +333,20 @@ export function RdpDesktopSession({
       if (!stage || !connectedRef.current || !prefsRef.current.fitWindow) return;
 
       const pane = { width: stage.clientWidth - 8, height: stage.clientHeight - 8 };
+
+      // On phones, opening the soft keyboard or scrolling the browser bar shrinks
+      // height while width stays unchanged. Let `recalcScale()` fit the existing
+      // desktop instead of thrashing remote Display Control resolution on every tap.
+      if (
+        !force &&
+        typeof window !== "undefined" &&
+        window.innerWidth < 768 &&
+        lastSentSizeRef.current &&
+        Math.abs(pane.width - lastSentSizeRef.current.width) < 16 &&
+        pane.height < lastSentSizeRef.current.height
+      ) {
+        return;
+      }
 
       if (activeEngineRef.current === "ironrdp") {
         const iron = ironHandleRef.current;
@@ -750,6 +766,29 @@ export function RdpDesktopSession({
         client.sendMouseState(state, true);
       };
 
+      // Mobile touch binding for Guacamole (`Mouse.Touchscreen` emits scaled Mouse.State)
+      const TouchscreenCtor = (
+        Guacamole.Mouse as unknown as {
+          Touchscreen?: new (el: HTMLElement) => typeof mouse;
+        }
+      )?.Touchscreen;
+      if (TouchscreenCtor) {
+        const touch = new TouchscreenCtor(displayEl);
+        touch.onmousedown = (state) => {
+          setCaptured(true);
+          if (prefsRef.current.readOnly) return;
+          client.sendMouseState(state, true);
+        };
+        touch.onmouseup = (state) => {
+          if (prefsRef.current.readOnly) return;
+          client.sendMouseState(state, true);
+        };
+        touch.onmousemove = (state) => {
+          if (prefsRef.current.readOnly) return;
+          client.sendMouseState(state, true);
+        };
+      }
+
       // Keyboard binding (only while the desktop owns the keyboard).
       // Ctrl+Alt+Shift is the standard Guacamole escape hatch: it hands the
       // keyboard back to the browser instead of sending anything.
@@ -1126,10 +1165,10 @@ export function RdpDesktopSession({
               type="button"
               onClick={() => setCaptured(false)}
               title="Keys go to the desktop. Click to release them (or press Ctrl+Alt+Shift)."
-              className="inline-flex items-center gap-1 rounded-md border border-emerald-500/30 bg-emerald-500/10 px-2 py-0.5 text-[11px] font-medium text-emerald-200 transition hover:bg-emerald-500/20"
+              className="inline-flex shrink-0 items-center gap-1 rounded-md border border-emerald-500/30 bg-emerald-500/10 px-1.5 py-0.5 text-[11px] font-medium text-emerald-200 transition hover:bg-emerald-500/20 sm:px-2"
             >
               <KeyboardIcon className="h-3 w-3" />
-              Keyboard captured
+              <span className="hidden sm:inline">Keyboard captured</span>
               <Unlink className="h-3 w-3 opacity-70" />
             </button>
           )}
@@ -1189,6 +1228,38 @@ export function RdpDesktopSession({
               >
                 <Maximize2 className="h-3.5 w-3.5" />
               </button>
+
+              {/* Mobile On-Screen Keyboard (iOS / Android soft keyboard trigger) */}
+              {!prefs.readOnly && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    const inputEl = mobileKeyboardRef.current;
+                    if (!inputEl) return;
+                    if (mobileKeyboardOpen) {
+                      inputEl.blur();
+                      setMobileKeyboardOpen(false);
+                    } else {
+                      setShowSpecialKeys(false);
+                      setShowClipboard(false);
+                      setShowSettings(false);
+                      setCaptured(true);
+                      inputEl.value = "";
+                      inputEl.focus({ preventScroll: true });
+                      setMobileKeyboardOpen(true);
+                    }
+                  }}
+                  aria-label="Toggle mobile keyboard"
+                  title="Open your phone's on-screen keyboard to type into the remote desktop"
+                  className={`rounded-lg border px-1.5 py-1 text-xs transition md:hidden ${
+                    mobileKeyboardOpen
+                      ? "border-emerald-500/50 bg-emerald-500/15 text-emerald-200"
+                      : "border-white/10 bg-white/5 text-slate-200 hover:bg-white/10"
+                  }`}
+                >
+                  <span className="font-mono-code text-[10px] font-bold">Aa</span>
+                </button>
+              )}
 
               {/* Special Keys */}
               <div className="xl:relative">
@@ -1548,6 +1619,69 @@ export function RdpDesktopSession({
           prefs.fitWindow && !showDiagnosticsPanel ? "overflow-hidden" : "overflow-auto"
         } ${keyboardCaptured && connState === "connected" ? "ring-1 ring-emerald-500/25" : ""}`}
       >
+        {/* Hidden Mobile Soft-Keyboard Bridge (iOS Safari / Android IME) */}
+        <textarea
+          ref={mobileKeyboardRef}
+          aria-label="Mobile remote desktop keyboard input"
+          autoCapitalize="none"
+          autoCorrect="off"
+          autoComplete="off"
+          spellCheck={false}
+          rows={1}
+          onFocus={() => setMobileKeyboardOpen(true)}
+          onBlur={() => setMobileKeyboardOpen(false)}
+          onKeyDown={(event) => {
+            if (prefsRef.current.readOnly) return;
+            const keyMap: Record<string, number> = {
+              Backspace: 0xff08,
+              Enter: 0xff0d,
+              Tab: 0xff09,
+              Escape: KEYSYMS.ESCAPE,
+              Delete: KEYSYMS.DELETE,
+              ArrowUp: 0xff52,
+              ArrowDown: 0xff54,
+              ArrowLeft: 0xff51,
+              ArrowRight: 0xff53,
+            };
+            const ks = keyMap[event.key];
+            if (ks !== undefined) {
+              event.preventDefault();
+              event.stopPropagation();
+              if (ironHandleRef.current) {
+                if (event.key === "Backspace") ironHandleRef.current.typeText("\b");
+                else if (event.key === "Enter") ironHandleRef.current.typeText("\n");
+                else if (event.key === "Tab") ironHandleRef.current.typeText("\t");
+                else ironHandleRef.current.sendKeyCombo([ks]);
+              } else if (clientRef.current) {
+                clientRef.current.sendKeyEvent(1, ks);
+                clientRef.current.sendKeyEvent(0, ks);
+              }
+            }
+          }}
+          onChange={(event) => {
+            const val = event.currentTarget.value;
+            event.currentTarget.value = "";
+            if (!val || prefsRef.current.readOnly) return;
+            if (ironHandleRef.current) {
+              ironHandleRef.current.typeText(val);
+            } else if (clientRef.current) {
+              for (const ch of val) {
+                const cp = ch.codePointAt(0);
+                if (!cp) continue;
+                const keysym =
+                  ch === "\n" || ch === "\r"
+                    ? 0xff0d
+                    : cp >= 0x20 && cp <= 0xff
+                      ? cp
+                      : 0x01000000 | cp;
+                clientRef.current.sendKeyEvent(1, keysym);
+                clientRef.current.sendKeyEvent(0, keysym);
+              }
+            }
+          }}
+          className="pointer-events-none fixed -top-24 left-0 h-px w-px opacity-0"
+        />
+
         {/* Guacamole HTML5 Canvas Container */}
         <div
           ref={displayHostRef}

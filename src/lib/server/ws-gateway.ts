@@ -6,6 +6,10 @@ import type { ConnectionCredentials } from "@/types/connection";
 import { verifyRequestAccess } from "./security";
 import { connectSsh, type ConnectedSshSession } from "./ssh-client";
 import { bridgeRdpToGuacd } from "./guacd-bridge";
+import {
+  buildRDCleanPathError,
+  handleRDCleanPathWebSocket,
+} from "./rdcleanpath";
 
 /**
  * Browsers cannot set custom headers on a WebSocket handshake, so the SSH / RDP
@@ -49,6 +53,11 @@ export function createGatewayWebSockets(): GatewayUpgradeDispatcher {
       const first = protocols.values().next().value;
       return first || false;
     },
+  });
+
+  const rdpCleanPathWss = new WebSocketServer({
+    noServer: true,
+    maxPayload: 16 * 1024 * 1024,
   });
 
   sshWss.on("connection", (ws: WebSocket, req: IncomingMessage) => {
@@ -252,9 +261,67 @@ export function createGatewayWebSockets(): GatewayUpgradeDispatcher {
     }
   });
 
+  rdpCleanPathWss.on("connection", (ws: WebSocket, req: IncomingMessage) => {
+    const reqUrl = new URL(req.url || "/ws/rdp-cleanpath", "http://localhost");
+    const ignoreCert = reqUrl.searchParams.get("ignoreCert") !== "0";
+
+    // Buffer any binary frames sent by IronRDP WASM while async auth resolves.
+    const earlyMessages: Buffer[] = [];
+    let closedEarly = false;
+    const onEarlyMessage = (rawData: unknown) => {
+      const buf = Buffer.isBuffer(rawData)
+        ? rawData
+        : Array.isArray(rawData)
+          ? Buffer.concat(rawData)
+          : Buffer.from(rawData as ArrayBuffer);
+      earlyMessages.push(buf);
+    };
+    const onEarlyClose = () => {
+      closedEarly = true;
+    };
+    ws.on("message", onEarlyMessage);
+    ws.once("close", onEarlyClose);
+    ws.once("error", onEarlyClose);
+
+    void (async () => {
+      const auth = await verifyRequestAccess(
+        withBrowserTokens(req.headers, {
+          session: reqUrl.searchParams.get("session"),
+          gateway: reqUrl.searchParams.get("token"),
+        })
+      );
+
+      ws.removeListener("message", onEarlyMessage);
+      ws.removeListener("close", onEarlyClose);
+      ws.removeListener("error", onEarlyClose);
+      if (closedEarly) return;
+
+      if (!auth.ok) {
+        try {
+          if (ws.readyState === ws.OPEN) {
+            ws.send(buildRDCleanPathError({ errorCode: 1, httpStatusCode: 401 }));
+          }
+        } catch {
+          // ignore
+        }
+        ws.close(1008, "Unauthorized");
+        return;
+      }
+
+      handleRDCleanPathWebSocket(ws, { ignoreCert });
+      for (const msg of earlyMessages) {
+        ws.emit("message", msg, true);
+      }
+    })();
+  });
+
   return {
     canHandle(pathname: string) {
-      return pathname === "/ws/ssh" || pathname === "/ws/rdp";
+      return (
+        pathname === "/ws/ssh" ||
+        pathname === "/ws/rdp" ||
+        pathname === "/ws/rdp-cleanpath"
+      );
     },
     handleUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer) {
       const reqUrl = new URL(req.url || "/", "http://localhost");
@@ -265,6 +332,10 @@ export function createGatewayWebSockets(): GatewayUpgradeDispatcher {
       } else if (reqUrl.pathname === "/ws/rdp") {
         rdpWss.handleUpgrade(req, socket, head, (ws) => {
           rdpWss.emit("connection", ws, req);
+        });
+      } else if (reqUrl.pathname === "/ws/rdp-cleanpath") {
+        rdpCleanPathWss.handleUpgrade(req, socket, head, (ws) => {
+          rdpCleanPathWss.emit("connection", ws, req);
         });
       } else {
         socket.destroy();

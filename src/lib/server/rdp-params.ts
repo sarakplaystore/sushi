@@ -114,6 +114,16 @@ function clamp(value: number, min: number, max: number): number {
  * Only the arguments guacd advertises are filled in by the bridge, so this map may
  * safely carry settings an older guacd build does not know about.
  */
+export function sanitizeDriveSegment(raw: string | undefined, fallback = "default"): string {
+  const cleaned = (raw ?? "")
+    .trim()
+    .replace(/[^A-Za-z0-9._-]+/g, "_")
+    .replace(/\.{2,}/g, "_")
+    .replace(/^[._-]+|[._-]+$/g, "")
+    .slice(0, 48);
+  return cleaned || fallback;
+}
+
 export function buildRdpParams(creds: ConnectionCredentials): Record<string, string> {
   const performance = normalizeRdpPerformance(creds.rdpPerformance);
   const width = clamp(Number(creds.width || 1280), RDP_SIZE_LIMITS.minWidth, RDP_SIZE_LIMITS.maxWidth);
@@ -150,6 +160,7 @@ export function buildRdpParams(creds: ConnectionCredentials): Record<string, str
   if (drive) {
     params["enable-drive"] = "true";
     params["drive-name"] = "Sushi";
+    params["drive-path"] = `/tmp/sushi-drive/${sanitizeDriveSegment(creds.host, "host")}-${sanitizeDriveSegment(creds.username, "user")}`;
     // guacd creates the backing folder when it is missing (Guacamole 1.3+).
     params["create-drive-path"] = "true";
   } else {

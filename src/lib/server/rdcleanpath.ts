@@ -860,23 +860,42 @@ interface RelayRedisConfig {
 let relayTableEnsuredFor = "";
 
 function getRelayTursoConfig(): RelayTursoConfig | null {
-  const rawUrl = (
-    process.env.SUSHI_TURSO_DATABASE_URL ||
-    process.env.TURSO_DATABASE_URL ||
-    ""
-  ).trim();
-  const token = (
-    process.env.SUSHI_TURSO_AUTH_TOKEN ||
-    process.env.TURSO_AUTH_TOKEN ||
-    ""
-  ).trim();
-  if (!rawUrl || !token) return null;
-  const httpUrl = rawUrl
-    .replace(/^libsql:\/\//i, "https://")
-    .replace(/^wss:\/\//i, "https://")
-    .replace(/^ws:\/\//i, "http://")
-    .replace(/\/+$/, "");
-  return { httpUrl, token };
+  const candidates = [
+    [process.env.SUSHI_TURSO_DATABASE_URL, process.env.SUSHI_TURSO_AUTH_TOKEN],
+    [process.env.TURSO_DATABASE_URL, process.env.TURSO_AUTH_TOKEN],
+  ];
+  for (const [rawUrl, rawToken] of candidates) {
+    const url = (rawUrl || "").trim();
+    const token = (rawToken || "").trim();
+    if (!url || !token) continue;
+    try {
+      const isLibsql = /^libsql:\/\//i.test(url);
+      const isWss = /^wss:\/\//i.test(url);
+      const isWs = /^ws:\/\//i.test(url);
+      const normalized =
+        isLibsql || isWss
+          ? url.replace(/^(libsql|wss):\/\//i, "https://")
+          : isWs
+            ? url.replace(/^ws:\/\//i, "http://")
+            : url;
+      const parsed = new URL(normalized);
+      const tlsParam = parsed.searchParams.get("tls");
+      const scheme =
+        isLibsql && tlsParam === "0"
+          ? "http:"
+          : parsed.protocol === "http:"
+            ? "http:"
+            : "https:";
+      const basePath = parsed.pathname.replace(/\/+$/, "");
+      return {
+        httpUrl: `${scheme}//${parsed.host}${basePath}`,
+        token,
+      };
+    } catch {
+      continue;
+    }
+  }
+  return null;
 }
 
 function getRelayRedisConfig(): RelayRedisConfig | null {
@@ -905,6 +924,7 @@ async function execRelayRedisPipeline(
     },
     body: JSON.stringify(commands),
     cache: "no-store",
+    signal: AbortSignal.timeout(6000),
   });
   if (!res.ok) {
     throw new Error(`RDP Redis relay HTTP ${res.status}`);
@@ -916,11 +936,13 @@ type RelayTursoRow = Array<{ value?: unknown }>;
 
 async function execRelayTurso(
   cfg: RelayTursoConfig,
-  stmts: Array<{ sql: string; args: Array<{ type: "text" | "integer"; value: string }> }>
+  stmts: Array<{ sql: string; args: Array<{ type: "text" | "integer"; value: string }> }>,
+  forceCreateTable = false
 ): Promise<RelayTursoRow[][]> {
   const key = crypto.createHash("sha256").update(cfg.httpUrl).digest("hex");
+  const includeCreate = forceCreateTable || relayTableEnsuredFor !== key;
   const requests: Array<Record<string, unknown>> = [];
-  if (relayTableEnsuredFor !== key) {
+  if (includeCreate) {
     requests.push({
       type: "execute",
       stmt: {
@@ -959,6 +981,7 @@ async function execRelayTurso(
     },
     body: JSON.stringify({ requests }),
     cache: "no-store",
+    signal: AbortSignal.timeout(6000),
   });
   if (!res.ok) {
     throw new Error(`RDP relay storage HTTP ${res.status}`);
@@ -970,15 +993,24 @@ async function execRelayTurso(
       error?: { message?: string };
     }>;
   };
-  relayTableEnsuredFor = key;
-  const rowsPerStmt: RelayTursoRow[][] = [];
-  for (const r of data.results || []) {
+  const results = data.results || [];
+  for (const r of results) {
     if (r.type === "error") {
-      throw new Error(r.error?.message || "RDP relay SQL error");
+      const msg = r.error?.message || "RDP relay SQL error";
+      if (!includeCreate && /no such table/i.test(msg)) {
+        relayTableEnsuredFor = "";
+        return execRelayTurso(cfg, stmts, true);
+      }
+      throw new Error(msg);
     }
-    if (r.response?.result?.rows) {
-      rowsPerStmt.push(r.response.result.rows);
-    }
+  }
+  relayTableEnsuredFor = key;
+
+  const offset = includeCreate ? 1 : 0;
+  const rowsPerStmt: RelayTursoRow[][] = [];
+  for (let i = 0; i < stmts.length; i++) {
+    const item = results[offset + i];
+    rowsPerStmt.push(item?.response?.result?.rows || []);
   }
   return rowsPerStmt;
 }

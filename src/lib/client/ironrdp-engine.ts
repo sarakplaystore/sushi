@@ -273,7 +273,7 @@ export function describeIronRdpError(err: unknown): IronRdpErrorDiagnosis {
   return {
     title: "Remote desktop connection failed",
     detail: msg,
-    retryable: !/unauthorized|authentication|password|denied/i.test(msg),
+    retryable: !/unauthorized|authentication|password|denied|wasm|webassembly/i.test(msg),
     codeLabel: "RDP",
   };
 }
@@ -286,7 +286,25 @@ export function loadIronRdpModule(wasmUrl = "/api/rdp/wasm"): Promise<IronRdpMod
   if (!wasmLoadPromise) {
     wasmLoadPromise = import("ironrdp-wasm")
       .then(async (mod) => {
-        await mod.default({ module_or_path: wasmUrl });
+        // In browser builds, Next.js / Turbopack emits `rdp_client_bg.<hash>.wasm` directly
+        // into `/_next/static/media/` on Vercel's static Edge CDN (Brotli-compressed, with no
+        // 4.5 MB Lambda payload limit). Try the bundled static CDN asset first when same-origin,
+        // falling back to `wasmUrl` (`/api/rdp/wasm`) for custom gateways or Node test runners.
+        const useBundledStaticFirst =
+          typeof window !== "undefined" &&
+          typeof window.location?.origin === "string" &&
+          window.location.origin.startsWith("http") &&
+          (!wasmUrl || wasmUrl === "/api/rdp/wasm");
+
+        if (useBundledStaticFirst) {
+          try {
+            await mod.default();
+          } catch {
+            await mod.default({ module_or_path: wasmUrl });
+          }
+        } else {
+          await mod.default({ module_or_path: wasmUrl });
+        }
         try {
           mod.setup("warn");
         } catch {

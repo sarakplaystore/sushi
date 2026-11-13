@@ -7,9 +7,7 @@ import {
   Camera,
   Clipboard,
   RotateCw,
-  Download,
   Keyboard as KeyboardIcon,
-  Radio,
   CheckCircle2,
   AlertCircle,
   Loader2,
@@ -36,7 +34,6 @@ import {
   resolveGatewayHttpBase,
 } from "@/lib/client/gateway";
 import { getStoredSessionToken } from "@/lib/client/auth-storage";
-import { downloadRdpFile } from "@/lib/client/rdp-file";
 import {
   type ActiveIronRdpHandle,
   connectIronRdpSession,
@@ -63,7 +60,6 @@ interface RdpDesktopSessionProps {
   websocketAvailable?: boolean;
   rdpCleanPathAvailable?: boolean;
   gatewaySettings: GatewaySettings;
-  onOpenGatewayModal: () => void;
   /** Adjust the desktop credentials (Windows user / domain / port). */
   onEditCredentials: () => void;
 }
@@ -128,7 +124,6 @@ export function RdpDesktopSession({
   websocketAvailable = false,
   rdpCleanPathAvailable = true,
   gatewaySettings,
-  onOpenGatewayModal,
   onEditCredentials,
 }: RdpDesktopSessionProps) {
   const stageRef = useRef<HTMLDivElement | null>(null);
@@ -1058,7 +1053,9 @@ export function RdpDesktopSession({
           ? "Negotiating RDP..."
           : connState === "reconnecting"
             ? `Reconnecting ${reconnectAttempt}/${MAX_RECONNECT_ATTEMPTS}… ${reconnectCountdown}s`
-            : "RDP Inspector / Launcher",
+            : connState === "error"
+              ? "Connection Failed"
+              : "Session Disconnected",
     [connState, reconnectAttempt, reconnectCountdown, remoteSize.w, remoteSize.h]
   );
 
@@ -1484,14 +1481,6 @@ export function RdpDesktopSession({
                   <span>
                     Auto-reconnect: {reconnectAttempt > 0 ? `retry ${reconnectAttempt}` : "armed"}
                   </span>
-                  <button
-                    type="button"
-                    onClick={() => downloadRdpFile(profile)}
-                    className="inline-flex items-center gap-1 text-slate-300 hover:text-white"
-                    title="Download a native .rdp file"
-                  >
-                    <Download className="h-3 w-3" /> .rdp
-                  </button>
                 </div>
               </div>
             )}
@@ -1635,7 +1624,7 @@ export function RdpDesktopSession({
           </div>
         )}
 
-        {/* Diagnostics & Hybrid Launcher View (when guacd isn't active or stream errored) */}
+        {/* Disconnected / Connection Diagnostics View */}
         {showDiagnosticsPanel && (
           <div className="m-auto w-full max-w-2xl space-y-5 p-4 sm:p-6">
             <div className="rounded-2xl border border-white/10 bg-[#111621] p-4 shadow-2xl sm:p-6">
@@ -1770,8 +1759,8 @@ export function RdpDesktopSession({
                 ) : null}
               </div>
 
-              {/* Launch Actions */}
-              <div className="mt-5 grid grid-cols-1 gap-3 sm:grid-cols-3">
+              {/* Reconnect & Credential Actions */}
+              <div className="mt-5 grid grid-cols-1 gap-3 sm:grid-cols-2">
                 <button
                   type="button"
                   onClick={reconnectNow}
@@ -1783,29 +1772,17 @@ export function RdpDesktopSession({
 
                 <button
                   type="button"
-                  onClick={() => downloadRdpFile(profile)}
+                  onClick={onEditCredentials}
                   className="flex items-center justify-center gap-2 rounded-xl border border-white/12 bg-white/6 px-4 py-3 text-xs font-semibold text-white transition hover:bg-white/12"
                 >
-                  <Download className="h-4 w-4" />
-                  Download .rdp Client
-                </button>
-
-                <button
-                  type="button"
-                  onClick={onOpenGatewayModal}
-                  className="flex items-center justify-center gap-2 rounded-xl border border-white/12 bg-white/6 px-4 py-3 text-xs font-semibold text-white transition hover:bg-white/12"
-                >
-                  <Radio className="h-4 w-4 text-emerald-400" />
-                  VPS Gateway (Optional)
+                  <UserRound className="h-4 w-4 text-[#ff6b57]" />
+                  Edit Desktop Credentials
                 </button>
               </div>
 
               <p className="mt-4 text-[11px] leading-relaxed text-slate-400">
-                Live in-browser HTML5 RDP runs out of the box via{" "}
-                <code className="font-mono-code text-slate-300">IronRDP WebAssembly</code>{" "}
-                (TLS &amp; CredSSP/NLA) on both Vercel Serverless and Node, and automatically
-                accelerates with <code className="font-mono-code text-slate-300">guacd</code>{" "}
-                when a self-hosted Docker Compose or VPS Gateway is connected.
+                Live HTML5 Remote Desktop connects directly in your browser over TLS &amp;
+                CredSSP (NLA) with clipboard sync and dynamic display scaling.
               </p>
             </div>
           </div>

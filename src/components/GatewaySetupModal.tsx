@@ -187,17 +187,11 @@ export function GatewaySetupModal({
                   </span>
                 </li>
                 <li>
-                  • Live RDP (guacd):{" "}
-                  <span
-                    className={
-                      localCapabilities?.rdpGuacd
-                        ? "text-emerald-400"
-                        : "text-amber-300"
-                    }
-                  >
+                  • Live HTML5 RDP:{" "}
+                  <span className="text-emerald-400">
                     {localCapabilities?.rdpGuacd
-                      ? "Active on this host"
-                      : "Start guacd or attach VPS Gateway"}
+                      ? "Active (guacd)"
+                      : "Active (IronRDP WebAssembly)"}
                   </span>
                 </li>
               </ul>
@@ -210,10 +204,10 @@ export function GatewaySetupModal({
               </div>
               <p className="mt-2 text-xs leading-relaxed text-slate-400">
                 On <strong className="text-slate-200">Vercel</strong>, SFTP file management,
-                streaming SSH commands, and RDP X.224/TLS probes run natively on Node
-                serverless functions. Attach a{" "}
-                <strong className="text-slate-200">VPS Gateway URL</strong> below to unlock
-                persistent WebSocket PTY shells and 60fps HTML5 RDP streaming.
+                streaming SSH commands, and live HTML5 RDP desktops run natively on Node
+                serverless functions. Optionally attach a{" "}
+                <strong className="text-slate-200">VPS Gateway URL</strong> below if you also
+                want persistent WebSocket PTY shells.
               </p>
             </div>
           </div>

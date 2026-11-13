@@ -9,6 +9,7 @@ interface ServerlessRdpSessionConfig {
   headers: Record<string, string>;
   ignoreCert: boolean;
   forceSplitStream?: boolean;
+  preferDuplex?: boolean;
 }
 
 const pendingConfigs = new Map<string, ServerlessRdpSessionConfig>();
@@ -250,18 +251,22 @@ export class SushiServerlessRdpWebSocket extends EventTarget {
   }
 
   private async startTransport(firstFrame: Uint8Array): Promise<void> {
-    const preferDuplex = !this.cfg.forceSplitStream && canStreamExecStdin();
+    // Vercel Serverless / AWS Lambda buffers incoming HTTP request bodies until END_STREAM,
+    // which hangs open-ended `duplex: "half"` request streams in Chromium. Default straight
+    // to Split-Stream (`POST /api/rdp/stream` JSON + `POST /api/rdp/input` JSON), which starts
+    // immediately on Vercel, Cloudflare, Safari, Firefox, and Chromium alike.
+    const tryDuplex =
+      Boolean(this.cfg.preferDuplex) &&
+      !this.cfg.forceSplitStream &&
+      canStreamExecStdin();
 
-    if (preferDuplex) {
+    if (tryDuplex) {
       try {
         await this.startDuplexStream(firstFrame);
         return;
-      } catch (err) {
+      } catch {
         if (this.readyState !== SushiServerlessRdpWebSocket.OPEN) return;
-        // If duplex failed before connecting (e.g. HTTP/1.1 proxy rejecting streaming request body),
-        // seamlessly fall back to split-stream JSON + POST /api/rdp/input!
         this.duplexController = null;
-        void err;
       }
     }
 
@@ -279,6 +284,15 @@ export class SushiServerlessRdpWebSocket extends EventTarget {
       },
     });
 
+    const duplexAbort = new AbortController();
+    const onSessionAbort = () => duplexAbort.abort();
+    this.abortController.signal.addEventListener("abort", onSessionAbort, { once: true });
+    let timedOut = false;
+    const startWatchdog = setTimeout(() => {
+      timedOut = true;
+      duplexAbort.abort();
+    }, 2500);
+
     const streamUrlWithQuery = this.appendIgnoreCert(this.cfg.streamUrl);
     const reqInit: RequestInit & { duplex: "half" } = {
       method: "POST",
@@ -288,12 +302,29 @@ export class SushiServerlessRdpWebSocket extends EventTarget {
       },
       body: reqBody,
       duplex: "half",
-      signal: this.abortController.signal,
+      signal: duplexAbort.signal,
       cache: "no-store",
     };
 
-    const res = await fetch(streamUrlWithQuery, reqInit);
+    let res: Response;
+    try {
+      res = await fetch(streamUrlWithQuery, reqInit);
+    } catch (err) {
+      clearTimeout(startWatchdog);
+      this.abortController.signal.removeEventListener("abort", onSessionAbort);
+      try {
+        ctrlBox.current?.close();
+      } catch {
+        // ignore
+      }
+      if (timedOut) {
+        throw new Error("Duplex request body buffered by server proxy");
+      }
+      throw err;
+    }
+    clearTimeout(startWatchdog);
     if (!res.ok || !res.body) {
+      this.abortController.signal.removeEventListener("abort", onSessionAbort);
       try {
         ctrlBox.current?.close();
       } catch {
@@ -423,6 +454,13 @@ export class SushiServerlessRdpWebSocket extends EventTarget {
         }
       }
       if (this.readyState === SushiServerlessRdpWebSocket.OPEN) {
+        try {
+          this.duplexController?.close();
+        } catch {
+          // ignore
+        }
+        this.duplexController = null;
+        this.abortController.abort();
         this.readyState = SushiServerlessRdpWebSocket.CLOSED;
         this.dispatchEvent(makeCloseEvent(1000, "Stream ended"));
       }
@@ -487,6 +525,7 @@ export function buildServerlessRdpProxyUrl(params: {
   gatewaySettings: GatewaySettings;
   ignoreCert?: boolean;
   forceSplitStream?: boolean;
+  preferDuplex?: boolean;
 }): string {
   installServerlessRdpWebSocketShim();
   const base = (params.httpBase || "").replace(/\/+$/, "");
@@ -497,6 +536,7 @@ export function buildServerlessRdpProxyUrl(params: {
     headers: getAuthHeaders(params.gatewaySettings),
     ignoreCert: params.ignoreCert !== false,
     forceSplitStream: params.forceSplitStream,
+    preferDuplex: params.preferDuplex,
   });
   return `${SERVERLESS_RDP_WS_ORIGIN}/${sessionId}`;
 }

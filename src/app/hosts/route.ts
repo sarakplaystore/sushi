@@ -61,7 +61,7 @@ export async function GET(req: NextRequest) {
   const protocolRows: Array<[ProtocolType, string, string]> = [
     ["ssh", "SSH terminal", "Port 22 (or the saved port) — the interactive shell"],
     ["sftp", "SFTP files", "Same login and port as SSH — uploads, downloads, editor"],
-    ["rdp", "RDP desktop", "Port 3389 via guacd — Windows / xrdp desktops"],
+    ["rdp", "RDP desktop", "Port 3389 — live HTML5 Windows / xrdp desktops"],
   ];
 
   if (wantsJson) {

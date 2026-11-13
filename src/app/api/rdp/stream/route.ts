@@ -118,6 +118,15 @@ export async function POST(req: NextRequest) {
 
         req.signal.addEventListener("abort", () => cleanup(controller), { once: true });
 
+        // Flush HTTP 200 response headers immediately on Vercel Serverless / Edge proxies
+        // before TCP + TLS negotiation to the target RDP host even finishes.
+        try {
+          controller.enqueue(new Uint8Array(encodeRdpStreamFrame(Buffer.alloc(0))));
+        } catch {
+          cleanup(controller);
+          return;
+        }
+
         try {
           const parsedReq = parseRDCleanPathRequest(firstFrameBuf);
           const hs = await performRDCleanPathHandshake(

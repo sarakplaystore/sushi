@@ -3011,8 +3011,8 @@ export function SushiWorkspace() {
                     New RDP Remote Desktop
                   </h3>
                   <p className="mt-1 text-xs leading-relaxed text-slate-400">
-                    Live HTML5 Windows &amp; Linux xrdp desktop (IronRDP WASM &amp;
-                    guacd), NLA/TLS auth, clipboard sync, and .rdp export.
+                    Live HTML5 Windows &amp; Linux xrdp desktop in your browser with
+                    NLA/TLS auth, clipboard sync, and dynamic display scaling.
                   </p>
                 </button>
               </div>
@@ -3343,7 +3343,6 @@ export function SushiWorkspace() {
                     websocketAvailable={effectiveWsSsh}
                     rdpCleanPathAvailable={effectiveRdpCleanPath}
                     gatewaySettings={gatewaySettings}
-                    onOpenGatewayModal={() => setGatewayModalOpen(true)}
                     onEditCredentials={() => editRdpConnection(tab)}
                   />
                 )}

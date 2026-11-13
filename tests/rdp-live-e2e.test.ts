@@ -435,6 +435,7 @@ async function main() {
   });
 
   // Start HTTP + WebSocket server exposing BOTH /ws/rdp-cleanpath AND /api/rdp/stream + /api/rdp/input
+  let simulateVercelBufferedRequestBodies = false;
   const wsDispatcher = createGatewayWebSockets();
   const httpServer = http.createServer(async (req, res) => {
     try {
@@ -446,27 +447,40 @@ async function main() {
       }
 
       if (req.url?.startsWith("/api/rdp/stream")) {
-        const bodyStream = new ReadableStream<Uint8Array>({
-          start(controller) {
-            req.on("data", (chunk: Buffer) => controller.enqueue(new Uint8Array(chunk)));
-            req.on("end", () => {
-              try {
-                controller.close();
-              } catch {}
-            });
-            req.on("error", (err) => {
-              try {
-                controller.error(err);
-              } catch {}
-            });
-          },
-        });
-        const nextReq = new NextRequest(reqUrl, {
-          method: req.method || "POST",
-          headers,
-          body: bodyStream,
-          duplex: "half",
-        });
+        let nextReq: NextRequest;
+        if (simulateVercelBufferedRequestBodies) {
+          // Exact Vercel Serverless / AWS Lambda behavior: request body is buffered
+          // completely until END_STREAM before invoking the route handler.
+          const chunks: Buffer[] = [];
+          for await (const c of req) chunks.push(Buffer.from(c));
+          nextReq = new NextRequest(reqUrl, {
+            method: req.method || "POST",
+            headers,
+            body: new Uint8Array(Buffer.concat(chunks)),
+          });
+        } else {
+          const bodyStream = new ReadableStream<Uint8Array>({
+            start(controller) {
+              req.on("data", (chunk: Buffer) => controller.enqueue(new Uint8Array(chunk)));
+              req.on("end", () => {
+                try {
+                  controller.close();
+                } catch {}
+              });
+              req.on("error", (err) => {
+                try {
+                  controller.error(err);
+                } catch {}
+              });
+            },
+          });
+          nextReq = new NextRequest(reqUrl, {
+            method: req.method || "POST",
+            headers,
+            body: bodyStream,
+            duplex: "half",
+          });
+        }
         const nextRes = await postRdpStream(nextReq);
         res.writeHead(nextRes.status, Object.fromEntries(nextRes.headers.entries()));
         res.flushHeaders();
@@ -590,8 +604,49 @@ async function main() {
 
     installServerlessRdpWebSocketShim();
 
-    // 5a. Full-Duplex HTTP Streaming mode (`POST /api/rdp/stream` with `duplex: "half"`)
+    // 5a. Default Vercel Serverless transport in Chrome (`__setStreamingRequestBodySupport(true)`)
+    // against a request-body-buffering Vercel Lambda simulator!
     {
+      simulateVercelBufferedRequestBodies = true;
+      __setStreamingRequestBodySupport(true);
+      const t0 = Date.now();
+      const nextTlsData = rdpServer.waitForNextTlsPayload();
+      const proxyUrl = buildServerlessRdpProxyUrl({
+        httpBase: `http://127.0.0.1:${httpPort}`,
+        gatewaySettings: {
+          gatewayUrl: `http://127.0.0.1:${httpPort}`,
+          gatewayToken: "rdp-e2e-gateway-secret",
+        },
+        ignoreCert: true,
+      });
+
+      const builder = new SessionBuilder();
+      builder.username("Administrator");
+      builder.password("VercelChromeSplitPass!");
+      builder.destination(`127.0.0.1:${rdpServer.port}`);
+      builder.proxyAddress(proxyUrl);
+      configureCommonBuilder(builder, 1280, 720);
+      builder.extension(new Extension("enable_credssp", true));
+
+      const connectPromise = builder.connect().catch((e) => e);
+      const tlsPayload = await nextTlsData;
+      await connectPromise;
+      const elapsedMs = Date.now() - t0;
+
+      assert.ok(
+        tlsPayload.includes(Buffer.from("NTLMSSP\0", "ascii")),
+        "Real IronRDP WASM transmitted CredSSP NTLMSSP on Vercel buffered-request Lambda!"
+      );
+      assert.ok(
+        elapsedMs < 1500,
+        `Vercel default Split-Stream connected immediately (${elapsedMs}ms) without duplex hang`
+      );
+      simulateVercelBufferedRequestBodies = false;
+    }
+
+    // 5b. Opt-in Full-Duplex HTTP Streaming mode (`preferDuplex: true`) on non-buffering HTTP/2 server
+    {
+      simulateVercelBufferedRequestBodies = false;
       __setStreamingRequestBodySupport(true);
       const nextTlsData = rdpServer.waitForNextTlsPayload();
       const proxyUrl = buildServerlessRdpProxyUrl({
@@ -601,6 +656,7 @@ async function main() {
           gatewayToken: "rdp-e2e-gateway-secret",
         },
         ignoreCert: true,
+        preferDuplex: true,
       });
 
       const builder = new SessionBuilder();
@@ -621,7 +677,7 @@ async function main() {
       );
     }
 
-    // 5b. Safari / Firefox Split-Stream HTTP mode (`POST /api/rdp/stream` JSON + `POST /api/rdp/input`)
+    // 5c. Safari / Firefox Split-Stream HTTP mode (`__setStreamingRequestBodySupport(false)`)
     {
       __setStreamingRequestBodySupport(false);
       const nextTlsData = rdpServer.waitForNextTlsPayload();
@@ -768,6 +824,29 @@ async function main() {
       } finally {
         await nlaOnlyServer.close();
       }
+    }
+    // 6e. Verify RDP UI has zero `.rdp` native client download or `VPS Gateway (guacd)` buttons
+    {
+      const rdpComponentSrc = fs.readFileSync(
+        path.join(process.cwd(), "src", "components", "RdpDesktopSession.tsx"),
+        "utf8"
+      );
+      assert.ok(
+        !rdpComponentSrc.includes("downloadRdpFile"),
+        "RdpDesktopSession does not import or call downloadRdpFile"
+      );
+      assert.ok(
+        !rdpComponentSrc.includes(".rdp Client"),
+        "RdpDesktopSession does not render a Native .rdp Client button"
+      );
+      assert.ok(
+        !rdpComponentSrc.includes("VPS Gateway"),
+        "RdpDesktopSession does not render a VPS Gateway button"
+      );
+      assert.ok(
+        !rdpComponentSrc.includes("onOpenGatewayModal"),
+        "RdpDesktopSession does not accept or trigger onOpenGatewayModal"
+      );
     }
   } finally {
     await rdpServer.close();

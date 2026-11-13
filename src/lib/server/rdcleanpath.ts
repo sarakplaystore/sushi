@@ -587,7 +587,7 @@ export async function performRDCleanPathHandshake(
           if (selectedProto === 0) {
             fail(
               new RDCleanPathHandshakeError(
-                `RDP server ${serverAddr} selected legacy unencrypted Standard RDP (no TLS/NLA). Enable TLS or NLA on the remote desktop server, or connect via a guacd gateway.`,
+                `RDP server ${serverAddr} selected legacy unencrypted Standard RDP (no TLS/NLA). Enable TLS or CredSSP (NLA) on the remote desktop server.`,
                 { errorCode: 2, httpStatusCode: 502 }
               )
             );
@@ -846,9 +846,14 @@ function applyOrderedTunnelFrames(
   }
 }
 
-/* Optional Turso cross-instance relay for multi-lambda Safari fallback */
+/* Optional Turso or Redis cross-instance relay for multi-lambda Vercel Split-Stream */
 interface RelayTursoConfig {
   httpUrl: string;
+  token: string;
+}
+
+interface RelayRedisConfig {
+  url: string;
   token: string;
 }
 
@@ -872,6 +877,39 @@ function getRelayTursoConfig(): RelayTursoConfig | null {
     .replace(/^ws:\/\//i, "http://")
     .replace(/\/+$/, "");
   return { httpUrl, token };
+}
+
+function getRelayRedisConfig(): RelayRedisConfig | null {
+  const candidates = [
+    [process.env.SUSHI_REDIS_REST_URL, process.env.SUSHI_REDIS_REST_TOKEN],
+    [process.env.UPSTASH_REDIS_REST_URL, process.env.UPSTASH_REDIS_REST_TOKEN],
+    [process.env.KV_REST_API_URL, process.env.KV_REST_API_TOKEN],
+  ];
+  for (const [rawUrl, rawToken] of candidates) {
+    const url = (rawUrl || "").trim().replace(/\/+$/, "");
+    const token = (rawToken || "").trim();
+    if (url && token) return { url, token };
+  }
+  return null;
+}
+
+async function execRelayRedisPipeline(
+  cfg: RelayRedisConfig,
+  commands: Array<Array<string | number>>
+): Promise<Array<{ result?: unknown; error?: string }>> {
+  const res = await fetch(`${cfg.url}/pipeline`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${cfg.token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(commands),
+    cache: "no-store",
+  });
+  if (!res.ok) {
+    throw new Error(`RDP Redis relay HTTP ${res.status}`);
+  }
+  return (await res.json()) as Array<{ result?: unknown; error?: string }>;
 }
 
 type RelayTursoRow = Array<{ value?: unknown }>;
@@ -962,9 +1000,12 @@ export function registerRdpHttpTunnel(params: {
   };
   registry.set(params.sessionId, tunnel);
 
-  // Only poll Turso on Vercel Serverless when Split-Stream mode is used, so
+  // Only poll shared storage on Vercel Serverless when Split-Stream mode is used, so
   // cross-instance input frames still arrive if Fluid Compute routes to a second lambda.
   const tursoCfg = process.env.VERCEL === "1" ? getRelayTursoConfig() : null;
+  const redisCfg =
+    process.env.VERCEL === "1" && !tursoCfg ? getRelayRedisConfig() : null;
+  const redisListKey = `sushi:rdp:relay:${params.sessionId}`;
   let pollTimer: ReturnType<typeof setInterval> | null = null;
   let polling = false;
 
@@ -1012,7 +1053,39 @@ export function registerRdpHttpTunnel(params: {
       } finally {
         polling = false;
       }
-    }, 150);
+    }, 80);
+  } else if (redisCfg) {
+    pollTimer = setInterval(async () => {
+      if (polling || !registry.has(params.sessionId)) return;
+      polling = true;
+      try {
+        const res = await execRelayRedisPipeline(redisCfg, [
+          ["LRANGE", redisListKey, 0, 63],
+        ]);
+        const items = Array.isArray(res[0]?.result)
+          ? (res[0]!.result as string[])
+          : [];
+        if (items.length > 0) {
+          for (const raw of items) {
+            const parsed = JSON.parse(raw) as {
+              seq: number;
+              username: string;
+              frames: string[];
+            };
+            if (parsed.username !== params.username) continue;
+            const buffers = parsed.frames.map((b64) => Buffer.from(b64, "base64"));
+            applyOrderedTunnelFrames(tunnel, parsed.seq, buffers);
+          }
+          await execRelayRedisPipeline(redisCfg, [
+            ["LTRIM", redisListKey, items.length, -1],
+          ]);
+        }
+      } catch {
+        // Ignore transient poll errors; next tick will retry.
+      } finally {
+        polling = false;
+      }
+    }, 80);
   }
 
   return {
@@ -1032,6 +1105,10 @@ export function registerRdpHttpTunnel(params: {
             ],
           },
         ]).catch(() => {});
+      } else if (redisCfg) {
+        void execRelayRedisPipeline(redisCfg, [["DEL", redisListKey]]).catch(
+          () => {}
+        );
       }
     },
   };
@@ -1068,6 +1145,24 @@ export async function deliverRdpHttpInput(params: {
           { type: "integer", value: String(Date.now()) },
         ],
       },
+    ]);
+    return { ok: true, mode: "relay" };
+  }
+
+  const redisCfg = getRelayRedisConfig();
+  if (redisCfg) {
+    const redisListKey = `sushi:rdp:relay:${params.sessionId}`;
+    await execRelayRedisPipeline(redisCfg, [
+      [
+        "RPUSH",
+        redisListKey,
+        JSON.stringify({
+          seq: params.seq,
+          username: params.username,
+          frames: params.framesBase64,
+        }),
+      ],
+      ["EXPIRE", redisListKey, 120],
     ]);
     return { ok: true, mode: "relay" };
   }

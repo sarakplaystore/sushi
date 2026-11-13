@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { NextRequest, NextResponse } from "next/server";
 import { getCorsHeaders } from "@/lib/server/security";
 
@@ -9,15 +10,33 @@ let cachedWasm: Buffer | null = null;
 
 async function loadIronRdpWasm(): Promise<Buffer> {
   if (cachedWasm) return cachedWasm;
-  const wasmPath = path.join(
-    process.cwd(),
-    "node_modules",
-    "ironrdp-wasm",
-    "pkg",
-    "rdp_client_bg.wasm"
-  );
-  cachedWasm = await fs.readFile(wasmPath);
-  return cachedWasm;
+  const relWasm = path.join("node_modules", "ironrdp-wasm", "pkg", "rdp_client_bg.wasm");
+  const roots = new Set<string>([process.cwd()]);
+  try {
+    let dir = path.dirname(fileURLToPath(import.meta.url));
+    for (let i = 0; i < 8; i++) {
+      roots.add(dir);
+      const parent = path.dirname(dir);
+      if (parent === dir) break;
+      dir = parent;
+    }
+  } catch {
+    // Ignore import.meta.url resolution issues
+  }
+
+  let lastErr: unknown = null;
+  for (const root of roots) {
+    try {
+      const candidate = path.join(/*turbopackIgnore: true*/ root, relWasm);
+      cachedWasm = await fs.readFile(candidate);
+      return cachedWasm;
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  throw lastErr instanceof Error
+    ? lastErr
+    : new Error("Failed to locate rdp_client_bg.wasm");
 }
 
 export async function OPTIONS(req: NextRequest) {

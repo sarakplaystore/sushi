@@ -181,6 +181,7 @@ export function RdpDesktopSession({
   const [keyboardCaptured, setKeyboardCaptured] = useState(false);
   const [reconnectAttempt, setReconnectAttempt] = useState(0);
   const [reconnectCountdown, setReconnectCountdown] = useState(0);
+  const [hadConnected, setHadConnected] = useState(false);
   const [dragging, setDragging] = useState(false);
   const [driveLabel, setDriveLabel] = useState<string | null>(null);
   const [upload, setUpload] = useState<{ name: string; percent: number } | null>(null);
@@ -441,6 +442,7 @@ export function RdpDesktopSession({
     clearReconnectTimers();
     reconnectAttemptRef.current = 0;
     setReconnectAttempt(0);
+    setHadConnected(false);
     setErrorMessage(null);
     setGuacdFallback(false);
     if ((profile.host || "").trim()) {
@@ -588,6 +590,7 @@ export function RdpDesktopSession({
 
         ironHandleRef.current = handle;
         connectedRef.current = true;
+        setHadConnected(true);
         reconnectAttemptRef.current = 0;
         setReconnectAttempt(0);
         setDriveLabel("Clipboard");
@@ -667,6 +670,7 @@ export function RdpDesktopSession({
         if (disposed) return;
         if (state === STATE_CONNECTED) {
           connectedRef.current = true;
+          setHadConnected(true);
           reconnectAttemptRef.current = 0;
           setReconnectAttempt(0);
           setConnState("connected");
@@ -928,6 +932,7 @@ export function RdpDesktopSession({
     clearReconnectTimers();
     reconnectAttemptRef.current = 0;
     setReconnectAttempt(0);
+    setHadConnected(false);
     setErrorMessage(null);
     setConnState("connecting");
     setStreamEnabled(true);
@@ -1576,22 +1581,43 @@ export function RdpDesktopSession({
         )}
 
         {connState === "reconnecting" && (
-          <div className="absolute inset-0 flex flex-col items-center justify-center bg-[#090b10]/95">
+          <div className="absolute inset-0 flex flex-col items-center justify-center bg-[#090b10]/95 px-4 text-center">
             <Loader2 className="mb-3 h-8 w-8 animate-spin text-amber-400" />
             <div className="text-sm font-medium text-white">
-              Desktop dropped — reconnecting in {reconnectCountdown}s
+              {hadConnected
+                ? `Desktop dropped — reconnecting in ${reconnectCountdown}s`
+                : `Connection interrupted — retrying in ${reconnectCountdown}s`}
             </div>
             <div className="mt-1 text-xs text-slate-400">
               Attempt {reconnectAttempt} of {MAX_RECONNECT_ATTEMPTS} · the session is rebuilt
               automatically
             </div>
-            <button
-              type="button"
-              onClick={reconnectNow}
-              className="mt-3 rounded-lg border border-white/12 px-3 py-1.5 text-xs text-slate-200 hover:bg-white/10"
-            >
-              Retry now
-            </button>
+            {errorMessage && (
+              <div className="mt-2.5 max-w-lg rounded-lg border border-amber-500/25 bg-amber-500/10 px-3 py-1.5 text-xs text-amber-200">
+                {errorMessage}
+              </div>
+            )}
+            <div className="mt-3 flex flex-wrap items-center justify-center gap-2">
+              <button
+                type="button"
+                onClick={reconnectNow}
+                className="rounded-lg border border-white/12 px-3 py-1.5 text-xs text-slate-200 hover:bg-white/10"
+              >
+                Retry now
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  clearReconnectTimers();
+                  reconnectAttemptRef.current = 0;
+                  setReconnectAttempt(0);
+                  setConnState("error");
+                }}
+                className="rounded-lg border border-white/12 px-3 py-1.5 text-xs text-slate-300 hover:bg-white/10"
+              >
+                Stop &amp; View Diagnostics
+              </button>
+            </div>
           </div>
         )}
 

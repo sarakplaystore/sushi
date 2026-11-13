@@ -401,28 +401,53 @@ export class SushiServerlessRdpWebSocket extends EventTarget {
       ) {
         const frames = this.splitBatch.splice(0, 64);
         const seq = this.splitSeq++;
-        const res = await fetch(this.cfg.inputUrl, {
-          method: "POST",
-          headers: {
-            ...this.cfg.headers,
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            sessionId: this.sessionId,
-            seq,
-            frames,
-          }),
-          signal: this.abortController.signal,
-          cache: "no-store",
+        const payload = JSON.stringify({
+          action: "input",
+          sessionId: this.sessionId,
+          seq,
+          frames,
         });
-        if (!res.ok) {
-          this.failAndClose(1006, `RDP input HTTP ${res.status}`);
+
+        let ok = false;
+        let lastStatus = 0;
+        for (let attempt = 0; attempt < 2; attempt++) {
+          try {
+            const res = await fetch(this.cfg.inputUrl, {
+              method: "POST",
+              headers: {
+                ...this.cfg.headers,
+                "Content-Type": "application/json",
+              },
+              body: payload,
+              signal: this.abortController.signal,
+              cache: "no-store",
+            });
+            lastStatus = res.status;
+            if (res.ok) {
+              ok = true;
+              break;
+            }
+            if (res.status < 500 || attempt === 1) break;
+          } catch {
+            if (
+              attempt === 1 ||
+              this.readyState !== SushiServerlessRdpWebSocket.OPEN
+            ) {
+              break;
+            }
+          }
+          await new Promise((r) => setTimeout(r, 150));
+        }
+
+        if (!ok) {
+          if (this.readyState === SushiServerlessRdpWebSocket.OPEN) {
+            this.failAndClose(
+              lastStatus === 401 ? 1008 : 1006,
+              lastStatus ? `RDP input HTTP ${lastStatus}` : "RDP input stream interrupted"
+            );
+          }
           return;
         }
-      }
-    } catch {
-      if (this.readyState === SushiServerlessRdpWebSocket.OPEN) {
-        this.failAndClose(1006, "RDP input stream interrupted");
       }
     } finally {
       this.splitFlushing = false;
@@ -526,13 +551,14 @@ export function buildServerlessRdpProxyUrl(params: {
   ignoreCert?: boolean;
   forceSplitStream?: boolean;
   preferDuplex?: boolean;
+  inputPath?: string;
 }): string {
   installServerlessRdpWebSocketShim();
   const base = (params.httpBase || "").replace(/\/+$/, "");
   const sessionId = randomSessionId();
   pendingConfigs.set(sessionId, {
     streamUrl: `${base}/api/rdp/stream`,
-    inputUrl: `${base}/api/rdp/input`,
+    inputUrl: `${base}${params.inputPath || "/api/rdp/stream"}`,
     headers: getAuthHeaders(params.gatewaySettings),
     ignoreCert: params.ignoreCert !== false,
     forceSplitStream: params.forceSplitStream,

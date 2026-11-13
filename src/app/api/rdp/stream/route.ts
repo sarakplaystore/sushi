@@ -4,6 +4,7 @@ import { getCorsHeaders, verifyRequestAccess } from "@/lib/server/security";
 import {
   buildRDCleanPathError,
   buildRDCleanPathResponse,
+  deliverRdpHttpInput,
   encodeRdpStreamFrame,
   isValidRdpSessionId,
   mapErrorToRDCleanPathDetails,
@@ -41,21 +42,69 @@ export async function POST(req: NextRequest) {
 
   if (isJsonSplitMode) {
     let body: {
+      action?: string;
       sessionId?: string;
       firstFrame?: string;
       ignoreCert?: boolean;
+      seq?: unknown;
+      frames?: unknown;
     };
     try {
       body = (await req.json()) as {
+        action?: string;
         sessionId?: string;
         firstFrame?: string;
         ignoreCert?: boolean;
+        seq?: unknown;
+        frames?: unknown;
       };
     } catch {
       return NextResponse.json(
         { error: "Invalid JSON body." },
         { status: 400, headers: cors }
       );
+    }
+
+    // Handling outbound client frames (`action: "input"`) inside the exact same
+    // `/api/rdp/stream` route function lets Vercel Fluid Compute route concurrent
+    // stream + input calls to the same warm Node.js Lambda (0ms in-memory delivery).
+    if (body.action === "input" || Array.isArray(body.frames)) {
+      if (
+        !isValidRdpSessionId(body.sessionId) ||
+        typeof body.seq !== "number" ||
+        !Number.isInteger(body.seq) ||
+        body.seq < 0 ||
+        !Array.isArray(body.frames) ||
+        body.frames.length === 0 ||
+        body.frames.length > 256 ||
+        !body.frames.every((f) => typeof f === "string")
+      ) {
+        return NextResponse.json(
+          { error: "Invalid sessionId, seq, or frames payload." },
+          { status: 400, headers: cors }
+        );
+      }
+
+      try {
+        const result = await deliverRdpHttpInput({
+          sessionId: body.sessionId,
+          username: auth.username || "admin",
+          seq: body.seq,
+          framesBase64: body.frames as string[],
+        });
+        if (!result.ok) {
+          return NextResponse.json(
+            { error: result.error || "Failed to deliver RDP input." },
+            { status: 410, headers: cors }
+          );
+        }
+        return NextResponse.json({ ok: true, mode: result.mode }, { headers: cors });
+      } catch (err) {
+        return NextResponse.json(
+          { error: err instanceof Error ? err.message : "RDP input delivery failed." },
+          { status: 500, headers: cors }
+        );
+      }
     }
 
     if (!isValidRdpSessionId(body.sessionId) || typeof body.firstFrame !== "string") {
@@ -178,7 +227,7 @@ export async function POST(req: NextRequest) {
             } catch {
               cleanup(controller);
             }
-          }, 20_000);
+          }, 12_000);
         } catch (err) {
           if (!closed) {
             try {

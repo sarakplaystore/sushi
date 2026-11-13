@@ -351,6 +351,12 @@ export function SshTerminalSession({
   const sudoNoPasswordRef = useRef<boolean>(false);
   const secretPromptRef = useRef<SecretPrompt | null>(null);
   const secretBufferRef = useRef<string>("");
+  const termInputHandlerRef = useRef<((data: string) => void) | null>(null);
+
+  const sendMobileTerminalKey = useCallback((seq: string) => {
+    termRef.current?.focus();
+    termInputHandlerRef.current?.(seq);
+  }, []);
 
   useEffect(() => {
     cwdRef.current = currentCwd;
@@ -1588,7 +1594,7 @@ export function SshTerminalSession({
       setStatus("connecting");
 
       // Handle user keystrokes across both WS and Serverless modes
-      term.onData((data) => {
+      const handleTermData = (data: string) => {
         // A failed connection is not a shell: keys are dropped, so nothing gets
         // echoed under the error message (`ubuntu@host:~$ sudo su`). While the shell
         // is still opening there is nothing to type into either.
@@ -1792,7 +1798,9 @@ export function SshTerminalSession({
             term.write(ch);
           }
         }
-      });
+      };
+      termInputHandlerRef.current = handleTermData;
+      term.onData(handleTermData);
 
       const switchToServerlessShell = (notice?: string) => {
         modeRef.current = "serverless";
@@ -2229,8 +2237,8 @@ export function SshTerminalSession({
       }}
     >
       {/* Session Toolbar */}
-      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-white/8 bg-[#0f131b] px-4 py-2">
-        <div className="flex min-w-0 max-w-full flex-wrap items-center gap-2.5">
+      <div className="flex flex-wrap items-center justify-between gap-1.5 border-b border-white/8 bg-[#0f131b] px-2.5 py-1.5 sm:gap-2 sm:px-4 sm:py-2">
+        <div className="flex min-w-0 max-w-full flex-wrap items-center gap-1.5 sm:gap-2.5">
           <span
             className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-0.5 text-[11px] font-medium ${
               status === "connected"
@@ -2361,7 +2369,8 @@ export function SshTerminalSession({
               className="inline-flex items-center gap-1 rounded-md border border-amber-500/25 bg-amber-500/10 px-2 py-0.5 text-[11px] text-amber-200 transition hover:bg-amber-500/20"
             >
               <Radio className="h-3 w-3" />
-              Attach VPS Gateway for full PTY
+              <span className="hidden sm:inline">Attach VPS Gateway for full PTY</span>
+              <span className="sm:hidden">VPS Gateway</span>
             </button>
           )}
         </div>
@@ -2925,6 +2934,49 @@ export function SshTerminalSession({
           />
         )}
       </div>
+
+      {/* Mobile Touch Key Bar (Esc / Tab / Ctrl+C / History Arrows / Shell Symbols) */}
+      {!connectFailure && (
+        <div
+          aria-label="Mobile terminal shortcut keys"
+          className="flex shrink-0 items-center gap-1 overflow-x-auto border-t border-white/8 bg-[#0c1017] px-2 py-1.5 md:hidden"
+        >
+          {(
+            [
+              { label: "Esc", seq: "\x1b", title: "Escape" },
+              { label: "Tab", seq: "\t", title: "Tab autocomplete" },
+              { label: "Ctrl+C", seq: "\x03", title: "Interrupt (SIGINT)", danger: true },
+              { label: "Ctrl+D", seq: "\x04", title: "EOF / logout" },
+              { label: "↑", seq: "\x1b[A", title: "Previous command" },
+              { label: "↓", seq: "\x1b[B", title: "Next command" },
+              { label: "←", seq: "\x1b[D", title: "Cursor left" },
+              { label: "→", seq: "\x1b[C", title: "Cursor right" },
+              { label: "-", seq: "-", title: "Dash / flag" },
+              { label: "/", seq: "/", title: "Slash" },
+              { label: "|", seq: "|", title: "Pipe" },
+              { label: "~", seq: "~", title: "Home (~)" },
+            ] as Array<{ label: string; seq: string; title: string; danger?: boolean }>
+          ).map((key) => (
+            <button
+              key={key.label}
+              type="button"
+              title={key.title}
+              onPointerDown={(e) => {
+                // Keep mobile soft keyboard open while tapping shortcut keys
+                e.preventDefault();
+              }}
+              onClick={() => sendMobileTerminalKey(key.seq)}
+              className={`font-mono-code shrink-0 rounded-lg border px-2.5 py-1 text-xs font-medium active:scale-95 ${
+                key.danger
+                  ? "border-rose-500/30 bg-rose-500/12 text-rose-200 active:bg-rose-500/25"
+                  : "border-white/10 bg-white/[0.06] text-slate-200 active:bg-white/15"
+              }`}
+            >
+              {key.label}
+            </button>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

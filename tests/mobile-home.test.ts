@@ -87,4 +87,40 @@ assert.match(list, /min-w-0 flex-1 truncate text-xs font-medium/, "long host nam
 assert.match(workspace, /desktopHomeNoticeDismissed/, "desktop notice is dismissible and remembered");
 assert.match(workspace, /On a phone, Sushi now opens on your/, "notice explains the new phone home");
 
+// ---- mobile responsiveness: touch, scroll containers, soft keyboard & crypto --
+assert.match(
+  workspace,
+  /flex min-h-0 flex-1 flex-col overflow-hidden px-3 pb-2/,
+  "mobile drawer wraps HostNavList in a flex-1 min-h-0 container so hosts scroll and Settings stays reachable"
+);
+assert.match(
+  workspace,
+  /pointer-events-none invisible -translate-x-full/,
+  "closed mobile drawer disables pointer-events so it never intercepts taps"
+);
+assert.match(
+  workspace,
+  /reuseSalt:/,
+  "routine vault updates reuse existing PBKDF2 salt + cached key instead of freezing mobile main thread"
+);
+
+const cryptoVault = read("src/lib/client/crypto-vault.ts");
+assert.match(cryptoVault, /derivedKeyCache/, "PBKDF2 derived keys are cached in memory");
+
+const ironEngine = read("src/lib/client/ironrdp-engine.ts");
+assert.match(ironEngine, /addEventListener\("touchstart"/, "IronRDP canvas binds touchstart for mobile touch");
+assert.match(ironEngine, /addEventListener\("touchmove"/, "IronRDP canvas binds touchmove for mobile drag & 2-finger scroll");
+assert.match(ironEngine, /touchAction = "none"/, "IronRDP canvas prevents browser pan/zoom hijacking");
+assert.match(ironEngine, /typeText\(text: string\)/, "IronRDP exposes Unicode/IME text typing for mobile soft keyboards");
+
+const rdpSession = read("src/components/RdpDesktopSession.tsx");
+assert.match(rdpSession, /Toggle mobile keyboard/, "RDP toolbar exposes mobile on-screen keyboard button");
+assert.match(rdpSession, /Mobile remote desktop keyboard input/, "RDP stage includes hidden mobile soft-keyboard textarea bridge");
+
+const sshSession = read("src/components/SshTerminalSession.tsx");
+assert.match(sshSession, /Mobile terminal shortcut keys/, "SSH terminal exposes mobile shortcut key bar (Esc, Tab, Ctrl+C, arrows)");
+
+const globalsCss = read("src/app/globals.css");
+assert.match(globalsCss, /touch-action:\s*manipulation/, "interactive elements disable 300ms double-tap-zoom delay on mobile");
+
 console.log("Phone home screen (host list first) tests passed.");

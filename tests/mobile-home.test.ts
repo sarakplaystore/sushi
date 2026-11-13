@@ -67,7 +67,15 @@ assert.ok(!list.includes("ArrowLeftRight"), "row does not render the ArrowLeftRi
 assert.match(list, /onOpen\(entry, "rdp"\)/, "RDP action per row");
 assert.match(list, /onOpen\(entry, "sftp"\)/, "SFTP action per row");
 assert.ok(!list.includes('onOpen(entry, "ssh")'), "redundant SSH icon button is removed from host row");
-assert.match(list, /machineHasManyProfiles/, "deleting a merged row explains it removes every protocol");
+assert.ok(!list.includes("Trash2"), "inline Trash2 delete button is removed from host row");
+assert.ok(!workspace.includes("Trash2"), "inline Trash2 delete button is removed from saved host cards");
+assert.match(list, /machineHasManyProfiles/, "merged row edit tooltip notes multi-protocol machines");
+
+const hostModal = read("src/components/HostProfileModal.tsx");
+assert.match(hostModal, /Remove Host/, "host removal lives inside Edit Host Profile modal");
+assert.match(hostModal, /Confirm Remove/, "Edit Host Profile modal requires confirmation before deleting");
+assert.match(hostModal, /Remove Entire Machine/, "Edit Host Profile modal supports removing all profiles of a merged machine");
+assert.match(workspace, /siblingProtocolsDescription=\{editingHostSiblingProtocols\}/, "workspace wires sibling protocol info into HostProfileModal");
 // Phones have no hover: the roomy variant must not hide the SFTP button behind it.
 const sftpButton = list.slice(list.indexOf('onOpen(entry, "sftp")') - 120, list.indexOf('onOpen(entry, "sftp")'));
 assert.ok(!sftpButton.includes("group-hover"), "SFTP button itself does not gate on group-hover when roomy is active");

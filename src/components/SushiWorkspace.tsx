@@ -10,7 +10,6 @@ import {
   Shield,
   Radio,
   Pencil,
-  Trash2,
   X,
   PanelLeftClose,
   PanelLeftOpen,
@@ -1654,40 +1653,38 @@ export function SushiWorkspace() {
   }, []);
 
   /**
-   * Deletes a connection. `wholeMachine` removes every protocol profile of that
-   * machine (the unified list shows one row per machine, so leaving its RDP/SFTP
-   * twins behind would resurrect a half-deleted host).
+   * Deletes a connection from the Edit Host dialog. `wholeMachine` removes every
+   * protocol profile of that machine; `false` removes only the edited profile.
    */
   const handleDeleteHost = async (
     id: string,
-    e?: React.MouseEvent,
     options: { wholeMachine?: boolean } = {}
   ) => {
-    e?.stopPropagation();
     const target = hosts.find((host) => host.id === id);
     if (!target) return;
-    const siblings = siblingsOf(hosts, target);
-    let nextHosts: HostProfile[];
-    if (options.wholeMachine) {
-      if (
-        siblings.length &&
-        !window.confirm(
-          `Delete ${target.name || target.host} entirely? This also removes its ${describeProtocols(siblings)} profile${siblings.length > 1 ? "s" : ""} (${target.username}@${target.host}).`
-        )
-      ) {
-        return;
-      }
-      nextHosts = removeMachine(hosts, target).hosts;
-    } else {
-      nextHosts = hosts.filter((h) => h.id !== id);
-    }
-    try {
-      const saved = await persistVault(nextHosts, snippets);
-      setHosts(saved.hosts);
-    } catch {
-      // persistVault displays the failure; leave the original host intact.
-    }
+    const nextHosts = options.wholeMachine
+      ? removeMachine(hosts, target).hosts
+      : hosts.filter((h) => h.id !== id);
+    const saved = await persistVault(nextHosts, snippets);
+    setHosts(saved.hosts);
+    setHostModalOpen(false);
+    setEditingProfile(null);
+    setHostModalIntent(null);
   };
+
+  const savedEditingHost = useMemo(
+    () =>
+      editingProfile?.id
+        ? hosts.find((h) => h.id === editingProfile.id) ?? null
+        : null,
+    [editingProfile?.id, hosts]
+  );
+
+  const editingHostSiblingProtocols = useMemo(() => {
+    if (!savedEditingHost) return null;
+    const siblings = siblingsOf(hosts, savedEditingHost);
+    return siblings.length > 0 ? describeProtocols(siblings) : null;
+  }, [hosts, savedEditingHost]);
 
   const handleQuickConnectSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -2212,9 +2209,6 @@ export function SushiWorkspace() {
                   onSearchChange={setHostSearch}
                   onOpen={(entry, protocol) => openUnifiedHost(entry, protocol)}
                   onEdit={handleEditHost}
-                  onDelete={(entry, event) =>
-                    void handleDeleteHost(entry.primary.id, event, { wholeMachine: true })
-                  }
                 />
               </div>
             </>
@@ -2228,9 +2222,6 @@ export function SushiWorkspace() {
               searchInputRef={searchInputRef}
               onOpen={(entry, protocol) => openUnifiedHost(entry, protocol)}
               onEdit={handleEditHost}
-              onDelete={(entry, event) =>
-                void handleDeleteHost(entry.primary.id, event, { wholeMachine: true })
-              }
               onNewHost={() => {
                 setEditingProfile(null);
                 setHostModalIntent(null);
@@ -3132,17 +3123,10 @@ export function SushiWorkspace() {
                                   setHostModalOpen(true);
                                 }}
                                 className="rounded-lg p-1.5 text-slate-400 hover:bg-white/8 hover:text-white"
-                                title={profileCount > 1 ? "Edit this machine (SSH / SFTP / RDP each keep their own profile)" : "Edit"}
+                                aria-label={`Edit ${h.name}`}
+                                title={profileCount > 1 ? "Edit or remove this machine (SSH / SFTP / RDP profiles)" : "Edit or remove host"}
                               >
                                 <Pencil className="h-3.5 w-3.5" />
-                              </button>
-                              <button
-                                type="button"
-                                onClick={(e) => void handleDeleteHost(primary.id, e, { wholeMachine: true })}
-                                className="rounded-lg p-1.5 text-slate-400 hover:bg-rose-500/15 hover:text-rose-400"
-                                title={profileCount > 1 ? "Delete this machine (all its profiles)" : "Delete"}
-                              >
-                                <Trash2 className="h-3.5 w-3.5" />
                               </button>
                             </div>
                           </div>
@@ -3268,9 +3252,6 @@ export function SushiWorkspace() {
                   onSearchChange={setHostSearch}
                   onOpen={(entry, protocol) => openUnifiedHost(entry, protocol)}
                   onEdit={handleEditHost}
-                  onDelete={(entry, event) =>
-                    void handleDeleteHost(entry.primary.id, event, { wholeMachine: true })
-                  }
                   onNewHost={() => {
                     setEditingProfile(null);
                     setHostModalIntent(null);
@@ -3383,6 +3364,13 @@ export function SushiWorkspace() {
           setHostModalIntent(null);
         }}
         onSave={handleSaveHostProfile}
+        siblingProtocolsDescription={editingHostSiblingProtocols}
+        onDelete={
+          savedEditingHost
+            ? ({ wholeMachine }) =>
+                handleDeleteHost(savedEditingHost.id, { wholeMachine })
+            : undefined
+        }
         onQuickConnectOnly={(p) => {
           setHostModalOpen(false);
           setEditingProfile(null);

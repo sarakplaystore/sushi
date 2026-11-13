@@ -14,6 +14,7 @@ import {
   Loader2,
   Play,
   ShieldCheck,
+  Trash2,
 } from "lucide-react";
 import type {
   AuthMethod,
@@ -46,6 +47,10 @@ interface HostProfileModalProps {
   onClose: () => void;
   onSave: (profile: HostProfile, connectAfterSave?: boolean) => Promise<void>;
   onQuickConnectOnly?: (profile: HostProfile) => void;
+  /** Other protocol profiles saved for the same machine (e.g. "SFTP and RDP"). */
+  siblingProtocolsDescription?: string | null;
+  /** Removes the saved host (`wholeMachine` deletes sibling protocol profiles too). */
+  onDelete?: (options: { wholeMachine: boolean }) => Promise<void>;
 }
 
 const ACCENT_COLORS = [
@@ -69,6 +74,8 @@ export function HostProfileModal({
   onClose,
   onSave,
   onQuickConnectOnly,
+  siblingProtocolsDescription = null,
+  onDelete,
 }: HostProfileModalProps) {
   const [protocol, setProtocol] = useState<ProtocolType>("ssh");
   const [name, setName] = useState("");
@@ -100,6 +107,8 @@ export function HostProfileModal({
   const [rdpProbeResult, setRdpProbeResult] = useState<RdpProbeResult | null>(null);
   const [formError, setFormError] = useState<string | null>(null);
   const [savingProfile, setSavingProfile] = useState(false);
+  const [confirmingDelete, setConfirmingDelete] = useState(false);
+  const [deletingProfile, setDeletingProfile] = useState(false);
 
   useEffect(() => {
     if (!isOpen) return;
@@ -134,6 +143,8 @@ export function HostProfileModal({
     setSshTestResult(null);
     setRdpProbeResult(null);
     setFormError(null);
+    setConfirmingDelete(false);
+    setDeletingProfile(false);
   }, [isOpen, initialProfile]);
 
   useEffect(() => {
@@ -246,7 +257,7 @@ export function HostProfileModal({
   };
 
   const handleSaveProfile = async (connectAfterSave: boolean) => {
-    if (savingProfile) return;
+    if (savingProfile || deletingProfile) return;
     const profile = buildProfile();
     if (!profile) return;
     setFormError(null);
@@ -257,6 +268,21 @@ export function HostProfileModal({
       setFormError(error instanceof Error ? error.message : "Could not save this host.");
     } finally {
       setSavingProfile(false);
+    }
+  };
+
+  const handleDeleteProfile = async (wholeMachine: boolean) => {
+    if (!onDelete || deletingProfile || savingProfile) return;
+    setFormError(null);
+    setDeletingProfile(true);
+    try {
+      await onDelete({ wholeMachine });
+    } catch (error) {
+      setFormError(
+        error instanceof Error ? error.message : "Could not remove this host."
+      );
+    } finally {
+      setDeletingProfile(false);
     }
   };
 
@@ -956,9 +982,73 @@ export function HostProfileModal({
           )}
         </div>
 
+        {/* Inline Remove Host Confirmation */}
+        {confirmingDelete && onDelete && initialProfile?.id && (
+          <div className="flex flex-wrap items-center justify-between gap-2.5 border-t border-rose-500/25 bg-rose-950/35 px-4 py-3 text-xs text-rose-100 sm:px-6">
+            <div className="min-w-0 flex-1">
+              <p className="font-medium text-rose-200">
+                Remove {name.trim() || host.trim() || "this host"} from your vault?
+              </p>
+              {siblingProtocolsDescription ? (
+                <p className="mt-0.5 text-[11px] text-rose-200/75">
+                  This machine also has saved {siblingProtocolsDescription} profile(s).
+                </p>
+              ) : (
+                <p className="mt-0.5 text-[11px] text-rose-200/75">
+                  Saved credentials for {username.trim() || "user"}@{host.trim() || "host"} will be deleted.
+                </p>
+              )}
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                disabled={deletingProfile}
+                onClick={() => setConfirmingDelete(false)}
+                className="rounded-lg border border-white/15 bg-white/5 px-2.5 py-1.5 text-xs font-medium text-slate-200 transition hover:bg-white/10"
+              >
+                Keep Host
+              </button>
+              {siblingProtocolsDescription && (
+                <button
+                  type="button"
+                  disabled={deletingProfile}
+                  onClick={() => void handleDeleteProfile(false)}
+                  className="rounded-lg border border-rose-400/35 bg-rose-500/15 px-2.5 py-1.5 text-xs font-medium text-rose-100 transition hover:bg-rose-500/25"
+                >
+                  Only {(initialProfile.protocol || protocol).toUpperCase()} Profile
+                </button>
+              )}
+              <button
+                type="button"
+                disabled={deletingProfile}
+                onClick={() => void handleDeleteProfile(true)}
+                className="flex items-center gap-1.5 rounded-lg bg-rose-600 px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-rose-500 disabled:opacity-60"
+              >
+                {deletingProfile ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <Trash2 className="h-3.5 w-3.5" />
+                )}
+                {siblingProtocolsDescription ? "Remove Entire Machine" : "Confirm Remove"}
+              </button>
+            </div>
+          </div>
+        )}
+
         {/* Footer */}
         <div className="grid grid-cols-2 gap-2 border-t border-white/8 bg-[#0b0e14] px-4 py-3 sm:flex sm:flex-wrap sm:items-center sm:justify-between sm:gap-3 sm:px-6 sm:py-4">
-          {onQuickConnectOnly && !initialProfile?.id ? (
+          {onDelete && initialProfile?.id ? (
+            <button
+              type="button"
+              disabled={savingProfile || deletingProfile}
+              onClick={() => setConfirmingDelete((prev) => !prev)}
+              aria-label="Remove host from vault"
+              className="flex items-center justify-center gap-1.5 rounded-xl border border-rose-500/25 bg-rose-500/10 px-2.5 py-2 text-xs font-medium text-rose-300 transition hover:border-rose-500/40 hover:bg-rose-500/20 hover:text-rose-200 sm:px-3.5"
+            >
+              <Trash2 className="h-3.5 w-3.5" />
+              <span>Remove Host</span>
+            </button>
+          ) : onQuickConnectOnly && !initialProfile?.id ? (
             <button
               type="button"
               onClick={() => {
@@ -979,14 +1069,14 @@ export function HostProfileModal({
             <button
               type="button"
               onClick={onClose}
-              className={`${onQuickConnectOnly && !initialProfile?.id ? "" : "col-span-2"} rounded-xl px-2 py-2 text-xs font-medium text-slate-400 transition hover:bg-white/5 hover:text-white sm:px-4`}
+              className={`${(onDelete && initialProfile?.id) || (onQuickConnectOnly && !initialProfile?.id) ? "" : "col-span-2"} rounded-xl px-2 py-2 text-xs font-medium text-slate-400 transition hover:bg-white/5 hover:text-white sm:px-4`}
             >
               Cancel
             </button>
             <button
               type="button"
               onClick={() => void handleSaveProfile(false)}
-              disabled={savingProfile}
+              disabled={savingProfile || deletingProfile}
               className="rounded-xl border border-white/15 bg-white/8 px-2 py-2 text-xs font-medium text-white transition hover:bg-white/14 sm:px-4"
             >
               Save to Vault
@@ -994,7 +1084,7 @@ export function HostProfileModal({
             <button
               type="button"
               onClick={() => void handleSaveProfile(true)}
-              disabled={savingProfile}
+              disabled={savingProfile || deletingProfile}
               className="flex items-center justify-center gap-1 rounded-xl bg-[#ff6b57] px-2 py-2 text-xs font-semibold text-white shadow-lg shadow-[#ff6b57]/20 transition hover:bg-[#ff7f6e] sm:gap-1.5 sm:px-4"
             >
               <Play className="h-3.5 w-3.5 fill-current" />

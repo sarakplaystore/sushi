@@ -8,7 +8,6 @@ import {
   Plus,
   Search,
   Terminal,
-  Trash2,
   X,
 } from "lucide-react";
 import type { ProtocolType } from "@/types/connection";
@@ -40,10 +39,8 @@ export interface HostNavListProps {
   searchInputRef?: React.RefObject<HTMLInputElement | null>;
   /** Opens a merged host, optionally on a specific protocol. */
   onOpen: (entry: UnifiedHost, protocol?: ProtocolType) => void;
-  /** Edit the machine / this connection. */
+  /** Edit the machine / this connection (also where host removal lives). */
   onEdit: (entry: UnifiedHost) => void;
-  /** Delete the machine (with its confirmation), `event` stops row navigation. */
-  onDelete: (entry: UnifiedHost, event: React.MouseEvent) => void;
   /** Opens the "new connection" dialog (shown next to search). */
   onNewHost?: () => void;
   /** A dense variant for the drawer, a roomier one for a full screen. */
@@ -61,7 +58,6 @@ export function HostNavList({
   searchInputRef,
   onOpen,
   onEdit,
-  onDelete,
   onNewHost,
   variant = "drawer",
 }: HostNavListProps) {
@@ -189,7 +185,6 @@ export function HostNavList({
                   roomy={roomy}
                   onOpen={onOpen}
                   onEdit={onEdit}
-                  onDelete={onDelete}
                 />
               ))}
             </div>
@@ -205,13 +200,11 @@ function HostRow({
   roomy,
   onOpen,
   onEdit,
-  onDelete,
 }: {
   entry: UnifiedHost;
   roomy: boolean;
   onOpen: HostNavListProps["onOpen"];
   onEdit: HostNavListProps["onEdit"];
-  onDelete: HostNavListProps["onDelete"];
 }) {
   const ProtoIcon = entry.protocols.rdp
     ? Monitor
@@ -315,24 +308,11 @@ function HostRow({
           aria-label={`Edit ${entry.name}`}
           title={
             machineHasManyProfiles
-              ? "Edit this connection (each protocol keeps its own profile)"
-              : "Edit host"
+              ? "Edit or remove this connection (each protocol keeps its own profile)"
+              : "Edit or remove host"
           }
         >
           <Pencil className="h-3 w-3" />
-        </button>
-        <button
-          type="button"
-          onClick={(event) => onDelete(entry, event)}
-          className="rounded p-1 text-slate-400 hover:bg-rose-500/20 hover:text-rose-400"
-          aria-label={`Delete ${entry.name}`}
-          title={
-            machineHasManyProfiles
-              ? "Delete this machine (SSH / SFTP / RDP profiles)"
-              : "Delete host"
-          }
-        >
-          <Trash2 className="h-3 w-3" />
         </button>
       </div>
     </div>

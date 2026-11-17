@@ -26,6 +26,7 @@ import {
   Languages,
   Infinity,
   Square,
+  Users,
 } from "lucide-react";
 import type {
   CommandSnippet,
@@ -38,6 +39,11 @@ import {
   buildWebSocketUrl,
   getAuthHeaders,
 } from "@/lib/client/gateway";
+import {
+  type SharedSessionView,
+  loadShareDisplayName,
+} from "@/lib/client/shared-ssh";
+import { ShareSessionModal, type ShareStartOptions } from "./ShareSessionModal";
 import {
   type ExecStdinChannel,
   canStreamExecStdin,
@@ -243,6 +249,21 @@ export function SshTerminalSession({
   const streamingConfirmedRef = useRef(false);
   const [streamingStdinBlocked, setStreamingStdinBlocked] = useState(false);
 
+  // ---- team sharing (one shell, many people) ---------------------------------
+  const [shareModalOpen, setShareModalOpen] = useState(false);
+  /** Non-null exactly while this tab's shell is published to the team. */
+  const [sharedInfo, setSharedInfo] = useState<SharedSessionView | null>(null);
+  /** The 6-digit code minted when the share started (rotating replaces it). */
+  const [sharePasscode, setSharePasscode] = useState<string | null>(null);
+  const [shareBusy, setShareBusy] = useState(false);
+  const [shareError, setShareError] = useState<string | null>(null);
+  const [shareActivity, setShareActivity] = useState<{ by: string; at: number } | null>(
+    null
+  );
+  /** Set when "Start sharing" is pressed before the PTY exists. */
+  const pendingShareRef = useRef<ShareStartOptions | null>(null);
+  const shareActivityTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
   const [transportMode, setTransportMode] = useState<"ws" | "serverless">(
     wsAvailable ? "ws" : "serverless"
   );
@@ -256,6 +277,71 @@ export function SshTerminalSession({
   const statusRef = useRef(status);
   statusRef.current = status;
   const [fingerprint, setFingerprint] = useState<string | undefined>();
+
+  /**
+   * Share control frames ride on the same socket as the terminal, so they can only be
+   * sent once the PTY is up; anything sent before that is queued in `pendingShareRef`
+   * and flushed by the `ready` handler.
+   */
+  const sendShareControl = useCallback((payload: Record<string, unknown>): boolean => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+    try {
+      ws.send(JSON.stringify(payload));
+      return true;
+    } catch {
+      return false;
+    }
+  }, []);
+
+  const startSharing = useCallback(
+    (options: ShareStartOptions) => {
+      setShareError(null);
+      const frame = {
+        type: "share",
+        action: "start" as const,
+        write: options.write,
+        passcode: options.access === "passcode" ? "auto" : "none",
+        name: loadShareDisplayName() || undefined,
+      };
+      if (!sendShareControl(frame)) {
+        // The shell is still connecting: publish it the moment the PTY exists.
+        pendingShareRef.current = options;
+        setShareBusy(true);
+        return;
+      }
+      setShareBusy(true);
+    },
+    [sendShareControl]
+  );
+
+  const stopSharing = useCallback(
+    (shareId?: string) => {
+      setShareError(null);
+      // A share hosted by another tab/session has to be stopped through the API:
+      // this socket has no hold on it.
+      if (shareId && shareId !== sharedInfo?.shareId) {
+        void fetch(`/api/ssh/share?id=${encodeURIComponent(shareId)}`, {
+          method: "DELETE",
+          headers: getAuthHeaders(gatewaySettings),
+        }).catch(() => undefined);
+        setShareModalOpen(false);
+        return;
+      }
+      if (!sendShareControl({ type: "share", action: "stop" })) {
+        setShareError("Connect the terminal before sharing it.");
+      }
+    },
+    [gatewaySettings, sendShareControl, sharedInfo?.shareId]
+  );
+
+  const rotateSharePasscode = useCallback(() => {
+    setShareError(null);
+    if (!sendShareControl({ type: "share", action: "rotate" })) {
+      setShareError("This terminal is not being shared.");
+    }
+  }, [sendShareControl]);
+
   /**
    * Distro + version and hosting platform of the remote machine, e.g.
    * "Ubuntu 24.04.1 LTS · Oracle Cloud". Read once per connection.
@@ -1964,6 +2050,20 @@ export function SshTerminalSession({
               if (msg.fingerprint) setFingerprint(msg.fingerprint);
               onConnectedRef.current?.();
               term.focus();
+              // "Start sharing" pressed while this shell was still connecting.
+              const pendingShare = pendingShareRef.current;
+              if (pendingShare) {
+                pendingShareRef.current = null;
+                ws.send(
+                  JSON.stringify({
+                    type: "share",
+                    action: "start",
+                    write: pendingShare.write,
+                    passcode: pendingShare.access === "passcode" ? "auto" : "none",
+                    name: loadShareDisplayName() || undefined,
+                  })
+                );
+              }
               if (initialPath && initialPath !== "~") {
                 ws.send(
                   JSON.stringify({
@@ -1977,6 +2077,34 @@ export function SshTerminalSession({
                 stream: true,
               });
               term.write(text);
+            } else if (msg.type === "share") {
+              if (msg.action === "started" || msg.action === "rotated") {
+                setSharedInfo((msg.share as SharedSessionView) ?? null);
+                setSharePasscode(typeof msg.passcode === "string" ? msg.passcode : null);
+                setShareBusy(false);
+              } else if (msg.action === "stopped") {
+                setSharedInfo(null);
+                setSharePasscode(null);
+                setShareBusy(false);
+              }
+            } else if (msg.type === "participants") {
+              setSharedInfo((prev) =>
+                prev
+                  ? {
+                      ...prev,
+                      participants: Array.isArray(msg.participants)
+                        ? msg.participants
+                        : [],
+                    }
+                  : prev
+              );
+            } else if (msg.type === "activity" && typeof msg.by === "string") {
+              setShareActivity({ by: msg.by, at: Date.now() });
+              if (shareActivityTimer.current) clearTimeout(shareActivityTimer.current);
+              shareActivityTimer.current = setTimeout(
+                () => setShareActivity(null),
+                4000
+              );
             } else if (msg.type === "error") {
               lastServerError = String(msg.message || "");
               // A remote gateway that refuses our tokens closes with 1008 next;
@@ -2016,6 +2144,10 @@ export function SshTerminalSession({
           if (disposed) return;
           if (openedReady) {
             setStatus("disconnected");
+            // This socket is gone, so this tab no longer hosts that share. The
+            // shell itself keeps running for whoever is still attached.
+            setSharedInfo(null);
+            setSharePasscode(null);
             return;
           }
           if (fellBack) return;
@@ -2387,6 +2519,28 @@ export function SshTerminalSession({
             </span>
           )}
 
+          {sharedInfo && (
+            <button
+              type="button"
+              onClick={() => setShareModalOpen(true)}
+              title="Manage this shared session"
+              className="inline-flex items-center gap-1 rounded-md border border-[#ff6b57]/30 bg-[#ff6b57]/10 px-2 py-0.5 text-[11px] font-medium text-[#ff9587] transition hover:bg-[#ff6b57]/20"
+            >
+              <Users className="h-3 w-3" />
+              <span className="hidden lg:inline">
+                {sharedInfo.participants.length} in shared shell
+              </span>
+              <span className="lg:hidden">{sharedInfo.participants.length}</span>
+            </button>
+          )}
+
+          {shareActivity && (
+            <span className="hidden items-center gap-1 rounded-md border border-white/10 bg-white/[0.03] px-2 py-0.5 text-[11px] text-slate-400 xl:inline-flex">
+              <Keyboard className="h-3 w-3" />
+              {shareActivity.by} is typing
+            </span>
+          )}
+
           {detachedRun && (
             <span
               title={`This no-timeout command is still running on the host. Output log: ${detachedRun.runLog || "n/a"} (read it via SFTP or \`cat ${detachedRun.runLog}\`). Keystrokes are delivered to ${detachedRun.path}.`}
@@ -2463,6 +2617,17 @@ export function SshTerminalSession({
           >
             <Monitor className="h-3.5 w-3.5" />
             <span className="hidden sm:inline">Open RDP</span>
+          </button>
+
+          {/* Share this shell with the team */}
+          <button
+            type="button"
+            onClick={() => setShareModalOpen(true)}
+            className="flex items-center gap-1.5 rounded-lg border border-white/10 bg-white/5 px-2.5 py-1 text-xs text-slate-200 transition hover:bg-white/10"
+            title="Share this terminal with your team"
+          >
+            <Users className="h-3.5 w-3.5 text-[#ff9587]" />
+            <span className="hidden sm:inline">Share</span>
           </button>
 
           {/* Snippets Popover */}
@@ -3043,6 +3208,25 @@ export function SshTerminalSession({
             </button>
           ))}
         </div>
+      )}
+
+      {/* Team sharing panel */}
+      {shareModalOpen && (
+        <ShareSessionModal
+          open={shareModalOpen}
+          onClose={() => setShareModalOpen(false)}
+          activeShare={sharedInfo}
+          passcode={sharePasscode}
+          hostLabel={`${profile.username}@${profile.host}:${profile.port}`}
+          canShare={transportMode === "ws"}
+          busy={shareBusy}
+          error={shareError}
+          onStart={startSharing}
+          onStop={stopSharing}
+          onRotate={rotateSharePasscode}
+          onOpenGatewayModal={onOpenGatewayModal}
+          gatewaySettings={gatewaySettings}
+        />
       )}
     </div>
   );

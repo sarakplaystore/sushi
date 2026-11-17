@@ -43,6 +43,15 @@ patches in Next.js/Node/Docker/`sshd`/`xrdp`/`guacd` themselves, third-party pro
 "the admin account can access every host" (that is the documented single-admin design, not a
 vulnerability — see `DISCLAIMER.md` §3.2).
 
+## Shared SSH sessions (team sharing)
+
+A shared terminal is a live handover of the host account: everyone attached to
+`/share/<id>` runs commands as that connection's SSH user, and the shell stays up on the
+server (default 12 h) after the last person leaves. Share only with people you would
+give the host password to, prefer the read-only mode when someone only needs to watch,
+and stop the share when the work is done. Rotate the 6-digit code if a link leaks, or
+switch the share to *signed-in Sushi accounts* so no code exists at all.
+
 ## Baseline protections you should enable
 
 HTTPS in front of the app, a strong unique password, passkeys where available, network

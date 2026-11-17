@@ -104,6 +104,26 @@ export async function verifyRequestAccess(
   return verifyIncomingAuth(headers, explicitSessionOrToken);
 }
 
+/**
+ * Browsers cannot set custom headers on a WebSocket handshake, so the SSH / RDP
+ * clients send their Sushi session token and VPS gateway token in the first message
+ * or the query string. Map both onto the headers the HTTP API uses, so the session
+ * token is verified as a session AND the gateway token is checked against
+ * SUSHI_GATEWAY_TOKEN. (Forwarding only one of them — always as a session token —
+ * meant a Vercel-hosted Sushi could never authenticate to a VPS gateway.)
+ */
+export function withBrowserTokenHeaders(
+  headers: IncomingMessage["headers"],
+  tokens: { session?: string | null; gateway?: string | null }
+): IncomingMessage["headers"] {
+  const merged: IncomingMessage["headers"] = { ...headers };
+  const session = tokens.session?.trim();
+  const gateway = tokens.gateway?.trim();
+  if (session) merged["x-sushi-session"] = session;
+  if (gateway) merged["x-sushi-token"] = gateway;
+  return merged;
+}
+
 export function getCorsHeaders(origin?: string | null): Record<string, string> {
   const configuredOrigin = process.env.ALLOWED_ORIGIN?.trim();
   const effectiveOrigin =

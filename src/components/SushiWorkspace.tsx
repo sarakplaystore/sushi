@@ -33,6 +33,7 @@ import {
   RotateCcw,
   Infinity as InfinityIcon,
   Square,
+  Heart,
 } from "lucide-react";
 import type { AuthStatusResponse } from "@/types/auth";
 import type {
@@ -94,6 +95,8 @@ import { GatewaySetupModal } from "./GatewaySetupModal";
 import { VaultSecurityModal, type VaultModalTab } from "./VaultSecurityModal";
 import { AuthGateScreen } from "./AuthGateScreen";
 import { AccountPasskeysModal } from "./AccountPasskeysModal";
+import { DonateModal } from "./DonateModal";
+import { DONATION_ADDRESS } from "@/lib/client/donation";
 import { SshTerminalSession } from "./SshTerminalSession";
 import { SftpBrowserSession } from "./SftpBrowserSession";
 import { RdpDesktopSession } from "./RdpDesktopSession";
@@ -284,9 +287,10 @@ export function SushiWorkspace() {
     useState<VaultModalTab>("security");
   const [vaultModalFocusBackup, setVaultModalFocusBackup] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [donateModalOpen, setDonateModalOpen] = useState(false);
   // Do not replace in-memory data while a form is being edited.
   syncEligibleRef.current = vaultReady && !hostModalOpen &&
-    !vaultModalOpen && !accountModalOpen && !gatewayModalOpen;
+    !vaultModalOpen && !accountModalOpen && !gatewayModalOpen && !donateModalOpen;
 
   const searchInputRef = useRef<HTMLInputElement | null>(null);
   const mobileMenuButtonRef = useRef<HTMLButtonElement | null>(null);
@@ -2349,6 +2353,12 @@ export function SushiWorkspace() {
                     <HardDriveDownload className="mt-0.5 h-4 w-4 shrink-0 text-amber-300" />
                     <span>Vault &amp; iCloud Drive backup <span className="mt-0.5 block text-[10px] text-slate-400">Manual encrypted file backup / restore</span></span>
                   </button>
+                  <button type="button" onClick={() => {
+                    setSettingsOpen(false); setDonateModalOpen(true); setMobileSidebarOpen(false);
+                  }} className="flex w-full items-start gap-2.5 rounded-lg px-2.5 py-2 text-left text-xs text-slate-200 hover:bg-white/8 focus-visible:outline-2 focus-visible:outline-[#ff6b57]">
+                    <Heart className="mt-0.5 h-4 w-4 shrink-0 text-[#ff6b57]" />
+                    <span>Donate crypto <span className="mt-0.5 block text-[10px] text-slate-400">Support Sushi — {DONATION_ADDRESS.slice(0, 6)}…{DONATION_ADDRESS.slice(-4)}</span></span>
+                  </button>
                 </div>
               )}
               <button ref={settingsButtonRef} type="button" onClick={() => setSettingsOpen((open) => !open)} aria-haspopup="dialog" aria-expanded={settingsOpen} aria-controls="workspace-settings" className="flex w-full items-center justify-between rounded-xl border border-white/8 bg-[#131823] px-3 py-2.5 text-xs font-medium text-slate-200 transition hover:border-white/18 hover:bg-white/8 focus-visible:outline-2 focus-visible:outline-[#ff6b57]">
@@ -2907,6 +2917,15 @@ export function SushiWorkspace() {
                           ? "Vercel Serverless Mode"
                           : "VPS Self-Hosted Mode"}
                     </button>
+                    <button
+                      type="button"
+                      onClick={() => setDonateModalOpen(true)}
+                      className="inline-flex items-center gap-1.5 rounded-xl border border-[#ff6b57]/30 bg-[#ff6b57]/10 px-3.5 py-2 text-xs font-medium text-[#ff9587] transition hover:bg-[#ff6b57]/20"
+                      title={`Donate crypto to support Sushi — ${DONATION_ADDRESS}`}
+                    >
+                      <Heart className="h-3.5 w-3.5" />
+                      Donate crypto
+                    </button>
                   </div>
                 </div>
 
@@ -3406,6 +3425,11 @@ export function SushiWorkspace() {
           setGatewaySettings(nextSettings);
           setRemoteCaps(nextRemoteCaps);
         }}
+      />
+
+      <DonateModal
+        isOpen={donateModalOpen}
+        onClose={() => setDonateModalOpen(false)}
       />
 
       <VaultSecurityModal

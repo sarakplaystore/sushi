@@ -49,6 +49,11 @@ export interface HostProfile {
   rdpDrive?: boolean;
   // SFTP specific options
   initialPath?: string;
+  /**
+   * Browse files as root ("auto sudo su"): SFTP runs through `sudo` instead of
+   * sshd's own subsystem, so /etc, /var/lib/... and root-owned files are editable.
+   */
+  sftpElevated?: boolean;
   // Organization
   group?: string;
   tags?: string[];
@@ -85,6 +90,16 @@ export interface ConnectionCredentials {
   /** IANA zone for the remote clock, e.g. "Asia/Phnom_Penh". */
   timezone?: string;
   dpi?: number;
+  /**
+   * SFTP only: run the file session through `sudo` so it acts as root
+   * (see `src/lib/server/sftp-elevation.ts`).
+   */
+  sftpElevate?: {
+    /** Run as this user (default "root"). */
+    user?: string;
+    /** sudo password, when the server asks for one. Never stored on the host. */
+    password?: string;
+  };
 }
 
 export interface SftpEntry {

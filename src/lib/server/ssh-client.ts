@@ -11,6 +11,15 @@ import net from "node:net";
 import { isPrivateIp, validateTargetHost } from "./security";
 import { SYSINFO_SCRIPT, parseSysinfo } from "./sysinfo";
 import { normalizePrivateKeyForSsh } from "./ssh-key-utils";
+import {
+  SFTP_SUDO_PROBE_SCRIPT,
+  buildElevatedSftpCommand,
+  buildSftpServerProbeScript,
+  openElevatedSftp,
+  parseSftpServerProbe,
+  parseSudoProbe,
+  type ElevatedSftpSession,
+} from "./sftp-elevation";
 
 export interface ConnectedSshSession {
   client: Client;
@@ -369,25 +378,147 @@ export async function testSshConnection(
   }
 }
 
+/**
+ * What one SFTP session can tell the caller beyond the file operations themselves.
+ *
+ * `elevated` is how the browser learns whether it is really looking at root's view
+ * of the filesystem, and `elevationError` carries the reason when "auto sudo su"
+ * could not start, so the UI can fall back to the login user *and* say why.
+ */
+export interface SftpSessionMeta {
+  /** The session runs as root (or the configured sudo user). */
+  elevated: boolean;
+  /** Set when elevation was requested but could not be started. */
+  elevationError?: string;
+}
+
+export interface SftpSessionAccess {
+  sftp: SFTPWrapper;
+  session: ConnectedSshSession;
+  meta: SftpSessionMeta;
+}
+
+/**
+ * Opens an SFTP session — through `sudo` when `creds.sftpElevate` is set — runs
+ * `handler`, and always closes both the file session and the SSH connection.
+ *
+ * Elevation never makes the file browser *worse*: when `sudo` is missing, asks for
+ * a password we don't have, or the SFTP server binary cannot be found, the caller
+ * still gets a working session as the login user plus a human-readable reason.
+ */
+export async function withSftpAccess<T>(
+  creds: ConnectionCredentials,
+  handler: (access: SftpSessionAccess) => Promise<T>
+): Promise<T> {
+  const session = await connectSsh(creds, 15000);
+  try {
+    const elevate = creds.sftpElevate;
+    if (elevate) {
+      const elevated = await tryElevatedSftp(session.client, elevate);
+      if ("session" in elevated) {
+        try {
+          return await handler({
+            sftp: elevated.session.sftp,
+            session,
+            meta: { elevated: true },
+          });
+        } finally {
+          await elevated.session.close();
+        }
+      }
+      const sftp = await openPlainSftp(session.client);
+      return await handler({
+        sftp,
+        session,
+        meta: { elevated: false, elevationError: elevated.error },
+      });
+    }
+
+    const sftp = await openPlainSftp(session.client);
+    return await handler({ sftp, session, meta: { elevated: false } });
+  } finally {
+    session.client.end();
+  }
+}
+
+/** Opens sshd's own SFTP subsystem (the unelevated path). */
+async function openPlainSftp(client: import("ssh2").Client): Promise<SFTPWrapper> {
+  return new Promise<SFTPWrapper>((resolve, reject) => {
+    client.sftp((err, sftpStream) => {
+      if (err) {
+        reject(new Error(err.message || "Failed to open SFTP subsystem."));
+        return;
+      }
+      resolve(sftpStream);
+    });
+  });
+}
+
+/**
+ * Runs the remote pre-flight checks and opens the elevated session.
+ *
+ * Returns `{ error }` instead of throwing: a server without `sudo`, or one that
+ * wants a password we were not given, is a normal situation the file browser
+ * continues from as the login user.
+ */
+async function tryElevatedSftp(
+  client: import("ssh2").Client,
+  elevate: NonNullable<ConnectionCredentials["sftpElevate"]>
+): Promise<{ session: ElevatedSftpSession } | { error: string }> {
+  let command = "";
+  try {
+    const probe = await execSimple(client, SFTP_SUDO_PROBE_SCRIPT, 8000);
+    const sudoState = parseSudoProbe(probe);
+    if (sudoState.status === "missing") {
+      return {
+        error:
+          "This server has no sudo, so files can only be browsed as your login user. Connect as root (key auth) to manage root-owned files.",
+      };
+    }
+    if (sudoState.status === "needs-password" && !elevate.password) {
+      return {
+        error:
+          "sudo needs a password on this server. Enter the sudo password to browse files as root.",
+      };
+    }
+
+    const serverPath = parseSftpServerProbe(
+      await execSimple(client, buildSftpServerProbeScript(), 8000)
+    );
+    if (!serverPath) {
+      return {
+        error:
+          "No sftp-server binary was found on this host, so SFTP cannot run as root. Files are still browsable as your login user.",
+      };
+    }
+
+    command = buildElevatedSftpCommand({
+      user: elevate.user,
+      password: sudoState.status === "needs-password" ? elevate.password : undefined,
+    });
+    const elevated = await openElevatedSftp(client, command, { timeoutMs: 15000 });
+    if (!elevated) {
+      return {
+        error:
+          "Root SFTP is not available on this deployment; files are browsed as your login user.",
+      };
+    }
+    return { session: elevated };
+  } catch (err) {
+    return {
+      error:
+        err instanceof Error
+          ? err.message
+          : "Could not start SFTP as root; files are browsed as your login user.",
+    };
+  }
+}
+
 export async function withSftp<T>(
   creds: ConnectionCredentials,
   handler: (sftp: SFTPWrapper, session: ConnectedSshSession) => Promise<T>
 ): Promise<T> {
-  const session = await connectSsh(creds, 15000);
-  try {
-    const sftp = await new Promise<SFTPWrapper>((resolve, reject) => {
-      session.client.sftp((err, sftpStream) => {
-        if (err) {
-          reject(new Error(err.message || "Failed to open SFTP subsystem."));
-          return;
-        }
-        resolve(sftpStream);
-      });
-    });
-    return await handler(sftp, session);
-  } finally {
-    session.client.end();
-  }
+  return withSftpAccess(creds, ({ sftp, session }) => handler(sftp, session));
 }
 
 function sftpRealpath(sftp: SFTPWrapper, target: string): Promise<string> {
@@ -417,11 +548,21 @@ function sftpStat(sftp: SFTPWrapper, target: string): Promise<Attributes> {
   });
 }
 
+/**
+ * Lists a directory. `elevated` / `elevationError` tell the browser whether the
+ * session really runs as root and, when it does not, why (see `withSftpAccess`).
+ */
 export async function sftpListDirectory(
   creds: ConnectionCredentials,
   requestedPath?: string
-): Promise<{ cwd: string; entries: SftpEntry[]; fingerprint?: string }> {
-  return withSftp(creds, async (sftp, session) => {
+): Promise<{
+  cwd: string;
+  entries: SftpEntry[];
+  fingerprint?: string;
+  elevated: boolean;
+  elevationError?: string;
+}> {
+  return withSftpAccess(creds, async ({ sftp, session, meta }) => {
     const rawTarget =
       !requestedPath || requestedPath === "~" || requestedPath === "."
         ? "."
@@ -473,6 +614,8 @@ export async function sftpListDirectory(
       cwd: resolvedPath,
       entries,
       fingerprint: session.fingerprint,
+      elevated: meta.elevated,
+      ...(meta.elevationError ? { elevationError: meta.elevationError } : {}),
     };
   });
 }

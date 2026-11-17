@@ -1,5 +1,15 @@
 # Sushi
 
+> **⚠️ Read before you deploy.** Sushi is **AI-assisted software provided "AS IS", with no
+> warranty and no support commitment.** It is remote-access software: whoever signs in can run
+> commands as the accounts you save, and the app has **one admin account with full access to
+> every saved host** — there are no per-user or per-host permissions. Limit other people on the
+> target machine (scoped OS users, `rbash`, `sudoers`, RDP "Remote Desktop Users"), never by
+> handing out your admin password.
+> **Operate it only on hosts you are authorized to access, over HTTPS, with backups.**
+> Full terms: [`DISCLAIMER.md`](DISCLAIMER.md) · Data handling: [`PRIVACY.md`](PRIVACY.md) ·
+> Reporting a vulnerability: [`SECURITY.md`](SECURITY.md).
+
 **Sushi** is a self-hosted and Vercel-ready web workspace for **SSH**, **SFTP**, and **RDP** remote infrastructure management.
 
 It is designed around a **Hybrid VPS + Serverless Architecture**:
@@ -810,3 +820,24 @@ npm run typecheck
 npm test
 npm run build
 ```
+
+---
+
+## Legal, privacy & liability (read this)
+
+Sushi is a **self-hosted tool that can run commands and control desktops on your servers**. That
+is powerful and dangerous. The project publishes three documents so expectations are explicit:
+
+| Document | What it covers |
+|---|---|
+| [`DISCLAIMER.md`](DISCLAIMER.md) | **AI-assisted development disclosure**, "AS IS" warranty disclaimer, assumption of risk (remote access, destructive actions, credential compromise), **limitation of liability** (indirect/consequential damages, data loss, downtime, regulatory fines), no-support policy, acceptable-use rules, and the fact that there is **no `LICENSE` file yet** (so default copyright applies — add one before redistributing) |
+| [`PRIVACY.md`](PRIVACY.md) | Exactly what is stored and where — `auth.json` (username, `scrypt` verifier, public passkeys), `vault.enc.json` (**AES-256-GCM ciphertext the server cannot decrypt**), browser `localStorage` keys, `/tmp/.sushi-*` files on remote hosts — plus retention, third parties (Google Translate only if `SUSHI_TRANSLATE_URL` is unset), data-subject rights and breach duties. **There is no telemetry and no maintainer backend** |
+| [`SECURITY.md`](SECURITY.md) | How to report a vulnerability privately, what is in/out of scope, and the protections you are expected to enable |
+
+**The short version:** no warranty; you are the operator and the data controller; the maintainer
+receives none of your data and owes you no SLA; use it only on systems you are authorized to
+access; keep backups. None of these documents is legal advice — if you run Sushi as a service
+for other people, have a lawyer review them for your jurisdiction.
+
+Inside the app the same warning appears once, on the sign-in screen and on the launchpad
+(AI-assisted · experimental · no warranty), with a link to these files.

@@ -96,6 +96,7 @@ import { VaultSecurityModal, type VaultModalTab } from "./VaultSecurityModal";
 import { AuthGateScreen } from "./AuthGateScreen";
 import { AccountPasskeysModal } from "./AccountPasskeysModal";
 import { DonateModal } from "./DonateModal";
+import { AiDisclaimer } from "./AiDisclaimer";
 import { DONATION_ADDRESS } from "@/lib/client/donation";
 import { SshTerminalSession } from "./SshTerminalSession";
 import { SftpBrowserSession } from "./SftpBrowserSession";
@@ -2511,6 +2512,9 @@ export function SushiWorkspace() {
                 : "hidden"
             }
           >
+            {/* Stated once in the product itself: AI-assisted, no warranty, single admin. */}
+            <AiDisclaimer className="mx-auto mb-4 w-full max-w-5xl" />
+
             {/* Pinned hero on a phone: one tap back to the host list. */}
             {isPhoneLayout && mobileHome === "launchpad" && (
               <div className="mx-auto mb-4 flex w-full max-w-5xl items-center justify-between gap-2 rounded-xl border border-white/10 bg-[#0c1017] px-3 py-2">

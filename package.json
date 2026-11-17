@@ -25,7 +25,7 @@
     "test:firestore": "tsx tests/firestore-sync.test.ts",
     "test:os-commands": "tsx tests/os-commands.test.ts",
     "test:resume": "tsx tests/session-resume.test.ts",
-    "test:hosts": "tsx tests/unified-hosts.test.ts",
+    "test:hosts": "tsx tests/unified-hosts.test.ts && tsx tests/all-hosts.test.ts",
     "migrate:firestore": "tsx scripts/migrate-firestore.ts",
     "test:donate": "tsx tests/donate.test.ts",
     "test:disclaimer": "tsx tests/disclaimer.test.ts",

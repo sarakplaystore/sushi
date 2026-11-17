@@ -3,6 +3,12 @@ import type { ProtocolType } from "@/types/connection";
 import { getCorsHeaders } from "@/lib/server/security";
 import { verifyAdminSession } from "@/lib/server/auth";
 import { isServerVaultEnabled, readStoredVault } from "@/lib/server/vault-store";
+import {
+  buildUnifiedInventory,
+  unifiedInventoryFromProfiles,
+  type UnifiedInventory,
+} from "@/lib/server/unified-inventory";
+import { asProfiles, readClearTextInventory } from "@/app/api/hosts/route";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -15,11 +21,15 @@ export const dynamic = "force-dynamic";
  * separate lists. Each row links into the workspace (`/?host=<id>&protocol=…`), which
  * unlocks the vault and opens the right session.
  *
- * Because the vault is end-to-end encrypted, this page is a *server-rendered index*:
- * it can show that hosts exist and how they are reached (ports, protocols) but not
- * their names or credentials — those appear in the workspace, which holds the key. If
- * the deployment configured `SUSHI_HOSTS_INVENTORY` (a clear-text inventory on
- * purpose), the table is filled in fully here.
+ * ## Why this page does not pretend to be the list
+ *
+ * The vault is end-to-end encrypted: the server stores `{iv, ciphertext}` and has no
+ * key, so it cannot read host names — they only exist after a browser unlocks them.
+ * This page therefore renders the real list **only** when the deployment supplied one
+ * (`SUSHI_HOSTS_INVENTORY`, a deliberate clear-text inventory); otherwise it sends
+ * the browser to the workspace, which unlocks the vault and renders the real list at
+ * `/?view=hosts` (with this route's `?host=` / `?protocol=` intact). Earlier versions
+ * printed an empty host table in this case, which read as "you have no hosts".
  *
  * The page is also readable as JSON (Accept: application/json, or `?format=json`) for
  * scripts, so one request answers "what do I have and how do I reach it?".
@@ -39,23 +49,38 @@ export async function GET(req: NextRequest) {
 
   let mode: "server-vault" | "device" = "device";
   let vaultLines: Array<[string, string]> = [];
-  if (!auth.ok) {
-    vaultLines = [["Status", "Sign in to Sushi to see this list"]];
-  } else if (isServerVaultEnabled()) {
-    const stored = await readStoredVault().catch(() => null);
-    mode = "server-vault";
-    vaultLines = [
-      ["Vault", "Shared server vault (end-to-end encrypted)"],
-      ["Cipher mode", stored?.envelope?.mode ?? "not created yet"],
-      ["Key source", stored?.envelope?.keySource ?? "—"],
-      ["Revision", stored?.revision ?? "—"],
-      ["Last synced", stored?.envelope?.updatedAt ? new Date(stored.envelope.updatedAt).toISOString() : "—"],
-    ];
-  } else {
-    vaultLines = [
-      ["Vault", "Browser-only (device key)"],
-      ["Note", "Saved hosts live in the browser that created them; open Sushi to list them."],
-    ];
+  // The real, readable inventory — only ever a deliberate clear-text one.
+  let inventory: UnifiedInventory | null = null;
+
+  if (auth.ok) {
+    const clear = await readClearTextInventory();
+    if (clear) {
+      inventory = unifiedInventoryFromProfiles(asProfiles(clear), {
+        resolve: true,
+        encrypted: false,
+        source: "vault",
+      });
+      mode = "server-vault";
+      vaultLines = [
+        ["Vault", isServerVaultEnabled() ? "Shared server vault" : "Browser vault"],
+        ["Host list", `${inventory.counts.hosts} hosts from SUSHI_HOSTS_INVENTORY (clear text, on purpose)`],
+      ];
+    } else if (isServerVaultEnabled()) {
+      const stored = await readStoredVault().catch(() => null);
+      mode = "server-vault";
+      vaultLines = [
+        ["Vault", "Shared server vault (end-to-end encrypted)"],
+        ["Cipher mode", stored?.envelope?.mode ?? "not created yet"],
+        ["Key source", stored?.envelope?.keySource ?? "—"],
+        ["Revision", stored?.revision ?? "—"],
+        ["Last synced", stored?.envelope?.updatedAt ? new Date(stored.envelope.updatedAt).toISOString() : "—"],
+      ];
+    } else {
+      vaultLines = [
+        ["Vault", "Browser-only (device key)"],
+        ["Note", "Saved hosts live in the browser that created them; open Sushi to list them."],
+      ];
+    }
   }
 
   const protocolRows: Array<[ProtocolType, string, string]> = [
@@ -70,6 +95,8 @@ export async function GET(req: NextRequest) {
         ok: Boolean(auth.ok),
         page: "/hosts",
         index: "/api/hosts",
+        /** Where a browser sees the real, unlocked list. */
+        list: "/?view=hosts",
         vault: auth.ok ? { enabled: isServerVaultEnabled(), mode } : { enabled: false, mode },
         protocols: protocolRows.map(([protocol, label, description]) => ({
           protocol,
@@ -77,18 +104,45 @@ export async function GET(req: NextRequest) {
           description,
           access: `/?host=<host-id>&protocol=${protocol}`,
         })),
-        hosts: auth.ok ? [] : undefined,
+        // The merged index when it is actually readable, else `null` — never a
+        // fabricated empty list that looks like "you have zero hosts".
+        hosts: auth.ok ? inventory?.hosts ?? null : undefined,
+        counts: auth.ok ? inventory?.counts ?? null : undefined,
+        encrypted: auth.ok ? !inventory : undefined,
         hint: auth.ok
-          ? "Host names and credentials are end-to-end encrypted: open /hosts in a browser to unlock them, or GET /api/hosts for the merged index."
+          ? inventory
+            ? "Every host from the configured clear-text inventory, merged one entry per machine."
+            : "This vault is end-to-end encrypted: the host list exists only after a browser unlocks it. Open /hosts in Sushi to see and connect, or GET /api/hosts for the redacted index."
           : "Sign in first.",
       },
       { status: auth.ok ? 200 : 401, headers: { ...cors, "Cache-Control": "no-store" } }
     );
   }
 
+  // No readable inventory: the only place the real list can exist is the browser that
+  // unlocks the vault. Send every visitor there — signed in or not, `/hosts` stays the
+  // URL people type and bookmark, but the list itself is rendered by the workspace
+  // (behind the normal sign-in gate when the session is missing). Any `?host=` /
+  // `?protocol=` on the link is carried over, so one URL per machine still opens the
+  // machine (and lands on the list when the host is unknown).
+  if (!inventory) {
+    const requestUrl = new URL(req.url);
+    const target = new URL("/", requestUrl.origin);
+    target.searchParams.set("view", "hosts");
+    const hostId = (requestUrl.searchParams.get("host") || "").trim();
+    if (hostId) target.searchParams.set("host", hostId);
+    const protocol = (requestUrl.searchParams.get("protocol") || "").trim().toLowerCase();
+    if (protocol === "ssh" || protocol === "sftp" || protocol === "rdp") {
+      target.searchParams.set("protocol", protocol);
+    }
+    return new Response(null, {
+      status: 307,
+      headers: { ...cors, Location: `${target.pathname}${target.search}`, "Cache-Control": "no-store" },
+    });
+  }
 
-  // Plain HTML (no client React): this route answers with a self-contained page, so it
-  // works even when the app bundle has not loaded and stays dependency-free.
+  // Plain HTML (no client React) for the one case the server can list: a deliberate
+  // clear-text inventory. It stays dependency-free so it renders before any bundle.
   const escapeHtml = (value: string) =>
     value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 
@@ -106,6 +160,24 @@ export async function GET(req: NextRequest) {
         `<td class="m">/?host=&lt;host-id&gt;&amp;protocol=${protocol}</td></tr>`
     )
     .join("");
+
+  const hostTable =
+    `<table><thead><tr><th>Host</th><th>Address</th><th>Protocols</th><th>One link</th></tr></thead><tbody>` +
+      inventory.hosts
+        .map(
+          (host) =>
+            `<tr><td class="p">${escapeHtml(host.name ?? host.id)}</td>` +
+            `<td class="v">${escapeHtml(
+              host.links
+                .map((link) => link.url)
+                .filter(Boolean)
+                .join("  ·  ")
+            )}</td>` +
+            `<td>${host.protocols.map((protocol) => `<span class="tag">${protocol.toUpperCase()}</span>`).join(" ")}</td>` +
+            `<td class="m"><a href="${escapeHtml(host.accessUrl)}">${escapeHtml(host.accessUrl)}</a></td></tr>`
+        )
+        .join("") +
+      `</tbody></table>`;
 
   const html = `<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
@@ -131,9 +203,10 @@ td.v,.m,code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
 td.p{font-weight:600;white-space:nowrap}
 .m{color:#38bdf8}
 code{color:#38bdf8}
+.tag{display:inline-block;border-radius:4px;background:rgba(255,255,255,.08);color:#cbd5e1;font-size:10px;font-weight:600;padding:0 4px}
 ul{margin:0;padding-left:18px;color:#cbd5e1}
 li{margin:4px 0}
-.note{color:#94a3b8;font-size:12px;margin-bottom:0}
+.note{color:#94a3b8;font-size:12px;margin-bottom:0;line-height:1.6}
 a.cta{display:inline-block;margin-top:24px;background:#ff6b57;color:#0b0e14;font-weight:700;border-radius:10px;padding:10px 18px;text-decoration:none}
 a{color:#38bdf8}
 </style></head><body><div class="wrap">
@@ -142,9 +215,10 @@ a{color:#38bdf8}
 <p class="lead">One row per machine and account, with every way in: SSH, SFTP and RDP. The workspace
 merges your saved profiles the same way, so a server saved three times is one entry here.</p>
 
-<section><h2>Vault</h2><table><tbody>${vaultRows}</tbody></table>
-<p class="note">Host names and credentials are encrypted with a key the server never has, so this page
-lists what exists; the workspace unlocks the names and opens the sessions.</p></section>
+<section><h2>Every saved machine</h2>${hostTable}
+<p class="note">${escapeHtml(inventory.hint)}</p></section>
+
+<section><h2>Vault</h2><table><tbody>${vaultRows}</tbody></table></section>
 
 <section><h2>Every host is one of these</h2>
 <table><thead><tr><th>Open</th><th>What you get</th><th>One URL</th></tr></thead>
@@ -160,7 +234,7 @@ Requires a Sushi session.</li>
 machine&apos;s desktop (or SSH / SFTP).</li>
 </ul></section>
 
-<a class="cta" href="/">Open Sushi →</a>
+<a class="cta" href="/?view=hosts">Open the host list →</a>
 </div></body></html>`;
 
   return new Response(html, {

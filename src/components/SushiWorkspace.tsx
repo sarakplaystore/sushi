@@ -82,6 +82,7 @@ import {
   parseHostDeepLink,
   resolveHostDeepLink,
 } from "@/lib/client/unified-hosts";
+import { workspaceDeepLinkFromSearch } from "@/lib/client/all-hosts";
 import {
   applyIdentityChange,
   describeProtocols,
@@ -89,6 +90,7 @@ import {
   siblingsOf,
 } from "@/lib/client/host-consistency";
 import { HostNavList } from "./HostNavList";
+import { AllHostsPage } from "./AllHostsPage";
 import { useIsPhoneViewport, useMobileHome } from "@/lib/client/mobile-home";
 import { HostProfileModal } from "./HostProfileModal";
 import { GatewaySetupModal } from "./GatewaySetupModal";
@@ -232,6 +234,69 @@ export function SushiWorkspace() {
   const [protocolFilter, setProtocolFilter] = useState<"all" | ProtocolType>("all");
   const [hostSearch, setHostSearch] = useState("");
   const [quickConnectInput, setQuickConnectInput] = useState("");
+  /**
+   * `/hosts` — the "All hosts" page — is a view of this workspace, not a
+   * server-rendered page: only the browser can open the vault and read host names.
+   * It is set from the URL once hydrated (never during SSR, so the first paint cannot
+   * flash the wrong screen).
+   */
+  const [allHostsView, setAllHostsView] = useState<{ enabled: boolean; deepLinkHostId: string | null }>({
+    enabled: false,
+    deepLinkHostId: null,
+  });
+
+  /** Mirrors `allHostsView.enabled` for callbacks that must not re-subscribe. */
+  const allHostsViewRef = useRef(false);
+  /** Declared with `leaveAllHostsView`; read by the deep-link callback below. */
+  const leaveAllHostsViewRef = useRef<() => void>(() => {});
+
+  /** Leaves the All-hosts view: back to the ordinary workspace URL. */
+  const leaveAllHostsView = useCallback(() => {
+    allHostsViewRef.current = false;
+    setAllHostsView({ enabled: false, deepLinkHostId: null });
+    if (typeof window !== "undefined") {
+      const params = new URLSearchParams(window.location.search);
+      if (params.get("view") === "hosts") {
+        params.delete("view");
+        const query = params.toString();
+        window.history.replaceState(null, "", `${window.location.pathname}${query ? `?${query}` : ""}`);
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    leaveAllHostsViewRef.current = leaveAllHostsView;
+  }, [leaveAllHostsView]);
+
+  /**
+   * Switches to the All-hosts view and gives it a real URL (`/?view=hosts`), so it can
+   * be bookmarked, reloaded and shared. `/hosts` itself is served by the route handler
+   * (a redirect into this view when the vault is encrypted, or the real table when the
+   * deployment configured a clear-text inventory).
+   */
+  const enterAllHostsView = useCallback(() => {
+    allHostsViewRef.current = true;
+    setAllHostsView({ enabled: true, deepLinkHostId: null });
+    if (typeof window !== "undefined") {
+      // A fresh list URL: any `?host=` already consumed must not linger.
+      window.history.replaceState(null, "", `${window.location.pathname}?view=hosts`);
+    }
+  }, []);
+
+  /**
+   * `/?view=hosts` renders the All-hosts list. The server-rendered `/hosts` route
+   * redirects here when the vault is end-to-end encrypted (it cannot read the list),
+   * and any `?host=` / `?protocol=` on a one-machine link is left in place for the
+   * normal deep-link path.
+   */
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const params = new URLSearchParams(window.location.search);
+    if (params.get("view") !== "hosts") return;
+    const link = workspaceDeepLinkFromSearch(window.location.search);
+    allHostsViewRef.current = true;
+    setAllHostsView({ enabled: true, deepLinkHostId: link?.hostId ?? null });
+  }, []);
 
   const [tabs, setTabs] = useState<SessionTab[]>([]);
   const [activeTabId, setActiveTabId] = useState<string>("launchpad");
@@ -559,8 +624,13 @@ export function SushiWorkspace() {
 
       const hasDeepLink =
         typeof window !== "undefined" && Boolean(parseHostDeepLink(window.location.search));
+      // The All-hosts view without a `?host=` is a request for the list itself: land on
+      // the launchpad instead of restoring whatever session was last active.
+      const landingOnAllHosts =
+        allHostsViewRef.current && !hasDeepLink;
       const restoredActive =
         !hasDeepLink &&
+        !landingOnAllHosts &&
         mergedWs.activeTabId !== "launchpad" &&
         restoredTabs.some((t) => t.id === mergedWs.activeTabId)
           ? mergedWs.activeTabId
@@ -1946,15 +2016,19 @@ export function SushiWorkspace() {
       const link = parseHostDeepLink(window.location.search);
       if (!link) return;
       const entry = resolveHostDeepLink(entries, link.hostId);
+      // Consume the link either way: an unknown host must be reported once, not
+      // re-attempted on every reload (and `/hosts` shows the list underneath).
+      window.history.replaceState(null, "", window.location.pathname);
+      deepLinkHandledRef.current = true;
       if (!entry) {
         setWhitelistBannerError(
           `This link points at “${link.hostId}”, which is not in this vault. It may belong to another device, or the host was deleted.`
         );
         return;
       }
-      // Consume the link so a reload/re-render does not open the host again.
-      window.history.replaceState(null, "", window.location.pathname);
-      deepLinkHandledRef.current = true;
+      // The link asked for a session, not for the list: leave the list view (and its
+      // `?view=hosts` URL) behind.
+      leaveAllHostsViewRef.current();
       openUnifiedHostRef.current(entry, link.protocol ?? undefined);
     },
     []
@@ -1968,13 +2042,16 @@ export function SushiWorkspace() {
   /**
    * Runs once the vault is ready (that is when host names exist): a deep link is
    * applied, otherwise the URL is left alone.
+   *
+   * The vault being ready is not the same as having hosts: an empty vault must not
+   * leave `?host=…` in the URL forever (a reload would keep retrying), and the
+   * `/hosts` view needs to know the link could not be opened.
    */
   useEffect(() => {
     if (deepLinkHandledRef.current) return;
     if (!vaultReady) return;
-    if (!hosts.length) return;
     applyDeepLink(unifiedHostsRef.current);
-  }, [applyDeepLink, hosts.length, unifiedHostsRef, vaultReady]);
+  }, [applyDeepLink, unifiedHostsRef, vaultReady]);
 
   /** `openRdpCompanion` is declared below; the merged-host action calls it lazily. */
   const openRdpCompanionRef = useRef<(profile: HostProfile) => void>(() => {});
@@ -2414,15 +2491,20 @@ export function SushiWorkspace() {
             Launchpad
           </button>
 
-          {/* One URL listing every host (SSH / SFTP / RDP merged) */}
-          <a
-            href="/hosts"
-            className="flex shrink-0 items-center gap-1 rounded-t-xl border border-b-0 border-white/8 px-3 py-2 text-xs text-slate-400 transition hover:bg-white/8 hover:text-white"
+          {/* One URL listing every host (SSH / SFTP / RDP merged). It is a view of
+              this workspace: only the browser can open the vault and read the names. */}
+          <button
+            type="button"
+            onClick={enterAllHostsView}
+            aria-pressed={allHostsView.enabled}
+            className={`flex shrink-0 items-center gap-1 rounded-t-xl border border-b-0 border-white/8 px-3 py-2 text-xs transition hover:bg-white/8 hover:text-white ${
+              allHostsView.enabled ? "bg-[#171d2b] text-white" : "text-slate-400"
+            }`}
             title="Every host on one page, with SSH, SFTP and RDP side by side"
           >
             <Server className="h-3.5 w-3.5" />
             All hosts
-          </a>
+          </button>
 
           {/* Active Session Tabs */}
           {tabs.map((tab) => {
@@ -2502,14 +2584,44 @@ export function SushiWorkspace() {
 
         {/* Workspace Stage */}
         <div className="relative min-h-0 flex-1 overflow-hidden">
+          {/* All hosts (`/hosts`): every machine in one table. It lives here because
+              only this browser can unlock the vault and read host names. */}
+          {allHostsView.enabled && (
+            <div className="absolute inset-0 z-10">
+              <AllHostsPage
+                hosts={unifiedHosts}
+                vaultReady={vaultReady}
+                deepLinkHostId={allHostsView.deepLinkHostId}
+                deepLinkError={
+                  allHostsView.deepLinkHostId && deepLinkHandledRef.current
+                    ? whitelistBannerError
+                    : null
+                }
+                onOpen={(entry, protocol) => {
+                  leaveAllHostsView();
+                  openUnifiedHost(entry, protocol);
+                }}
+                onNewHost={() => {
+                  leaveAllHostsView();
+                  setEditingProfile(null);
+                  setHostModalIntent(null);
+                  setHostModalOpen(true);
+                }}
+                onBack={leaveAllHostsView}
+              />
+            </div>
+          )}
+
           {/* Launchpad Home View — host list is home on a phone, the hero on desktop */}
           <div
             className={
-              activeTabId === "launchpad"
-                ? isPhoneLayout && mobileHome === "hosts"
-                  ? "flex h-full w-full flex-col overflow-hidden p-3 pb-3 sm:p-8"
-                  : "h-full w-full overflow-y-auto overscroll-contain p-3 pb-6 sm:p-8"
-                : "hidden"
+              allHostsView.enabled
+                ? "hidden"
+                : activeTabId === "launchpad"
+                  ? isPhoneLayout && mobileHome === "hosts"
+                    ? "flex h-full w-full flex-col overflow-hidden p-3 pb-3 sm:p-8"
+                    : "h-full w-full overflow-y-auto overscroll-contain p-3 pb-6 sm:p-8"
+                  : "hidden"
             }
           >
             {/* Stated once in the product itself: AI-assisted, no warranty, single admin. */}
@@ -3307,12 +3419,13 @@ export function SushiWorkspace() {
                   >
                     Show quick connect
                   </button>
-                  <a
-                    href="/hosts"
+                  <button
+                    type="button"
+                    onClick={enterAllHostsView}
                     className="rounded-lg border border-white/10 px-2.5 py-1.5 text-slate-300 hover:bg-white/8"
                   >
                     All hosts &amp; API →
-                  </a>
+                  </button>
                 </div>
               </div>
             )}

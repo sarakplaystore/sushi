@@ -35,7 +35,7 @@ It is designed around a **Hybrid VPS + Serverless Architecture**:
   - **Distro & cloud badge on connect**: the header names the machine you are on — `Ubuntu 24.04.1 LTS · Oracle Cloud`, `Debian 12 · KVM VPS`, `Rocky Linux 9.4 · AWS EC2` — read in one non-root exec (`/etc/os-release`, cloud-init's `cloud-id`, DMI strings) and cached for five minutes; the **Test SSH Auth** card in *New Connection* shows the same OS, hosting platform and vCPU/RAM before you connect
   - SHA-256 host key fingerprint verification, quick command snippets, scrollback search, and terminal themes
 - Commands survive a closed tab (No timeout + resume prompt) and recently connected hosts are remembered
-- One merged entry per machine in the sidebar and launchpad, plus `/hosts` and `GET /api/hosts` with SSH/SFTP/RDP links for every host
+- One merged entry per machine in the sidebar and launchpad, plus **All hosts** (`/hosts`) — one table of every machine with its SSH/SFTP/RDP ports and one link each — and `GET /api/hosts` for scripts
   - **Translate selected text**: highlight any text in the terminal and hit the **Translate** button — the translation appears in a panel above the terminal (Chinese by default, 14 target languages, remembered per browser). Translates through Sushi's own `/api/translate` (see *Translating text* below)
 - **SFTP File Manager (`/api/sftp/*`)**
   - Works identically on **Vercel Serverless** and **VPS**
@@ -135,8 +135,14 @@ each entry a single URL:
   every way in and one click for each (a host saved only for SSH still offers the SFTP
   action, and a desktop through the derived RDP companion on 3389). Search and the
   protocol filter work on the merged entries, so “SSH” lists an SFTP-saved host too.
-- **`/hosts`** — one page listing every host with its protocols and ports, plus the
-  exact link for each. **`/hosts?format=json`** returns the same thing as JSON.
+- **All hosts** — the **All hosts** tab in the workspace header (or the `/hosts` URL)
+  lists every saved machine in one table: folder, name, tags, `ssh://user@host:port`
+  addresses, one button per way in, and a **link** button that copies that machine's
+  URL. Search covers name, address, account, folder, tag *and* pasted addresses; the
+  `ALL / SSH / SFTP / RDP` tabs filter by how a machine can be opened. It opens from
+  `/hosts`, which the server answers with a redirect into the workspace view
+  (`/?view=hosts`) because the vault key is only in your browser — the page is never a
+  fabricated empty list. **`/hosts?format=json`** answers scripts.
 - **`GET /api/hosts`** — the machine-readable half: one entry per machine with `id`,
   `accessUrl`, `protocols`, `counts`, and `links[]` holding `ssh://…`, `sftp://…` and
   `rdp://…` (each labelled `saved` or `derived`). Protected by the normal Sushi session
@@ -151,11 +157,14 @@ end-to-end encrypted: the server stores `{iv, ciphertext}` and has no key, so it
 read host names or passwords, and returning them in clear would mean storing them in
 clear. `/api/hosts` therefore reports the structure honestly — one entry per machine,
 its protocols, ports and access URLs, with `encrypted: true` and names redacted
-(`host #1`) — while `/hosts` in the browser shows the real names after you unlock. A
+(`host #1`) — and `/hosts` hands the browser to the workspace, where **All hosts**
+unlocks the vault and lists the real names, addresses and links. (Earlier the server
+printed an empty host list in that case, which read as “you have no hosts”.) A
 deployment that deliberately keeps a clear-text inventory can set
 `SUSHI_HOSTS_INVENTORY` (inline JSON or a file path, shape
-`{ "hosts": [ { …HostProfile } ] }`); those entries are merged the same way and returned
-with `encrypted: false`.
+`{ "hosts": [ { …HostProfile } ] }`); those entries are merged the same way, returned
+with `encrypted: false`, and rendered as the real table on `/hosts` itself — no
+JavaScript required.
 
 **Editing and deleting stay consistent** (`lib/client/host-consistency`): change the
 address or account of one profile and its SSH/SFTP/RDP siblings move with it, so a

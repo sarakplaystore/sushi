@@ -33,7 +33,7 @@ interface ClearTextInventory {
 }
 
 /** Reads `SUSHI_HOSTS_INVENTORY` (inline JSON or a file path). Null when unset/invalid. */
-async function readClearTextInventory(): Promise<unknown[] | null> {
+export async function readClearTextInventory(): Promise<unknown[] | null> {
   const raw = process.env.SUSHI_HOSTS_INVENTORY?.trim();
   if (!raw) return null;
   try {
@@ -50,7 +50,7 @@ async function readClearTextInventory(): Promise<unknown[] | null> {
 }
 
 /** Keeps only entries that look like a HostProfile (never trust env JSON blindly). */
-function asProfiles(raw: unknown[]): Parameters<typeof unifiedInventoryFromProfiles>[0] {
+export function asProfiles(raw: unknown[]): Parameters<typeof unifiedInventoryFromProfiles>[0] {
   return raw.filter((entry): entry is Parameters<typeof unifiedInventoryFromProfiles>[0][number] => {
     if (!entry || typeof entry !== "object") return false;
     const data = entry as Record<string, unknown>;

@@ -289,6 +289,39 @@ The database is parsed with SQLite compiled to WebAssembly (`sql.js`) and decryp
 
 ## Quick Start
 
+**Pick the one-liner for your platform. Each installs, configures, builds and starts Sushi
+(Web UI + SSH + SFTP + guacd for RDP) — no manual config, no cloning by hand.**
+
+| You have | Run this | Notes |
+| --- | --- | --- |
+| **Docker** (recommended) | `curl -fsSL https://raw.githubusercontent.com/sarakplaystore/sushi/main/scripts/install-vps.sh \| bash` | Installs Docker if missing, starts Sushi + guacd, waits for health, prints the URL. Debian/Ubuntu, Rocky/Alma, Fedora, Arch, Alpine |
+| **Docker, prebuilt image** (fastest, no compile) | `docker run -d --name sushi -p 3000:3000 -v sushi-data:/app/data --restart unless-stopped ghcr.io/sarakplaystore/sushi:latest` | Pulls a multi-arch image (~1 min). Needs a separate `guacd` only if you want *live* RDP |
+| **Docker Compose, no clone** | `curl -fsSLO https://raw.githubusercontent.com/sarakplaystore/sushi/main/docker-compose.prebuilt.yml && docker compose -f docker-compose.prebuilt.yml up -d` | Sushi **+ guacd** from the published image |
+| **Python 3.9+** (no Docker needed) | `python3 install.py` | Cross-platform (Linux, macOS, Windows via WSL). Downloads the source, `npm ci`, builds, starts in the background and health-checks it |
+| **Node.js 22 only** | `git clone https://github.com/sarakplaystore/sushi.git && cd sushi && npm ci && npm run build && npm start` | The manual equivalent |
+| **Vercel** | Import the repo, add Turso/Firestore/Redis | See [Deploy to Vercel](#3-deploy-to-vercel--optional-companion-vps-gateway) |
+
+Useful installer flags: `--port 8080`, `--dir ~/sushi`, `--https your.domain` (adds Caddy with
+automatic HTTPS), `--prebuilt` (skip the build), `--node` (no Docker: Node.js + systemd), and
+`--foreground` (Python: keep it in this terminal). Every path is safe to re-run: your `.env`,
+`data/` and the `sushi-data` volume are never deleted, so re-running **upgrades** the code.
+
+> **Docker image:** published to GitHub Container Registry by
+> [`.github/workflows/docker-publish.yml`](.github/workflows/docker-publish.yml) on every push to
+> `main` and on `v*` tags (linux/amd64 + linux/arm64). If the image is not published yet, use the
+> `--build` / build-from-source paths above — nothing else changes.
+
+### 0. One-click deploys
+
+[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fsarakplaystore%2Fsushi&repository-name=sushi)
+*(Vercel needs a Turso / Firestore / Redis database before the admin account can be created — see §3.)*
+
+```bash
+# Docker, one line, everything included (Sushi + guacd)
+docker run -d --name sushi --restart unless-stopped -p 3000:3000 \
+  -v sushi-data:/app/data ghcr.io/sarakplaystore/sushi:latest
+```
+
 ### 1. Local Development
 
 ```bash
@@ -307,10 +340,12 @@ cp .env.example .env
 docker compose up -d --build
 ```
 
-Or run the one-step VPS installer on Ubuntu/Debian:
+Or run the one-step installer (any Linux distro, adds `--https your.domain` for Caddy):
 
 ```bash
-bash scripts/install-vps.sh
+bash scripts/install-vps.sh                 # build locally
+bash scripts/install-vps.sh --prebuilt      # pull ghcr.io image instead
+bash scripts/install-vps.sh --node          # no Docker: Node.js + systemd unit
 ```
 
 Keep the `sushi-data` volume (or `DATA_DIR` when running Node directly) persistent

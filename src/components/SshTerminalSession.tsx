@@ -61,6 +61,13 @@ import {
   type FullscreenMenu,
 } from "@/lib/client/terminal-commands";
 import {
+  applyLineInput,
+  emptyLineEditorState,
+  pushHistory,
+  redrawToText,
+  type LineEditorState,
+} from "@/lib/client/line-editor";
+import {
   createKeyBatcher,
   sendKeyChannelInput,
   type ExecKeyChannel,
@@ -335,9 +342,12 @@ export function SshTerminalSession({
   /** True while the shell is still opening: typing has nowhere to go yet. */
   const connectingRef = useRef(false);
   const cwdRef = useRef<string>(initialPath || profile.initialPath || "~");
-  const lineBufferRef = useRef<string>("");
+  /**
+   * The serverless shell's line buffer. It carries a caret now, so ← → Home End
+   * Delete edit the line being typed instead of being dropped (see line-editor.ts).
+   */
+  const lineEditorRef = useRef<LineEditorState>(emptyLineEditorState());
   const historyRef = useRef<string[]>([]);
-  const historyIdxRef = useRef<number>(-1);
   const execBusyRef = useRef<boolean>(false);
   // Root mode: after `sudo su` / `sudo -i` every command runs through sudo.
   const elevatedUserRef = useRef<string | null>(null);
@@ -420,7 +430,7 @@ export function SshTerminalSession({
       setConnectFailure(failure);
       setRetryIn(failure.retryable ? SSH_RETRY_DELAY_SECONDS : null);
       setStatus("error");
-      lineBufferRef.current = "";
+      lineEditorRef.current = emptyLineEditorState();
       busyInputRef.current = "";
       secretPromptRef.current = null;
       secretBufferRef.current = "";
@@ -437,20 +447,33 @@ export function SshTerminalSession({
     failConnectRef.current = failConnect;
   }, [failConnect]);
 
+  /**
+   * The prompt as it is drawn on screen (colours included). The line editor needs
+   * the exact string to redraw over itself when a key moves the caret, so it is
+   * built in one place and mirrored into `promptTextRef`.
+   */
+  const promptTextRef = useRef<string>("$ ");
+  const buildPromptText = useCallback(
+    (cwdVal?: string) => {
+      const displayPath = cwdVal ?? cwdRef.current ?? "~";
+      const asRoot = elevatedUserRef.current !== null;
+      const user = elevatedUserRef.current ?? profile.username;
+      const color = asRoot ? "\x1b[1;31m" : "\x1b[1;32m";
+      const text = `${color}${user}@${profile.host}\x1b[0m:\x1b[1;34m${displayPath}\x1b[0m${asRoot ? "# " : "$ "}`;
+      promptTextRef.current = text;
+      return text;
+    },
+    [profile.host, profile.username]
+  );
+
   const writePrompt = useCallback(
     (term: import("@xterm/xterm").Terminal, cwdVal?: string) => {
       // A dead connection has no prompt. Printing one is what used to make a failed
       // session look alive (`ubuntu@host:~$ sudo su` under the timeout message).
       if (connectFailureRef.current) return;
-      const displayPath = cwdVal ?? cwdRef.current ?? "~";
-      const asRoot = elevatedUserRef.current !== null;
-      const user = elevatedUserRef.current ?? profile.username;
-      const color = asRoot ? "\x1b[1;31m" : "\x1b[1;32m";
-      term.write(
-        `\r\n${color}${user}@${profile.host}\x1b[0m:\x1b[1;34m${displayPath}\x1b[0m${asRoot ? "# " : "$ "}`
-      );
+      term.write(`\r\n${buildPromptText(cwdVal)}`);
     },
-    [profile.username, profile.host]
+    [buildPromptText]
   );
 
   /**
@@ -1711,91 +1734,55 @@ export function SshTerminalSession({
           return;
         }
 
-        for (let i = 0; i < data.length; i++) {
-          const ch = data[i];
+        // One chunk, one editor pass: the editor parses escape sequences itself,
+        // because a sequence (or a CRLF) can be split across two onData events.
+        // It handles ← → Home End Delete ↑ ↓ Ctrl+A/E/U/K/W and bracketed paste, and
+        // owns the caret, so typing in the middle of a line behaves like a real
+        // shell (see src/lib/client/line-editor.ts).
+        const editorState = lineEditorRef.current;
+        const { state: nextEditor, actions } = applyLineInput(
+          editorState,
+          data,
+          historyRef.current
+        );
+        lineEditorRef.current = nextEditor;
 
-          // Handle ANSI escape sequences (Up/Down history)
-          if (ch === "\x1b" && data.slice(i, i + 3) === "\x1b[A") {
-            i += 2;
-            const hist = historyRef.current;
-            if (hist.length > 0) {
-              const nextIdx =
-                historyIdxRef.current === -1
-                  ? hist.length - 1
-                  : Math.max(0, historyIdxRef.current - 1);
-              historyIdxRef.current = nextIdx;
-              const prevLen = lineBufferRef.current.length;
-              if (prevLen > 0) {
-                term.write("\b \b".repeat(prevLen));
-              }
-              lineBufferRef.current = hist[nextIdx];
-              term.write(lineBufferRef.current);
-            }
+        for (const action of actions) {
+          if (action.kind === "redraw") {
+            // The prompt text is what the editor must erase back to; it is stable
+            // for the life of a line (root mode changes it only between lines).
+            term.write(redrawToText(promptTextRef.current, nextEditor));
             continue;
           }
-          if (ch === "\x1b" && data.slice(i, i + 3) === "\x1b[B") {
-            i += 2;
-            const hist = historyRef.current;
-            if (historyIdxRef.current !== -1) {
-              const prevLen = lineBufferRef.current.length;
-              if (prevLen > 0) {
-                term.write("\b \b".repeat(prevLen));
-              }
-              if (historyIdxRef.current < hist.length - 1) {
-                historyIdxRef.current += 1;
-                lineBufferRef.current = hist[historyIdxRef.current];
-                term.write(lineBufferRef.current);
-              } else {
-                historyIdxRef.current = -1;
-                lineBufferRef.current = "";
-              }
-            }
+          if (action.kind === "interrupt") {
+            lineEditorRef.current = emptyLineEditorState();
+            term.write("^C");
+            writePrompt(term);
             continue;
           }
-          if (ch === "\x1b") {
-            // Skip other escape sequences in line-buffered mode
-            while (i + 1 < data.length && !/[A-Za-z~]/.test(data[i + 1])) {
-              i++;
-            }
-            i++;
+          if (action.kind === "clear-screen") {
+            term.clear();
+            writePrompt(term);
+            term.write(nextEditor.line);
+            const back = nextEditor.line.length - nextEditor.cursor;
+            if (back > 0) term.write(`\x1b[${back}D`);
             continue;
           }
-
-          if (ch === "\r" || ch === "\n") {
+          if (action.kind === "eof") {
+            lineEditorRef.current = emptyLineEditorState();
+            term.writeln("\r\n\x1b[33mSession closed.\x1b[0m");
+            setStatus("disconnected");
+            continue;
+          }
+          if (action.kind === "submit") {
+            lineEditorRef.current = emptyLineEditorState();
             term.write("\r\n");
-            const cmd = lineBufferRef.current;
-            lineBufferRef.current = "";
-            historyIdxRef.current = -1;
-            if (cmd.trim()) {
-              historyRef.current.push(cmd);
-              void runServerlessCommandRef.current(cmd);
+            if (action.line.trim()) {
+              pushHistory(historyRef.current, action.line);
+              void runServerlessCommandRef.current(action.line);
             } else {
               writePrompt(term);
             }
-          } else if (ch === "\x7f" || ch === "\b") {
-            if (lineBufferRef.current.length > 0) {
-              lineBufferRef.current = lineBufferRef.current.slice(0, -1);
-              term.write("\b \b");
-            }
-          } else if (ch === "\x03") {
-            lineBufferRef.current = "";
-            term.write("^C");
-            writePrompt(term);
-          } else if (ch === "\x15") {
-            // Ctrl+U clear line
-            const len = lineBufferRef.current.length;
-            if (len > 0) {
-              term.write("\b \b".repeat(len));
-              lineBufferRef.current = "";
-            }
-          } else if (ch === "\x0c") {
-            // Ctrl+L clear screen
-            term.clear();
-            writePrompt(term);
-            term.write(lineBufferRef.current);
-          } else if (ch >= " ") {
-            lineBufferRef.current += ch;
-            term.write(ch);
           }
         }
       };

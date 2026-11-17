@@ -3298,18 +3298,47 @@ async function runTests() {
     const anon = await hostsApiGet(new NextRequest("http://localhost/api/hosts"));
     assert.equal(anon.status, 401);
 
-    // 4. The page: HTML for people, JSON for scripts.
+    // 4a. No readable inventory: the page cannot list an encrypted vault, so it
+    // sends the browser to the workspace view that can (`/?view=hosts`) instead of
+    // printing an empty table, and keeps a one-machine link intact.
+    const savedInventory = process.env.SUSHI_HOSTS_INVENTORY;
+    delete process.env.SUSHI_HOSTS_INVENTORY;
+    const redirectRes = await hostsPageGet(
+      new NextRequest("http://localhost/hosts?host=unified-203.0.113.10-root&protocol=rdp", { headers: authed })
+    );
+    assert.equal(redirectRes.status, 307);
+    const redirectTo = redirectRes.headers.get("location") || "";
+    assert.match(redirectTo, /^\/\?view=hosts/);
+    assert.match(redirectTo, /host=unified-203\.0\.113\.10-root/);
+    assert.match(redirectTo, /protocol=rdp/);
+    // Signed out it redirects too: the app's sign-in gate comes first, then the list.
+    const anonPage = await hostsPageGet(new NextRequest("http://localhost/hosts"));
+    assert.equal(anonPage.status, 307);
+    if (savedInventory !== undefined) process.env.SUSHI_HOSTS_INVENTORY = savedInventory;
+
+    // 4b. A clear-text inventory (opt-in) is a real page: names and addresses.
+    process.env.SUSHI_HOSTS_INVENTORY = JSON.stringify({
+      hosts: [
+        { id: "a-ssh", name: "prod", protocol: "ssh", host: "203.0.113.10", port: 22, username: "root" },
+        { id: "a-rdp", name: "prod (RDP)", protocol: "rdp", host: "203.0.113.10", port: 3389, username: "root" },
+      ],
+    });
     const pageRes = await hostsPageGet(new NextRequest("http://localhost/hosts", { headers: authed }));
     assert.equal(pageRes.status, 200);
     assert.match(pageRes.headers.get("content-type") || "", /text\/html/);
     const page = await pageRes.text();
     assert.match(page, /All hosts — one URL/);
     assert.match(page, /\/api\/hosts/);
+    assert.match(page, /Every saved machine/, "the readable inventory is on the page");
+    assert.match(page, /prod/, "with the real machine name");
+    assert.match(page, /ssh:\/\/root@203\.0\.113\.10:22/, "and its address");
     for (const protocol of ["ssh", "sftp", "rdp"]) {
       assert.ok(page.includes(`protocol=${protocol}`), `the page documents ${protocol} links`);
     }
     assert.ok(!page.toLowerCase().includes("password:"), "the page never prints credentials");
+    delete process.env.SUSHI_HOSTS_INVENTORY;
 
+    // 4c. JSON for scripts: never a fabricated empty host list.
     const pageJson = await hostsPageGet(
       new NextRequest("http://localhost/hosts?format=json", { headers: authed })
     );
@@ -3317,6 +3346,9 @@ async function runTests() {
     const json = (await pageJson.json()) as Record<string, unknown>;
     assert.equal(json.ok, true);
     assert.equal(json.index, "/api/hosts");
+    assert.equal(json.list, "/?view=hosts");
+    assert.equal(json.hosts, null, "an encrypted vault has no server-readable host list");
+    assert.equal(json.encrypted, true);
     assert.equal((json.protocols as unknown[]).length, 3);
     const anonJson = await hostsPageGet(
       new NextRequest("http://localhost/hosts", { headers: new Headers({ accept: "application/json" }) })

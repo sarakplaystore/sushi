@@ -50,7 +50,11 @@ assert.match(phoneBlock, /onSearchChange=\{setHostSearch\}/, "search box on the 
 assert.match(phoneBlock, /onProtocolFilterChange=\{setProtocolFilter\}/, "All / SSH / SFTP / RDP filter");
 assert.match(phoneBlock, /onNewHost=/, "can add a host from the phone home screen");
 assert.match(phoneBlock, /Show quick connect/, "the hero/quick connect stays one tap away");
-assert.match(phoneBlock, /href="\/hosts"/, "the one-URL host page is linked");
+assert.match(
+  phoneBlock,
+  /onClick=\{enterAllHostsView\}[\s\S]{0,200}All hosts &amp; API/,
+  "the one-URL host page opens the in-app All-hosts view (the server cannot read an encrypted vault)"
+);
 
 // ---- the sidebar reuses the same component, never a second copy ---------------
 const listImports = workspace.match(/<HostNavList/g) ?? [];

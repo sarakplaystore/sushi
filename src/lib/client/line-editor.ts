@@ -448,15 +448,144 @@ export function applyLineInput(
   return { state, actions };
 }
 
+/** Printable width of a string after removing SGR/CSI colour sequences. */
+export function visibleWidth(text: string): number {
+  // eslint-disable-next-line no-control-regex
+  return text.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "").length;
+}
+
 /**
  * What the terminal must do to draw `state` again, given the prompt.
  *
  * Returns the escape sequence that returns the caret to the prompt column, then
  * redraws prompt + line and puts the cursor back where it belongs.
+ *
+ * `cols` is the terminal width: when prompt + line exactly fills the last row,
+ * the real terminal has already wrapped the cursor onto the next line (a pending
+ * wrap), so `\r` and the "move back N columns" count would be off by one row and
+ * the line would smear. In that case the redraw starts from a fresh line instead.
  */
-export function redrawToText(promptText: string, state: LineEditorState): string {
+export function redrawToText(
+  promptText: string,
+  state: LineEditorState,
+  cols?: number
+): string {
+  const promptWidth = visibleWidth(promptText);
+  const used = promptWidth + state.line.length;
+
+  if (cols && cols > 0 && used > 0 && used % cols === 0) {
+    // The cursor sits on a fresh row: reprint on a clean line, then walk the
+    // caret back from the end of the printed text.
+    const tail = state.line.length - state.cursor;
+    return `\r\n${promptText}${state.line}\x1b[0K${tail > 0 ? `\x1b[${tail}D` : ""}`;
+  }
+
   const tail = state.line.length - state.cursor;
   return `\r${promptText}${state.line}\x1b[0K${tail > 0 ? `\x1b[${tail}D` : ""}`;
+}
+
+/** Which pieces of `user@host:path$` are worth showing in a pane this wide. */
+export interface PromptParts {
+  /** Show `user@` — droppped first, the path says more about where you are. */
+  user: boolean;
+  /** Show `host:` — kept longer than the user, but not at the cost of the path. */
+  host: boolean;
+  /** Always true: the path (or `~`) is the one piece that must survive. */
+  path: boolean;
+}
+
+/**
+ * Which prompt pieces fit in `cols` columns.
+ *
+ * A full `ubuntu@193.123.125.81:/home/ubuntu$` in a narrow pane wraps into one
+ * word per line (`ubuntu@` / `193.123` / `.125.81` / …) and reads like a broken
+ * session. Rather than truncating a string (which would cut `193.123.125.81` in
+ * half and lose the address), whole pieces are dropped in order of usefulness:
+ *
+ *   `user@host:path$` → `host:path$` → `host$` → `path$` → `$`
+ *
+ * `reserve` is the room the typed command needs to stay readable (default 20
+ * columns): a prompt that fills the row makes every command wrap immediately.
+ *
+ * `cols <= 0` means the terminal has not been laid out yet; the full prompt is
+ * returned rather than guessing, because the prompt must stay stable for the life
+ * of a line (the line editor redraws over exactly these bytes).
+ */
+export function choosePromptParts(options: {
+  user: string;
+  host: string;
+  path: string;
+  marker: string;
+  cols: number;
+  reserve?: number;
+}): PromptParts {
+  const { user, host, path, marker, cols } = options;
+  if (!Number.isFinite(cols) || cols <= 0) return { user: true, host: true, path: true };
+
+  const reserve = Math.max(4, options.reserve ?? 20);
+  const room = Math.max(1, cols - reserve);
+  const width = (parts: PromptParts) =>
+    (parts.user ? user.length + 1 : 0) +
+    (parts.host ? host.length + 1 : 0) +
+    path.length +
+    marker.length;
+  const fits = (parts: PromptParts) => width(parts) <= room;
+
+  // Ordered by how much information survives. `user@path` (no host) is skipped on
+  // purpose: without the host it reads like a typo, so the host outranks the path
+  // once the two no longer fit together.
+  const candidates: PromptParts[] = [
+    { user: true, host: true, path: true },
+    { user: false, host: true, path: true },
+    { user: false, host: true, path: false },
+    { user: false, host: false, path: true },
+    { user: false, host: false, path: false },
+  ];
+  return candidates.find(fits) ?? candidates[candidates.length - 1];
+}
+
+/** Plain (uncoloured) prompt text for the chosen parts — used for width maths. */
+export function promptTextFor(
+  parts: PromptParts,
+  options: { user: string; host: string; path: string; marker: string }
+): string {
+  const head = [parts.user ? options.user : "", parts.host ? options.host : ""]
+    .filter(Boolean)
+    .join("@");
+  const path = parts.path ? `${head ? ":" : ""}${options.path}` : "";
+  return `${head}${path}${options.marker}`;
+}
+
+/**
+ * Escape sequence that erases a prompt + line which may span several rows.
+ *
+ * A resize re-fits the terminal to new columns but does not re-layout text that
+ * is already on the screen, so a prompt printed in a narrow pane stays broken
+ * into one-word-per-line. Clearing the rows it occupies lets the caller repaint
+ * it at the new width.
+ *
+ * `cols` is the width the text was originally laid out with: the rows it covers
+ * are `ceil((prompt + line) / cols)`. The cursor can be anywhere inside the line,
+ * so each row is cleared on its own rather than assuming the caret is at the end.
+ */
+export function clearPromptRegion(
+  promptText: string,
+  state: LineEditorState,
+  cols: number
+): string {
+  const width = visibleWidth(promptText) + state.line.length;
+  const safeCols = Number.isFinite(cols) && cols > 0 ? cols : 0;
+  const rows = safeCols ? Math.max(1, Math.ceil(Math.max(1, width) / safeCols)) : 1;
+  const parts = ["\r"];
+  if (rows > 1) parts.push(`\x1b[${rows - 1}A`);
+  // Erase every row of the old line without touching anything above it.
+  for (let row = 0; row < rows; row += 1) {
+    parts.push("\x1b[2K");
+    if (row < rows - 1) parts.push("\x1b[1B");
+  }
+  if (rows > 1) parts.push(`\x1b[${rows - 1}A`);
+  parts.push("\r");
+  return parts.join("");
 }
 
 /** Records a submitted command in the (bounded) history list. */

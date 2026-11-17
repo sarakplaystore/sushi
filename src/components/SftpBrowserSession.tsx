@@ -36,6 +36,14 @@ import {
 import type { HostProfile, SftpEntry } from "@/types/connection";
 import { type GatewaySettings, getAuthHeaders } from "@/lib/client/gateway";
 import { openArchiveSink } from "@/lib/client/zip-sink";
+import {
+  pruneSelection,
+  selectOnly,
+  selectRange as rangeSelection,
+  summariseSelection,
+  toggleSelectAll as toggleAllVisibleSelection,
+  toggleSelection,
+} from "@/lib/client/sftp-selection";
 
 interface SftpBrowserSessionProps {
   profile: HostProfile;
@@ -191,6 +199,8 @@ export function SftpBrowserSession({
   // Multi-selection: a checkbox per row plus click / ⌘ / Ctrl / Shift on the
   // row, so any mix of files and folders can be downloaded as one archive.
   const [selectedPaths, setSelectedPaths] = useState<string[]>([]);
+  /** Directory the rows currently come from (null until the first listing). */
+  const cwdRef = useRef<string | null>(null);
   const selectionAnchorRef = useRef<string | null>(null);
   const selectedSet = new Set(selectedPaths);
 
@@ -272,13 +282,18 @@ export function SftpBrowserSession({
         setCwd(data.cwd);
         setPathInput(data.cwd);
         setEntries(nextEntries);
-        // Keep the selection across refreshes/renames, but never keep a path
-        // that no longer exists (and drop everything after navigating away).
-        const stillThere = new Set(nextEntries.map((e) => e.path));
-        setSelectedPaths((prev) => {
-          const kept = prev.filter((p) => stillThere.has(p));
-          return kept.length === prev.length ? prev : kept;
-        });
+        // Keep the selection across a refresh or rename of the same directory, but
+        // never keep a path that no longer exists. Navigating to another directory
+        // starts clean: keeping paths from the old folder is what made the header
+        // checkbox and the "N selected" count disagree with the rows on screen.
+        const navigated = cwdRef.current !== null && data.cwd !== cwdRef.current;
+        cwdRef.current = data.cwd;
+        if (navigated) {
+          setSelectedPaths([]);
+          selectionAnchorRef.current = null;
+        } else {
+          setSelectedPaths((prev) => pruneSelection(prev, nextEntries));
+        }
       } catch (err) {
         setError(err instanceof Error ? err.message : "Failed to load directory.");
       } finally {
@@ -634,42 +649,23 @@ export function SftpBrowserSession({
   const breadcrumbParts = cwd.split("/").filter(Boolean);
 
   // ---- Selection helpers -------------------------------------------------
+  // Counts come from the rows that exist *here and now*, so a stale path from a
+  // previous directory can never inflate "N selected" or leave the header box
+  // stuck on "all". See `src/lib/client/sftp-selection.ts`.
+  const selection = summariseSelection(selectedPaths, entries, visibleEntries);
   const selectedEntries = entries.filter((e) => selectedSet.has(e.path));
-  const selectedFolderCount = selectedEntries.filter(
-    (e) => e.type === "directory"
-  ).length;
-  const selectedBytes = selectedEntries.reduce(
-    (sum, e) => sum + (e.type === "directory" ? 0 : e.size),
-    0
-  );
-  const allVisibleSelected =
-    visibleEntries.length > 0 &&
-    visibleEntries.every((e) => selectedSet.has(e.path));
-  const someVisibleSelected = visibleEntries.some((e) =>
-    selectedSet.has(e.path)
-  );
+  const selectedFolderCount = selection.folderCount;
+  const selectedBytes = selection.bytes;
+  const allVisibleSelected = selection.allVisible;
+  const someVisibleSelected = selection.someVisible;
 
   const toggleSelected = (entry: SftpEntry) => {
-    setSelectedPaths((prev) =>
-      prev.includes(entry.path)
-        ? prev.filter((p) => p !== entry.path)
-        : [...prev, entry.path]
-    );
+    setSelectedPaths((prev) => toggleSelection(prev, entry.path));
     selectionAnchorRef.current = entry.path;
   };
 
   const selectRange = (entry: SftpEntry) => {
-    const paths = visibleEntries.map((e) => e.path);
-    const to = paths.indexOf(entry.path);
-    const anchor = selectionAnchorRef.current;
-    const from = anchor === null ? -1 : paths.indexOf(anchor);
-    if (from === -1 || to === -1) {
-      setSelectedPaths([entry.path]);
-      selectionAnchorRef.current = entry.path;
-      return;
-    }
-    const [lo, hi] = from <= to ? [from, to] : [to, from];
-    setSelectedPaths(paths.slice(lo, hi + 1));
+    setSelectedPaths(rangeSelection(visibleEntries, selectionAnchorRef.current, entry.path));
   };
 
   /** Row click: plain = select only this one, ⌘/Ctrl = toggle, Shift = range. */
@@ -750,17 +746,22 @@ export function SftpBrowserSession({
     }
   };
 
+  /**
+   * Header checkbox: select or deselect exactly the rows on screen.
+   *
+   * Deselecting leaves rows hidden by the search filter or the dotfiles toggle
+   * selected on purpose — dropping a selection the user cannot see would be a
+   * surprise. Rows that no longer exist are pruned by `loadDirectory`.
+   */
   const toggleSelectAllVisible = () => {
-    if (allVisibleSelected) {
-      const visible = new Set(visibleEntries.map((e) => e.path));
-      setSelectedPaths((prev) => prev.filter((p) => !visible.has(p)));
-      return;
-    }
-    setSelectedPaths((prev) => {
-      const next = new Set(prev);
-      for (const e of visibleEntries) next.add(e.path);
-      return [...next];
-    });
+    setSelectedPaths((prev) => toggleAllVisibleSelection(prev, visibleEntries));
+    selectionAnchorRef.current = null;
+  };
+
+  /** "Clear" in the selection bar: drop everything, visible or not. */
+  const clearSelection = () => {
+    setSelectedPaths([]);
+    selectionAnchorRef.current = null;
   };
 
   return (
@@ -1201,6 +1202,12 @@ export function SftpBrowserSession({
               ` — ${selectedFolderCount} folder${selectedFolderCount === 1 ? "" : "s"}`}
             {selectedFolderCount > 0 && selectedBytes > 0 && ","}
             {selectedBytes > 0 && ` ${formatBytes(selectedBytes)} in files`}
+            {selection.includesHidden && (
+              <span className="text-sky-300/80">
+                {" "}
+                • includes rows hidden by the filter
+              </span>
+            )}
             <span className="hidden text-sky-300/70 sm:inline">
               {" "}
               • folders are zipped
@@ -1218,10 +1225,7 @@ export function SftpBrowserSession({
           </button>
           <button
             type="button"
-            onClick={() => {
-              setSelectedPaths([]);
-              selectionAnchorRef.current = null;
-            }}
+            onClick={clearSelection}
             className="flex shrink-0 items-center gap-1 rounded-md border border-white/15 px-2 py-0.5 text-slate-200 transition hover:bg-white/10"
             title="Clear selection"
           >

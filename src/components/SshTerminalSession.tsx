@@ -62,6 +62,8 @@ import {
 } from "@/lib/client/terminal-commands";
 import {
   applyLineInput,
+  choosePromptParts,
+  clearPromptRegion,
   emptyLineEditorState,
   pushHistory,
   redrawToText,
@@ -247,6 +249,12 @@ export function SshTerminalSession({
   const [status, setStatus] = useState<
     "connecting" | "connected" | "disconnected" | "error"
   >("connecting");
+  /**
+   * Mirror of `status` for callbacks that outlive a render (the resize observer,
+   * which must not close over a stale status when deciding to repaint a prompt).
+   */
+  const statusRef = useRef(status);
+  statusRef.current = status;
   const [fingerprint, setFingerprint] = useState<string | undefined>();
   /**
    * Distro + version and hosting platform of the remote machine, e.g.
@@ -453,14 +461,54 @@ export function SshTerminalSession({
    * built in one place and mirrored into `promptTextRef`.
    */
   const promptTextRef = useRef<string>("$ ");
+  /** Columns the on-screen prompt was laid out with (0 = unknown). */
+  const promptColsRef = useRef(0);
+
+  /**
+   * Draws the prompt, shortened to whatever the pane can actually show.
+   *
+   * A full `ubuntu@193.123.125.81:/home/ubuntu$` in a narrow pane wraps into one
+   * word per line (`ubuntu@` / `193.123` / `.125.81` / …) and reads like a broken
+   * session, so the host — and, only if needed, the user — is dropped as the
+   * terminal narrows. The path stays longest because it is what tells you where
+   * you are; `/home/<user>` and `/root` become `~` like in bash.
+   *
+   * The result is cached in `promptTextRef` because the line editor must redraw
+   * exactly these bytes when a key moves the caret.
+   */
   const buildPromptText = useCallback(
     (cwdVal?: string) => {
-      const displayPath = cwdVal ?? cwdRef.current ?? "~";
       const asRoot = elevatedUserRef.current !== null;
       const user = elevatedUserRef.current ?? profile.username;
-      const color = asRoot ? "\x1b[1;31m" : "\x1b[1;32m";
-      const text = `${color}${user}@${profile.host}\x1b[0m:\x1b[1;34m${displayPath}\x1b[0m${asRoot ? "# " : "$ "}`;
+      const rawPath = cwdVal ?? cwdRef.current ?? "~";
+      // `~` like bash: the home directory of the login user, and root's home.
+      const displayPath =
+        rawPath === `/home/${user}` || rawPath === "/root" ? "~" : rawPath;
+      // Unknown width (not laid out yet) keeps the full prompt: guessing here would
+      // make the prompt change mid-line the first time a key is pressed.
+      const cols = termRef.current?.cols ?? 0;
+      const parts = choosePromptParts({
+        user,
+        host: profile.host,
+        path: displayPath,
+        marker: asRoot ? "# " : "$ ",
+        cols,
+      });
+
+      // Colours are per piece, so a shortened prompt keeps the same look: green
+      // (or red for root) user/host, blue path, plain marker.
+      const userColor = asRoot ? "\x1b[1;31m" : "\x1b[1;32m";
+      const hostColor = asRoot ? "\x1b[1;31m" : "\x1b[1;32m";
+      const pathColor = "\x1b[1;34m";
+      const marker = asRoot ? "# " : "$ ";
+
+      let text = "";
+      if (parts.user) text += `${userColor}${user}`;
+      if (parts.host) text += `${hostColor}${parts.user ? "@" : ""}${profile.host}`;
+      if (parts.path) text += `:${pathColor}${displayPath}`;
+      text += `\x1b[0m${marker}`;
       promptTextRef.current = text;
+      promptColsRef.current = cols;
       return text;
     },
     [profile.host, profile.username]
@@ -1996,23 +2044,55 @@ export function SshTerminalSession({
         switchToServerlessShell();
       }
 
-      resizeObserver = new ResizeObserver(() => {
+      /**
+       * Re-measures the terminal after the pane changes size.
+       *
+       * xterm re-flows its buffer on resize, but the *prompt* was already printed:
+       * a prompt drawn in a narrow pane stays split into one word per line
+       * (`ubuntu@` / `193.123` / `.125.81` / …) after the pane grows, because no
+       * program repaints it — in serverless mode there is no live PTY to redraw
+       * the line. So when the width changes and a prompt with an untouched line is
+       * on screen, the rows it occupies are erased and it is drawn again at the new
+       * width. In WebSocket mode the remote shell owns the line, so only the size
+       * is reported and the shell redraws its own prompt.
+       */
+      const applyFit = () => {
         if (!containerRef.current || containerRef.current.clientWidth === 0) return;
-        try {
-          fitAddon.fit();
-          if (
-            modeRef.current === "ws" &&
-            wsRef.current &&
-            wsRef.current.readyState === WebSocket.OPEN
-          ) {
+        const previousCols = term.cols;
+        fitAddon.fit();
+        if (term.cols === previousCols) return;
+
+        if (modeRef.current === "ws") {
+          if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
             wsRef.current.send(
-              JSON.stringify({
-                type: "resize",
-                cols: term.cols,
-                rows: term.rows,
-              })
+              JSON.stringify({ type: "resize", cols: term.cols, rows: term.rows })
             );
           }
+          return;
+        }
+
+        // Serverless: repaint the prompt only when it is safe to — the line is
+        // untouched (no caret movement), nothing is running, and nothing else has
+        // been printed since the prompt.
+        const editor = lineEditorRef.current;
+        const pristine =
+          editor.line === "" && editor.cursor === 0 && !editor.pendingCarriageReturn;
+        if (!pristine || connectFailureRef.current || statusRef.current !== "connected") {
+          return;
+        }
+        const promptWidth = promptColsRef.current;
+        if (promptWidth > 0 && promptWidth !== term.cols) {
+          // The old prompt may span several rows; clear exactly those rows.
+          term.write(clearPromptRegion(promptTextRef.current, editor, promptWidth));
+          term.write(buildPromptText());
+        } else {
+          promptColsRef.current = term.cols;
+        }
+      };
+
+      resizeObserver = new ResizeObserver(() => {
+        try {
+          applyFit();
         } catch {
           // ignore
         }

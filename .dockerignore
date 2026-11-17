@@ -7,3 +7,6 @@ npm-debug.log*
 .env*.local
 data/*.json
 data/*.enc*
+.sushi
+data/*.lock
+data/*.tmp

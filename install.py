@@ -1,0 +1,411 @@
+#!/usr/bin/env python3
+"""
+Sushi — one-click installer (Python 3.9+, no third-party packages).
+
+    python3 install.py                  # install + build + start in the background
+    python3 install.py --foreground     # install + build + run in this terminal
+    python3 install.py --docker         # use Docker Compose instead of Node.js
+    python3 install.py --port 8080      # pick a port
+    python3 install.py --dir ~/sushi    # pick an install directory
+    python3 install.py --no-start       # install + build only
+
+What it does, in order:
+  1. Checks that Node.js >= 20 (or Docker, with --docker) exists — and tells you
+     the one command to install it if not.
+  2. Downloads the latest Sushi source (git clone, falling back to a GitHub
+     tarball when git is unavailable).
+  3. `npm ci` + `npm run build` with output-streaming, then starts the server.
+  4. Waits until /api/system/capabilities answers, then prints the URL.
+
+Nothing here needs root: it installs into a directory you own (`./sushi` by
+default) and never touches `data/` once it exists, so re-running the installer
+upgrades the code without deleting your account or encrypted vault.
+
+Sushi is AI-assisted software provided "AS IS", without warranty — see
+DISCLAIMER.md and PRIVACY.md in the repository before exposing it to the internet.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import platform
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+import urllib.error
+import urllib.request
+
+REPO = "sarakplaystore/sushi"
+MIN_NODE_MAJOR = 20
+HEALTH_PATH = "/api/system/capabilities"
+DEFAULT_PORT = 3000
+
+
+# --------------------------------------------------------------------------- #
+# tiny terminal helpers (no dependencies, colour only when attached to a TTY)
+# --------------------------------------------------------------------------- #
+class Style:
+    _on = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+
+    @classmethod
+    def _wrap(cls, code: str, text: str) -> str:
+        return f"\033[{code}m{text}\033[0m" if cls._on else text
+
+    @classmethod
+    def bold(cls, text: str) -> str:
+        return cls._wrap("1", text)
+
+    @classmethod
+    def green(cls, text: str) -> str:
+        return cls._wrap("32", text)
+
+    @classmethod
+    def yellow(cls, text: str) -> str:
+        return cls._wrap("33", text)
+
+    @classmethod
+    def red(cls, text: str) -> str:
+        return cls._wrap("31", text)
+
+    @classmethod
+    def dim(cls, text: str) -> str:
+        return cls._wrap("2", text)
+
+
+def step(message: str) -> None:
+    print(f"{Style.bold('==>')} {message}", flush=True)
+
+
+def ok(message: str) -> None:
+    print(f"  {Style.green('✔')} {message}", flush=True)
+
+
+def warn(message: str) -> None:
+    print(f"  {Style.yellow('!')} {message}", flush=True)
+
+
+def fail(message: str, hint: str | None = None) -> "NoReturn":  # type: ignore[name-defined]
+    print(f"\n{Style.red('✘')} {message}", file=sys.stderr)
+    if hint:
+        print(f"  {hint}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+# --------------------------------------------------------------------------- #
+# environment checks
+# --------------------------------------------------------------------------- #
+def run(cmd: list[str], cwd: str | None = None, env: dict[str, str] | None = None) -> int:
+    """Run a command, streaming output, and return its exit code."""
+    completed = subprocess.run(cmd, cwd=cwd, env=env)
+    return completed.returncode
+
+
+def which(name: str) -> str | None:
+    return shutil.which(name)
+
+
+def node_version(binary: str = "node") -> tuple[int, int, int] | None:
+    if not which(binary):
+        return None
+    try:
+        out = subprocess.run(
+            [binary, "--version"], capture_output=True, text=True, timeout=20
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    out = out.lstrip("v")
+    parts = out.split(".")
+    if not parts or not parts[0].isdigit():
+        return None
+    nums = [int(p) for p in parts[:3] if p.isdigit()]
+    while len(nums) < 3:
+        nums.append(0)
+    return nums[0], nums[1], nums[2]
+
+
+NODE_HINT = {
+    "linux": "Install Node.js 22 with:  curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash - && sudo apt-get install -y nodejs",
+    "darwin": "Install Node.js 22 with:  brew install node@22   (or download from https://nodejs.org)",
+}
+
+
+def require_node() -> None:
+    version = node_version()
+    if version is None:
+        fail(
+            "Node.js is not installed (Sushi needs Node.js 22).",
+            NODE_HINT.get(platform.system().lower(), "Download it from https://nodejs.org"),
+        )
+    if version[0] < MIN_NODE_MAJOR:
+        fail(
+            f"Node.js {version[0]}.{version[1]}.{version[2]} is too old — Sushi needs Node.js {MIN_NODE_MAJOR}+ (22 recommended).",
+            NODE_HINT.get(platform.system().lower(), "Download a newer version from https://nodejs.org"),
+        )
+    ok(f"Node.js {version[0]}.{version[1]}.{version[2]}")
+
+
+def require_docker() -> None:
+    if which("docker") is None:
+        fail(
+            "Docker is not installed.",
+            "Install it from https://docs.docker.com/engine/install/ (or run this script without --docker to use Node.js).",
+        )
+    if run(["docker", "compose", "version"]) != 0:
+        fail("Docker Compose v2 is missing.", "Update Docker Desktop / the docker-compose-plugin.")
+    if run(["docker", "info"]) != 0:
+        fail(
+            "The Docker daemon is not running (or you lack permission to use it).",
+            "Start Docker Desktop / run `sudo systemctl start docker`, or use the Node.js install instead.",
+        )
+    ok("Docker + Compose")
+
+
+# --------------------------------------------------------------------------- #
+# source download
+# --------------------------------------------------------------------------- #
+def download_source(target: str, branch: str, ref: str | None) -> None:
+    """Clone (preferred) or download a tarball of the repository into `target`."""
+    if os.path.isdir(os.path.join(target, ".git")) or os.path.isfile(
+        os.path.join(target, "install.py")
+    ):
+        ok(f"Reusing the existing checkout at {target}")
+        return
+
+    os.makedirs(target, exist_ok=True)
+    git = which("git")
+    if git:
+        step(f"Downloading Sushi ({branch}) with git…")
+        url = f"https://github.com/{REPO}.git"
+        shallow = ["clone", "--depth", "1", "--branch", ref or branch, url, target]
+        if run([git, *shallow]) == 0:
+            ok("Source downloaded")
+            return
+        warn("git clone failed — falling back to a GitHub tarball")
+
+    archive_ref = ref or branch
+    step(f"Downloading Sushi ({archive_ref}) as a tarball…")
+    tarball_url = f"https://codeload.github.com/{REPO}/tar.gz/refs/heads/{archive_ref}"
+    with tempfile.TemporaryDirectory() as tmp:
+        archive = os.path.join(tmp, "sushi.tar.gz")
+        try:
+            with urllib.request.urlopen(tarball_url, timeout=120) as response:
+                with open(archive, "wb") as handle:
+                    shutil.copyfileobj(response, handle)
+        except (urllib.error.URLError, urllib.error.HTTPError, OSError) as error:
+            fail(
+                f"Could not download {tarball_url}",
+                f"{error} — check your internet connection, or clone manually: git clone https://github.com/{REPO}.git",
+            )
+        with tarfile.open(archive) as tar:
+            tar.extractall(tmp, filter="data") if hasattr(tarfile, "data_filter") else tar.extractall(tmp)
+        roots = [p for p in os.listdir(tmp) if os.path.isdir(os.path.join(tmp, p)) and p != "__MACOSX"]
+        if not roots:
+            fail("The downloaded archive was empty.")
+        source = os.path.join(tmp, roots[0])
+        for entry in os.listdir(source):
+            shutil.move(os.path.join(source, entry), os.path.join(target, entry))
+    ok("Source downloaded")
+
+
+# --------------------------------------------------------------------------- #
+# health check
+# --------------------------------------------------------------------------- #
+def wait_for_health(port: int, timeout_seconds: int = 180, proc: subprocess.Popen | None = None) -> bool:
+    url = f"http://127.0.0.1:{port}{HEALTH_PATH}"
+    deadline = time.time() + timeout_seconds
+    step(f"Waiting for Sushi to answer on port {port}…")
+    while time.time() < deadline:
+        if proc is not None and proc.poll() is not None:
+            return False
+        try:
+            with urllib.request.urlopen(url, timeout=5) as response:
+                if response.status < 500:
+                    payload = json.loads(response.read().decode("utf-8", "replace") or "{}")
+                    ok(f"Healthy — runtime mode: {payload.get('mode', 'unknown')}")
+                    return True
+        except (urllib.error.URLError, urllib.error.HTTPError, OSError, ValueError):
+            pass
+        time.sleep(2)
+    return False
+
+
+# --------------------------------------------------------------------------- #
+# node install path
+# --------------------------------------------------------------------------- #
+def install_with_node(args: argparse.Namespace, target: str) -> int:
+    require_node()
+    download_source(target, args.branch, None)
+
+    env = dict(os.environ)
+    env.setdefault("NEXT_TELEMETRY_DISABLED", "1")
+
+    if not os.path.isdir(os.path.join(target, "node_modules")):
+        step("Installing dependencies (npm ci) — this takes a minute…")
+        if run(["npm", "ci", "--no-audit", "--no-fund"], cwd=target, env=env) != 0:
+            warn("npm ci failed — retrying with npm install")
+            if run(["npm", "install", "--no-audit", "--no-fund"], cwd=target, env=env) != 0:
+                fail("Could not install dependencies.", "Check that npm can reach registry.npmjs.org.")
+        ok("Dependencies installed")
+    else:
+        ok("Dependencies already installed")
+
+    step("Building the production bundle (this is the slow part, ~1–3 min)…")
+    if run(["npm", "run", "build"], cwd=target, env=env) != 0:
+        fail("The build failed.", "Re-run with `npm run build` inside the directory to see the full error.")
+    ok("Build complete")
+
+    if args.no_start:
+        return 0
+
+    data_dir = args.data_dir or os.path.join(target, "data")
+    os.makedirs(data_dir, exist_ok=True)
+
+    serve_env = dict(env)
+    serve_env.update(
+        {
+            "NODE_ENV": "production",
+            "HOST": args.host,
+            "PORT": str(args.port),
+            "DATA_DIR": data_dir,
+        }
+    )
+    server = ["npm", "start"]
+
+    if args.foreground:
+        step(f"Starting Sushi in the foreground on http://{args.host}:{args.port} (Ctrl+C to stop)")
+        return run(server, cwd=target, env=serve_env)
+
+    log_dir = os.path.join(target, ".sushi")
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = os.path.join(log_dir, "sushi.log")
+    step(f"Starting Sushi in the background (log: {log_path})")
+    with open(log_path, "ab") as log:
+        proc = subprocess.Popen(
+            server,
+            cwd=target,
+            env=serve_env,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    pid_path = os.path.join(log_dir, "sushi.pid")
+    with open(pid_path, "w", encoding="utf-8") as handle:
+        handle.write(str(proc.pid))
+
+    if not wait_for_health(args.port, args.timeout, proc):
+        tail = subprocess.run(["tail", "-n", "30", log_path], capture_output=True, text=True).stdout
+        print(tail.rstrip(), file=sys.stderr)
+        fail(
+            "Sushi did not become healthy in time.",
+            f"Check {log_path}, then retry with --foreground to see the output live.",
+        )
+
+    print_summary(args, target, pid=str(proc.pid))
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# docker install path
+# --------------------------------------------------------------------------- #
+def install_with_docker(args: argparse.Namespace, target: str) -> int:
+    require_docker()
+    download_source(target, args.branch, None)
+
+    env_file = os.path.join(target, ".env")
+    if not os.path.isfile(env_file):
+        example = os.path.join(target, ".env.example")
+        if os.path.isfile(example):
+            shutil.copyfile(example, env_file)
+        secret = os.urandom(24).hex()
+        with open(env_file, "a", encoding="utf-8") as handle:
+            handle.write(f"\n# generated by install.py\nSUSHI_AUTH_SECRET={secret}\nPORT={args.port}\n")
+        ok(f"Created .env with a random SUSHI_AUTH_SECRET (port {args.port})")
+    else:
+        ok("Keeping your existing .env")
+
+    step("Building and starting Sushi + guacd with Docker Compose…")
+    if run(["docker", "compose", "up", "-d", "--build"], cwd=target) != 0:
+        fail("Docker Compose failed.", "Run `docker compose up --build` in the directory to see the error.")
+
+    if not wait_for_health(args.port, args.timeout):
+        warn("The container is running but has not answered yet — check `docker compose logs -f sushi`.")
+    print_summary(args, target, docker=True)
+    return 0
+
+
+def print_summary(args: argparse.Namespace, target: str, pid: str | None = None, docker: bool = False) -> None:
+    shown_host = "localhost" if args.host in {"0.0.0.0", "::"} else args.host
+    url = f"http://{shown_host}:{args.port}"
+    print()
+    print(Style.green(Style.bold("  Sushi is up.")))
+    print(f"  Open:      {Style.bold(url)}")
+    print(f"  Directory: {target}")
+    print(f"  Data:      {args.data_dir or os.path.join(target, 'data')}  {Style.dim('(back this up — account + encrypted vault)')}")
+    print()
+    if docker:
+        print(f"  Stop:      cd {target} && docker compose down")
+        print(f"  Logs:      cd {target} && docker compose logs -f sushi")
+    elif args.foreground:
+        print("  Stop:      Ctrl+C")
+    else:
+        print(f"  Stop:      kill {pid or '<pid in .sushi/sushi.pid>'}")
+        print(f"  Logs:      tail -f {os.path.join(target, '.sushi', 'sushi.log')}")
+    print()
+    print(Style.yellow("  First visit asks you to create the admin account — do that immediately,"))
+    print(Style.yellow("  and put HTTPS in front of it before exposing it to the internet."))
+    print()
+    print(Style.dim("  Sushi is AI-assisted software provided \"AS IS\", without warranty."))
+    print(Style.dim("  See DISCLAIMER.md and PRIVACY.md."))
+    print()
+
+
+# --------------------------------------------------------------------------- #
+# main
+# --------------------------------------------------------------------------- #
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="install.py",
+        description="Install, build and start Sushi (self-hosted web SSH/SFTP/RDP workspace) in one step.",
+        epilog="Docs: https://github.com/sarakplaystore/sushi#quick-start",
+    )
+    parser.add_argument("--dir", default="sushi", help="install directory (default: ./sushi)")
+    parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", DEFAULT_PORT)), help=f"HTTP port (default: {DEFAULT_PORT})")
+    parser.add_argument("--host", default="0.0.0.0", help="bind address (default: 0.0.0.0)")
+    parser.add_argument("--data-dir", default=None, help="where auth.json / vault.enc.json live (default: <dir>/data)")
+    parser.add_argument("--branch", default="main", help="git branch or tag to install (default: main)")
+    parser.add_argument("--docker", action="store_true", help="use Docker Compose (Sushi + guacd) instead of Node.js")
+    parser.add_argument("--foreground", action="store_true", help="keep the server attached to this terminal")
+    parser.add_argument("--no-start", action="store_true", help="install and build, but do not start the server")
+    parser.add_argument("--timeout", type=int, default=180, help="seconds to wait for the health check (default: 180)")
+    parser.add_argument("--version", action="version", version="Sushi installer 1.0.0")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str]) -> int:
+    args = parse_args(argv)
+    target = os.path.abspath(os.path.expanduser(args.dir))
+
+    print()
+    print(Style.bold("  Sushi installer"))
+    print(Style.dim("  self-hosted web SSH · SFTP · RDP workspace"))
+    print()
+
+    step(f"Install directory: {target}")
+    os.makedirs(target, exist_ok=True)
+
+    if args.docker:
+        return install_with_docker(args, target)
+    return install_with_node(args, target)
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        print("\nCancelled.", file=sys.stderr)
+        raise SystemExit(130)

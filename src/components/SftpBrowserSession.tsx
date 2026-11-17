@@ -194,6 +194,23 @@ export function SftpBrowserSession({
   const selectionAnchorRef = useRef<string | null>(null);
   const selectedSet = new Set(selectedPaths);
 
+  /**
+   * "Auto sudo su": when on, every SFTP call asks the server to run the file
+   * session as root through sudo, so root-owned paths open like they do in a root
+   * shell. The sudo password (when the host needs one) only lives in this tab's
+   * memory — never on the saved host.
+   */
+  // `wantRoot` is the user's choice; `isRoot` is what the server confirmed. They
+  // differ while a password is being asked for, or when elevation is impossible —
+  // and the banner in those cases says exactly which one applies.
+  const [wantRoot, setWantRoot] = useState(Boolean(profile.sftpElevated));
+  const [isRoot, setIsRoot] = useState(false);
+  const [elevationError, setElevationError] = useState<string | null>(null);
+  const [sudoPassword, setSudoPassword] = useState<string | null>(null);
+  const [sudoPrompt, setSudoPrompt] = useState<string | null>(null);
+  const [sudoInput, setSudoInput] = useState("");
+  const [sudoBusy, setSudoBusy] = useState(false);
+
   const credentialsPayload = {
     host: profile.host,
     port: profile.port,
@@ -202,6 +219,15 @@ export function SftpBrowserSession({
     password: profile.password,
     privateKey: profile.privateKey,
     passphrase: profile.passphrase,
+    ...(wantRoot
+      ? {
+          sftpElevate: {
+            user: "root",
+            // Sent per request; the server never stores it.
+            ...(sudoPassword ? { password: sudoPassword } : {}),
+          },
+        }
+      : {}),
   };
 
   const showNotice = (ok: boolean, msg: string) => {
@@ -227,6 +253,22 @@ export function SftpBrowserSession({
           throw new Error(data.error || `Failed to list ${targetPath}`);
         }
         const nextEntries: SftpEntry[] = data.entries || [];
+        // The server reports whether the session really runs as root; when it
+        // does not, it also says why (no sudo, no sftp-server, password needed).
+        const serverRoot = data.elevated === true;
+        setIsRoot(serverRoot);
+        const reason =
+          typeof data.elevationError === "string" && data.elevationError
+            ? data.elevationError
+            : null;
+        setElevationError(reason);
+        if (wantRoot && !serverRoot && !sudoPassword) {
+          // Missing (or wrong) sudo password → ask, instead of leaving the user
+          // wondering why /etc is still read-only.
+          setSudoPrompt(reason || "sudo did not grant root access on this server.");
+        } else if (wantRoot && serverRoot) {
+          setSudoPrompt(null);
+        }
         setCwd(data.cwd);
         setPathInput(data.cwd);
         setEntries(nextEntries);
@@ -253,6 +295,8 @@ export function SftpBrowserSession({
       profile.privateKey,
       profile.passphrase,
       gatewaySettings,
+      wantRoot,
+      sudoPassword,
     ]
   );
 
@@ -642,6 +686,70 @@ export function SftpBrowserSession({
     selectionAnchorRef.current = entry.path;
   };
 
+  /**
+   * Turns root mode on or off.
+   *
+   * Enabling it re-lists the current directory through sudo. When the server says
+   * it needs a password, the prompt below opens instead of quietly staying on the
+   * login user's files — the difference between "you are root" and "you are not"
+   * must never be silent.
+   */
+  const toggleElevation = (next: boolean) => {
+    setElevationError(null);
+    setWantRoot(next);
+    if (!next) {
+      setSudoPassword(null);
+      setSudoPrompt(null);
+      showNotice(true, `Browsing as ${profile.username}`);
+      void loadDirectory(cwd);
+      return;
+    }
+    // Try without a password first: root logins, NOPASSWD hosts and a still-valid
+    // sudo timestamp work silently. If sudo wants one, the list response says so
+    // and the prompt opens. `loadDirectory` re-runs from the effect.
+    if (!sudoPassword) setSudoPrompt("checking");
+  };
+
+  const submitSudoPassword = async () => {
+    if (!sudoInput.trim()) {
+      setSudoPrompt("sudo needs a password on this server.");
+      return;
+    }
+    setSudoBusy(true);
+    setSudoPassword(sudoInput);
+    setSudoInput("");
+    try {
+      // Verify immediately so a wrong password is reported here, not later.
+      const res = await fetch("/api/sftp/list", {
+        method: "POST",
+        headers: getAuthHeaders(gatewaySettings),
+        body: JSON.stringify({
+          credentials: { ...credentialsPayload, sftpElevate: { user: "root", password: sudoInput } },
+          path: cwd,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.ok) throw new Error(data.error || "Could not switch to root.");
+      if (data.elevated) {
+        setIsRoot(true);
+        setSudoPrompt(null);
+        setElevationError(null);
+        showNotice(true, "Browsing as root (sudo)");
+        // The list above was the login user's view; reload so the browser shows
+        // what root sees (root-owned entries, /root itself, …).
+        void loadDirectory(cwd);
+      } else {
+        setSudoPassword(null);
+        setSudoPrompt(data.elevationError || "sudo did not grant root access.");
+      }
+    } catch (err) {
+      setSudoPassword(null);
+      setSudoPrompt(err instanceof Error ? err.message : "sudo failed.");
+    } finally {
+      setSudoBusy(false);
+    }
+  };
+
   const toggleSelectAllVisible = () => {
     if (allVisibleSelected) {
       const visible = new Set(visibleEntries.map((e) => e.path));
@@ -680,6 +788,65 @@ export function SftpBrowserSession({
           <p className="text-sm font-semibold text-white">
             Drop files anywhere to upload to {cwd}
           </p>
+        </div>
+      )}
+
+      {/* sudo password prompt: appears only when root mode needs a password */}
+      {wantRoot && sudoPrompt !== null && (
+        <form
+          onSubmit={(e) => {
+            e.preventDefault();
+            void submitSudoPassword();
+          }}
+          className="flex flex-wrap items-center gap-2 border-b border-amber-500/30 bg-amber-500/10 px-4 py-2 text-xs text-amber-100"
+        >
+          <ShieldCheck className="h-4 w-4 shrink-0 text-amber-300" />
+          <span className="min-w-0 flex-1 truncate">
+            {sudoPrompt === "checking"
+              ? "Checking sudo on the server…"
+              : sudoPrompt}
+          </span>
+          {sudoPrompt !== "checking" && (
+            <>
+              <input
+                type="password"
+                value={sudoInput}
+                onChange={(e) => setSudoInput(e.target.value)}
+                placeholder={`sudo password for ${profile.username}`}
+                autoFocus
+                autoComplete="current-password"
+                className="font-mono-code w-56 rounded-lg border border-amber-400/40 bg-[#090b10] px-2 py-1 text-xs text-white outline-none"
+              />
+              <button
+                type="submit"
+                disabled={sudoBusy}
+                className="rounded-lg bg-amber-500 px-3 py-1 text-xs font-semibold text-slate-950 disabled:opacity-60"
+              >
+                {sudoBusy ? "Checking…" : "Use root"}
+              </button>
+            </>
+          )}
+          <button
+            type="button"
+            onClick={() => {
+              setSudoPrompt(null);
+              setSudoInput("");
+              setWantRoot(false);
+              setIsRoot(false);
+              setElevationError(null);
+              void loadDirectory(cwd);
+            }}
+            className="rounded-lg border border-white/15 px-2 py-1 text-slate-200 hover:bg-white/10"
+          >
+            Not now
+          </button>
+        </form>
+      )}
+
+      {wantRoot && sudoPrompt === null && elevationError && (
+        <div className="flex items-center gap-2 border-b border-rose-500/25 bg-rose-500/10 px-4 py-1.5 text-[11px] text-rose-200">
+          <AlertCircle className="h-3.5 w-3.5 shrink-0" />
+          <span className="min-w-0 flex-1">{elevationError}</span>
         </div>
       )}
 
@@ -764,6 +931,28 @@ export function SftpBrowserSession({
 
           {/* Right Toolbar */}
           <div className="flex flex-wrap items-center gap-1.5">
+            <button
+              type="button"
+              onClick={() => toggleElevation(!wantRoot)}
+              title={
+                isRoot
+                  ? "Files are managed as root through sudo — click to go back to your login user"
+                  : "Browse and edit root-owned files (runs SFTP through sudo)"
+              }
+              aria-pressed={wantRoot}
+              className={`flex items-center gap-1 rounded-lg border px-2 py-1 text-xs font-semibold transition ${
+                isRoot
+                  ? "border-amber-400/50 bg-amber-500/20 text-amber-200 hover:bg-amber-500/30"
+                  : "border-white/10 bg-white/5 text-slate-300 hover:bg-white/10 hover:text-white"
+              }`}
+            >
+              {isRoot ? (
+                <ShieldCheck className="h-3.5 w-3.5" />
+              ) : (
+                <Shield className="h-3.5 w-3.5" />
+              )}
+              {isRoot ? "Root" : "Sudo"}
+            </button>
             <input
               ref={fileInputRef}
               type="file"

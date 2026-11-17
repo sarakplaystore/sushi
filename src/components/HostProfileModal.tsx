@@ -98,6 +98,8 @@ export function HostProfileModal({
   const [rdpAudio, setRdpAudio] = useState(true);
   const [rdpDrive, setRdpDrive] = useState<"auto" | "on" | "off">("auto");
   const [initialPath, setInitialPath] = useState("");
+  // "Auto sudo su": open the file browser as root through sudo.
+  const [sftpElevated, setSftpElevated] = useState(false);
   const [group, setGroup] = useState("Production");
   const [accentColor, setAccentColor] = useState("#34d399");
   const [notes, setNotes] = useState("");
@@ -134,6 +136,7 @@ export function HostProfileModal({
     setRdpAudio(initialProfile?.rdpAudio !== false);
     setRdpDrive(initialProfile?.rdpDrive === undefined ? "auto" : initialProfile.rdpDrive ? "on" : "off");
     setInitialPath(initialProfile?.initialPath || "");
+    setSftpElevated(initialProfile?.sftpElevated === true);
     setGroup(initialProfile?.group || "Production");
     setAccentColor(
       initialProfile?.accentColor ||
@@ -248,6 +251,7 @@ export function HostProfileModal({
       rdpAudio: protocol === "rdp" ? rdpAudio : undefined,
       rdpDrive: protocol === "rdp" && rdpDrive !== "auto" ? rdpDrive === "on" : undefined,
       initialPath: protocol === "sftp" ? initialPath.trim() : undefined,
+      sftpElevated: protocol === "sftp" ? sftpElevated || undefined : undefined,
       group: group.trim() || "Servers",
       accentColor,
       notes: notes.trim() || undefined,
@@ -718,6 +722,25 @@ export function HostProfileModal({
                     placeholder="/var/www or leave empty for home directory"
                     className="font-mono-code w-full rounded-xl border border-white/10 bg-[#0b0e14] px-3.5 py-2 text-sm text-white placeholder-slate-500 outline-none focus:border-white/25"
                   />
+                  <label className="mt-3 flex cursor-pointer items-start gap-2 rounded-xl border border-white/10 bg-[#0b0e14] px-3 py-2">
+                    <input
+                      type="checkbox"
+                      checked={sftpElevated}
+                      onChange={(e) => setSftpElevated(e.target.checked)}
+                      className="mt-0.5 h-3.5 w-3.5 accent-amber-400"
+                    />
+                    <span className="min-w-0">
+                      <span className="block text-xs font-semibold text-white">
+                        Auto root (sudo su) for files
+                      </span>
+                      <span className="mt-0.5 block text-[11px] leading-snug text-slate-500">
+                        Opens this host&apos;s files as root through sudo, so
+                        /etc, /var and root-owned paths are editable. Asks for
+                        your sudo password when the server needs one; never saved
+                        on this host. Works when the login user may run sudo.
+                      </span>
+                    </span>
+                  </label>
                 </div>
               )}
             </div>

@@ -34,6 +34,13 @@ It is designed around a **Hybrid VPS + Serverless Architecture**:
   - Password, keyboard-interactive (PAM), and PEM/OpenSSH Private Key (`Ed25519`, `RSA`, `ECDSA` + passphrase) authentication
   - **Distro & cloud badge on connect**: the header names the machine you are on — `Ubuntu 24.04.1 LTS · Oracle Cloud`, `Debian 12 · KVM VPS`, `Rocky Linux 9.4 · AWS EC2` — read in one non-root exec (`/etc/os-release`, cloud-init's `cloud-id`, DMI strings) and cached for five minutes; the **Test SSH Auth** card in *New Connection* shows the same OS, hosting platform and vCPU/RAM before you connect
   - SHA-256 host key fingerprint verification, quick command snippets, scrollback search, and terminal themes
+- **Team Sharing — one SSH session, several people** (`/ws/ssh` + `/share/<id>`)
+  - **Share** in the terminal header publishes the shell you are already in: everyone who opens the link lands in *that* PTY — same screen, same working directory, same half-finished `vim` — and can keep running commands there
+  - **The shell outlives every browser**: close your laptop, and the SSH channel stays open on the server, so a teammate re-attaches hours later and carries on instead of starting over
+  - **Two ways in**: a 6-digit share code for anyone with the link, or *signed-in Sushi accounts only* — no code to leak, no guest list to manage
+  - **Who is in here**: a live roster with names and join times, and a `… is typing` hint so two people do not drive at once; **New code** invalidates the old one instantly
+  - **Let teammates type** is the default; switch it off for a read-only share when someone should only watch
+  - **Scrollback replay** for late joiners (256 KB ring buffer), terminal size follows the smallest attached screen, and **Stop sharing** disconnects guests while your own terminal keeps running
 - Commands survive a closed tab (No timeout + resume prompt) and recently connected hosts are remembered
 - One merged entry per machine in the sidebar and launchpad, plus **All hosts** (`/hosts`) — one table of every machine with its SSH/SFTP/RDP ports and one link each — and `GET /api/hosts` for scripts
   - **Translate selected text**: highlight any text in the terminal and hit the **Translate** button — the translation appears in a panel above the terminal (Chinese by default, 14 target languages, remembered per browser). Translates through Sushi's own `/api/translate` (see *Translating text* below)
@@ -173,6 +180,57 @@ reported before two machines merge). Deleting a merged row deletes the machine, 
 confirmation naming the protocols that go with it, instead of leaving orphaned
 profiles behind. Saves still go through the normal encrypted-vault path — no new
 storage, no new sync path.
+
+## Team sharing — one SSH session, several people
+
+A normal Sushi terminal is private: one tab, one shell, and the shell dies with the tab.
+**Share** (in the terminal header) turns that shell into a shared one:
+
+1. Open a host's terminal and hit **Share**.
+2. Pick **Anyone with the link** (Sushi mints a 6-digit code) or **Signed-in Sushi
+   accounts** (the link only works for people logged in to this instance), and decide
+   whether teammates may type.
+3. Send the link (`<your-sushi>/share/<id>`). Whoever opens it types their name, the
+   code if there is one, and **Join session**.
+
+From then on there is exactly **one** SSH connection to the host, no matter how many
+browsers are attached. Output goes to everyone; keystrokes from anyone with write
+access go into that one PTY. It is the difference between "here is the box, good luck"
+and "here is *my* shell, carry on where I stopped".
+
+**The shell keeps running when nobody is watching.** Detaching is the normal case, not
+an error: the SSH channel stays open on the server until it has been idle for
+`SUSHI_SHARE_IDLE_TTL_MS` (default 12 h), so a teammate can close their laptop and
+somebody else re-attaches to the same session later — replaying the scrollback they
+missed instead of a blank screen.
+
+Where it works, and where it does not:
+
+| | Shared shell |
+| --- | --- |
+| VPS / Docker install (`server.ts`) | ✅ |
+| `GATEWAY_ONLY=true` gateway | ✅ |
+| Vercel serverless | ❌ serverless has no process to hold a PTY open — the Share panel says so and offers *Attach a VPS gateway* |
+
+Managing shares: **Share → Other shared sessions here** lists everything currently
+published on this server, with **Rejoin** and **Stop**. The same list is available to
+scripts and dashboards at `GET /api/ssh/share` (account required); `DELETE
+/api/ssh/share?id=…` stops one, and `PATCH` with `{"id": …, "passcode": "auto"}` rotates
+its code (`"passcode": null` switches it to account-only).
+
+**Treat a share link as a handover of the host account.** Everyone in the shell runs
+commands as the SSH user of that connection, with that user's `sudo`, on the machine
+you pointed Sushi at. Share with people you would hand the password to, prefer
+read-only when someone only needs to watch, rotate or stop the share when the work is
+done, and remember the shell keeps running until you stop it.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `SUSHI_SHARE_MAX_SESSIONS` | `50` | Most shells shared at once on this server |
+| `SUSHI_SHARE_IDLE_TTL_MS` | `43200000` (12 h) | How long a detached shell with nobody attached is kept |
+| `SUSHI_SHARE_SCROLLBACK_BYTES` | `262144` (256 KB) | Scrollback replayed to whoever joins late |
+
+---
 
 ## Add Sushi to an iPhone or iPad Home Screen
 

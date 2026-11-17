@@ -33,6 +33,9 @@ export async function GET(req: NextRequest) {
     rdpGuacd: guacdOk,
     rdpCleanPath: true,
     rdpProbe: true,
+    // Sharing holds one SSH channel open for many browsers, which only a persistent
+    // WebSocket gateway can do — Vercel serverless has nowhere to keep it.
+    sharedSsh: wsActive,
     serverVault: isServerVaultEnabled(),
     storageBackend: getStateStoreKind(),
     requiresGatewayToken: Boolean(process.env.SUSHI_GATEWAY_TOKEN?.trim()),

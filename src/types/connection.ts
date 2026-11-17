@@ -184,6 +184,8 @@ export interface SystemCapabilities {
   rdpGuacd: boolean;
   rdpCleanPath?: boolean;
   rdpProbe: boolean;
+  /** Team-shared SSH PTY sessions are possible (needs a persistent gateway). */
+  sharedSsh?: boolean;
   serverVault: boolean;
   storageBackend?: "disk" | "redis" | "turso" | "firestore" | "none";
   requiresGatewayToken: boolean;

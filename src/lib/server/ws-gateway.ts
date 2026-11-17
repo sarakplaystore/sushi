@@ -1,35 +1,14 @@
 import type { IncomingMessage } from "node:http";
 import type { Duplex } from "node:stream";
 import { WebSocketServer, type WebSocket } from "ws";
-import type { ClientChannel } from "ssh2";
 import type { ConnectionCredentials } from "@/types/connection";
-import { verifyRequestAccess } from "./security";
-import { connectSsh, type ConnectedSshSession } from "./ssh-client";
+import { verifyRequestAccess, withBrowserTokenHeaders } from "./security";
+import { handleSshConnection } from "./ws-ssh";
 import { bridgeRdpToGuacd } from "./guacd-bridge";
 import {
   buildRDCleanPathError,
   handleRDCleanPathWebSocket,
 } from "./rdcleanpath";
-
-/**
- * Browsers cannot set custom headers on a WebSocket handshake, so the SSH / RDP
- * clients send their Sushi session token and VPS gateway token in the first message
- * or the query string. Map both onto the headers the HTTP API uses, so the session
- * token is verified as a session AND the gateway token is checked against
- * SUSHI_GATEWAY_TOKEN. (Forwarding only one of them — always as a session token —
- * meant a Vercel-hosted Sushi could never authenticate to a VPS gateway.)
- */
-function withBrowserTokens(
-  headers: IncomingMessage["headers"],
-  tokens: { session?: string | null; gateway?: string | null }
-): IncomingMessage["headers"] {
-  const merged: IncomingMessage["headers"] = { ...headers };
-  const session = tokens.session?.trim();
-  const gateway = tokens.gateway?.trim();
-  if (session) merged["x-sushi-session"] = session;
-  if (gateway) merged["x-sushi-token"] = gateway;
-  return merged;
-}
 
 export interface GatewayUpgradeDispatcher {
   canHandle: (pathname: string) => boolean;
@@ -60,175 +39,14 @@ export function createGatewayWebSockets(): GatewayUpgradeDispatcher {
     maxPayload: 16 * 1024 * 1024,
   });
 
-  sshWss.on("connection", (ws: WebSocket, req: IncomingMessage) => {
-    const reqUrl = new URL(req.url || "/ws/ssh", "http://localhost");
-    const queryToken = reqUrl.searchParams.get("token");
-
-    let sshSession: ConnectedSshSession | null = null;
-    let shellStream: ClientChannel | null = null;
-    let authenticated = false;
-
-    const sendJson = (payload: Record<string, unknown>) => {
-      if (ws.readyState === ws.OPEN) {
-        ws.send(JSON.stringify(payload));
-      }
-    };
-
-    const authTimeout = setTimeout(() => {
-      if (!authenticated) {
-        sendJson({ type: "error", message: "SSH authentication handshake timed out." });
-        ws.close(1008, "Auth timeout");
-      }
-    }, 15000);
-
-    const cleanup = () => {
-      clearTimeout(authTimeout);
-      try {
-        shellStream?.close();
-      } catch {
-        // ignore
-      }
-      try {
-        sshSession?.client.end();
-      } catch {
-        // ignore
-      }
-      shellStream = null;
-      sshSession = null;
-    };
-
-    ws.on("message", async (raw) => {
-      let msg: Record<string, unknown>;
-      try {
-        msg = JSON.parse(typeof raw === "string" ? raw : raw.toString("utf8"));
-      } catch {
-        return;
-      }
-
-      if (msg.type === "ping") {
-        sendJson({ type: "pong", ts: Date.now() });
-        return;
-      }
-
-      if (msg.type === "auth" && !authenticated) {
-        const sessionToken =
-          typeof msg.sessionToken === "string" ? msg.sessionToken.trim() : "";
-        const gatewayToken =
-          typeof msg.gatewayToken === "string" ? msg.gatewayToken.trim() : "";
-        const tokenCheck = await verifyRequestAccess(
-          withBrowserTokens(req.headers, {
-            session: sessionToken || reqUrl.searchParams.get("session"),
-            gateway: gatewayToken || queryToken,
-          })
-        );
-        if (!tokenCheck.ok) {
-          sendJson({ type: "error", message: tokenCheck.error });
-          ws.close(1008, "Unauthorized");
-          return;
-        }
-
-        authenticated = true;
-        clearTimeout(authTimeout);
-
-        const creds = msg.credentials as ConnectionCredentials | undefined;
-        if (!creds || !creds.host || !creds.username) {
-          sendJson({ type: "error", message: "Missing SSH host or username." });
-          ws.close(1008, "Invalid credentials");
-          return;
-        }
-
-        const cols = Math.max(20, Math.min(500, Number(msg.cols || 100)));
-        const rows = Math.max(5, Math.min(200, Number(msg.rows || 30)));
-
-        try {
-          sshSession = await connectSsh(creds, 15000);
-
-          sshSession.client.on("error", (err) => {
-            sendJson({ type: "error", message: err.message });
-            cleanup();
-          });
-
-          sshSession.client.on("end", () => {
-            sendJson({ type: "exit" });
-            ws.close(1000, "SSH ended");
-          });
-
-          sshSession.client.shell(
-            { term: "xterm-256color", cols, rows },
-            (err, stream) => {
-              if (err) {
-                sendJson({
-                  type: "error",
-                  message: err.message || "Failed to allocate interactive PTY shell.",
-                });
-                cleanup();
-                ws.close(1011, "Shell error");
-                return;
-              }
-
-              shellStream = stream;
-              sendJson({
-                type: "ready",
-                fingerprint: sshSession?.fingerprint,
-                banner: sshSession?.serverBanner,
-              });
-
-              stream.on("data", (chunk: Buffer) => {
-                sendJson({
-                  type: "data",
-                  data: chunk.toString("base64"),
-                });
-              });
-
-              stream.stderr.on("data", (chunk: Buffer) => {
-                sendJson({
-                  type: "data",
-                  data: chunk.toString("base64"),
-                });
-              });
-
-              stream.on("close", () => {
-                sendJson({ type: "exit" });
-                cleanup();
-                if (ws.readyState === ws.OPEN) {
-                  ws.close(1000, "Shell closed");
-                }
-              });
-            }
-          );
-        } catch (err) {
-          sendJson({
-            type: "error",
-            message: err instanceof Error ? err.message : "SSH connection failed.",
-          });
-          cleanup();
-          ws.close(1011, "SSH failed");
-        }
-        return;
-      }
-
-      if (msg.type === "input" && shellStream) {
-        if (typeof msg.data === "string") {
-          shellStream.write(msg.data);
-        }
-        return;
-      }
-
-      if (msg.type === "resize" && shellStream) {
-        const cols = Math.max(20, Math.min(500, Number(msg.cols || 80)));
-        const rows = Math.max(5, Math.min(200, Number(msg.rows || 24)));
-        shellStream.setWindow(rows, cols, 0, 0);
-      }
-    });
-
-    ws.on("close", cleanup);
-    ws.on("error", cleanup);
-  });
+  // One handler for both modes: a private shell, and a shell shared with the team
+  // (see src/lib/server/ws-ssh.ts).
+  sshWss.on("connection", handleSshConnection);
 
   rdpWss.on("connection", async (ws: WebSocket, req: IncomingMessage) => {
     const reqUrl = new URL(req.url || "/ws/rdp", "http://localhost");
     const auth = await verifyRequestAccess(
-      withBrowserTokens(req.headers, {
+      withBrowserTokenHeaders(req.headers, {
         session: reqUrl.searchParams.get("session"),
         gateway: reqUrl.searchParams.get("token"),
       })
@@ -285,7 +103,7 @@ export function createGatewayWebSockets(): GatewayUpgradeDispatcher {
 
     void (async () => {
       const auth = await verifyRequestAccess(
-        withBrowserTokens(req.headers, {
+        withBrowserTokenHeaders(req.headers, {
           session: reqUrl.searchParams.get("session"),
           gateway: reqUrl.searchParams.get("token"),
         })

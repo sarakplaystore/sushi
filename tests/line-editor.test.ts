@@ -3,9 +3,13 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import {
   applyLineInput,
+  choosePromptParts,
+  clearPromptRegion,
   emptyLineEditorState,
+  promptTextFor,
   pushHistory,
   redrawToText,
+  visibleWidth,
   type LineEditorState,
 } from "../src/lib/client/line-editor";
 
@@ -178,11 +182,84 @@ assert.deepEqual(store, ["ls", "pwd"], "history skips duplicates and blanks");
 for (let i = 0; i < 800; i += 1) pushHistory(store, `cmd ${i}`);
 assert.equal(store.length, 500, "history is bounded");
 
+// ---- wrapped prompts: pending-wrap redraw --------------------------------------
+// A prompt + line that exactly fills the last row leaves the cursor on a fresh row
+// (pending wrap). `\r` would then go to column 0 of the *next* row and smear the
+// line, so the redraw starts from a clean line instead.
+const exact = redrawToText("$ ", { line: "x".repeat(8), cursor: 8, historyIndex: -1, draft: "" }, 10);
+assert.ok(exact.startsWith("\r\n"), "a full row redraws on a fresh line");
+assert.ok(exact.includes("\x1b[0K"), "the new row is cleared first");
+// The normal case is untouched: a short line still redraws in place.
+assert.equal(
+  redrawToText("$ ", { line: "abc", cursor: 3, historyIndex: -1, draft: "" }, 80),
+  "\r$ abc\x1b[0K",
+  "a line that fits redraws in place"
+);
+// Without a known width the old behaviour is kept (no guessing).
+assert.equal(
+  redrawToText("$ ", { line: "abc", cursor: 3, historyIndex: -1, draft: "" }),
+  "\r$ abc\x1b[0K"
+);
+
+// ---- visible width (codes are not columns) --------------------------------------
+assert.equal(visibleWidth("\x1b[1;32mubuntu@host\x1b[0m"), 11);
+assert.equal(visibleWidth("$ "), 2);
+assert.equal(visibleWidth("\x1b[1;31mroot\x1b[0m:\x1b[1;34m~\x1b[0m# "), 8);
+
+// ---- prompt shortening for narrow panes -----------------------------------------
+const long = { user: "ubuntu", host: "193.123.125.81", path: "/home/ubuntu", marker: "$ " };
+const wide = choosePromptParts({ ...long, cols: 120 });
+assert.deepEqual(wide, { user: true, host: true, path: true }, "a wide pane gets the full prompt");
+assert.equal(promptTextFor(wide, long), "ubuntu@193.123.125.81:/home/ubuntu$ ");
+// 20 columns of the pane are reserved for typing, so the path (16 columns) needs
+// a pane of at least 36 columns to be shown.
+assert.equal(
+  promptTextFor(choosePromptParts({ ...long, cols: 33 }), long),
+  "$ ",
+  "below the path's width only the marker fits"
+);
+const narrow = choosePromptParts({ ...long, cols: 36 });
+assert.equal(promptTextFor(narrow, long), "/home/ubuntu$ ", "a narrow pane keeps the path");
+// Very narrow: the bare marker, so a command can still be typed.
+const tiny = choosePromptParts({ ...long, cols: 12 });
+assert.equal(promptTextFor(tiny, long), "$ ", "the narrowest pane keeps only the marker");
+// Unknown width keeps everything — the prompt must not change mid-line.
+assert.deepEqual(choosePromptParts({ ...long, cols: 0 }), { user: true, host: true, path: true });
+assert.deepEqual(choosePromptParts({ ...long, cols: NaN }), { user: true, host: true, path: true });
+// `user@path` (no host) is never produced: it reads like a typo.
+for (let cols = 1; cols <= 140; cols += 1) {
+  const parts = choosePromptParts({ ...long, cols });
+  assert.ok(!(parts.user && !parts.host), `never user@path without host (cols=${cols})`);
+}
+// Monotonic: a wider pane never shows less than a narrower one.
+let previous = 0;
+for (let cols = 1; cols <= 140; cols += 1) {
+  const parts = choosePromptParts({ ...long, cols });
+  const shown = (parts.user ? 1 : 0) + (parts.host ? 1 : 0) + (parts.path ? 1 : 0);
+  assert.ok(shown >= Math.min(previous, 3), `prompt never gets shorter when wider (cols=${cols})`);
+  previous = shown;
+}
+
+// ---- clearing a prompt that spans rows ------------------------------------------
+const short = clearPromptRegion("$ ", { line: "abc", cursor: 3, historyIndex: -1, draft: "" }, 80);
+assert.equal(short, "\r\x1b[2K\r", "one row: erase in place");
+const tall = clearPromptRegion(
+  "ubuntu@193.123.125.81:/home/ubuntu$ ",
+  { line: "ls", cursor: 2, historyIndex: -1, draft: "" },
+  12
+);
+// 38 columns of text in a 12-column pane = 4 rows.
+assert.ok(tall.includes("\x1b[3A"), "moves up over every row of the wrapped prompt");
+assert.equal((tall.match(/\x1b\[2K/g) || []).length, 4, "each row is cleared");
+assert.ok(tall.endsWith("\r"), "the cursor ends at column 0 of the first row");
+
 // ---- the component actually uses this editor -----------------------------------
 const session = readFileSync(resolve(process.cwd(), "src/components/SshTerminalSession.tsx"), "utf8");
 assert.match(session, /from "@\/lib\/client\/line-editor"/, "the terminal imports the line editor");
 assert.match(session, /applyLineInput\(/, "input goes through applyLineInput");
 assert.match(session, /redrawToText\(/, "redraws come from redrawToText");
+assert.match(session, /choosePromptParts\(/, "the prompt is fitted to the pane width");
+assert.match(session, /clearPromptRegion\(/, "a wrapped prompt is repainted after a resize");
 assert.ok(
   !/data\.slice\(i, i \+ 3\) === "\\x1b\[A"/.test(session),
   "the old hand-rolled up-arrow branch is gone"

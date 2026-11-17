@@ -20,6 +20,7 @@ import {
   setStoredSessionToken,
 } from "@/lib/client/auth-storage";
 import { isInsecureBrowserContext } from "@/lib/client/web-crypto";
+import { AiDisclaimer } from "./AiDisclaimer";
 
 const PASSKEY_HTTPS_REQUIRED =
   "Passkeys need HTTPS: browsers disable WebAuthn on plain-HTTP pages like this one. Sign in with your password, or serve Sushi over HTTPS (Caddy / Nginx) to use passkeys.";
@@ -413,6 +414,8 @@ export function AuthGateScreen({
             </div>
           </div>
 
+          <AiDisclaimer variant="card" />
+
           {error && (
             <div className="flex items-start gap-2 rounded-xl border border-rose-500/30 bg-rose-500/10 p-3 text-xs text-rose-200">
               <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-rose-400" />
@@ -514,6 +517,8 @@ export function AuthGateScreen({
             </p>
           </div>
         </div>
+
+        <AiDisclaimer variant="card" />
 
         {initialNotice && !error && (
           <div className="flex items-start gap-2 rounded-xl border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-100">

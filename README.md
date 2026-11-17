@@ -774,6 +774,35 @@ route is tested against a mock translator server).
 
 ---
 
+## Support Sushi — donate crypto
+
+Sushi is free and self-hosted. If it saves you time, you can send crypto to the project's address:
+
+```
+0xf3430a560b57189a888Ac02763c4d8f383B00F8d
+```
+
+<img src="public/donate-qr.svg" alt="QR code for the Sushi donation address" width="180" height="180">
+
+*(EVM address — Ethereum, BNB Smart Chain, Polygon, Base, Arbitrum, Optimism.)*
+
+- **One EVM address, many chains** — Ethereum (ETH / ERC-20), BNB Smart Chain (BNB / BEP-20),
+  Polygon (POL / ERC-20) and Base / Arbitrum / Optimism (ETH / ERC-20).
+- In the app the same address lives under **Settings → Donate crypto** (and the
+  **Donate crypto** button on the launchpad hero): a locally generated QR code — scan it with
+  MetaMask, Trust Wallet, Rainbow, Coinbase Wallet or any other wallet — a one-tap **Copy**
+  button, the list of accepted chains and an Etherscan link.
+- Send only assets on those EVM chains: a transfer on another network (Bitcoin, Solana, Tron, …)
+  cannot be recovered. Sushi never asks for a seed phrase or private key, and nobody from the
+  project will ever request one.
+
+The address, chain list, EIP-681 `ethereum:` URI and explorer links live in
+`src/lib/client/donation.ts`; `tests/donate.test.ts` (included in `npm test`) verifies the
+address shape **and its EIP-55 checksum**, so a mistyped character fails CI instead of sending
+funds into the void.
+
+---
+
 ## Verification & Protocol Tests
 
 ```bash

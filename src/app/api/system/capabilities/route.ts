@@ -28,6 +28,11 @@ export async function GET(req: NextRequest) {
   const capabilities: SystemCapabilities = {
     mode: isVercel ? "vercel" : isGatewayOnly ? "gateway" : "vps",
     websocketSsh: wsActive,
+    // Which SSH transport the UI should prefer. On Vercel (no persistent
+    // process to accept WebSocket upgrades) this is "serverless" — SSH still
+    // works fully via HTTP streaming exec; "websocket" means a native PTY
+    // (vim/tmux/resize) is available on this host.
+    sshTransport: wsActive ? "websocket" : "serverless",
     serverlessSshExec: true,
     serverlessSftp: true,
     rdpGuacd: guacdOk,

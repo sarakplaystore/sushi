@@ -179,6 +179,8 @@ export interface RdpProbeResult {
 export interface SystemCapabilities {
   mode: "vps" | "vercel" | "gateway";
   websocketSsh: boolean;
+  /** Preferred SSH transport: native WebSocket PTY, or serverless HTTP stream. */
+  sshTransport?: "websocket" | "serverless";
   serverlessSshExec: boolean;
   serverlessSftp: boolean;
   rdpGuacd: boolean;

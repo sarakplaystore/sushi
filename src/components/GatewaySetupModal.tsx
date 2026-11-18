@@ -174,17 +174,21 @@ export function GatewaySetupModal({
                 </li>
                 <li>
                   • Native WebSocket PTY:{" "}
-                  <span
-                    className={
-                      localCapabilities?.websocketSsh
-                        ? "text-emerald-400"
-                        : "text-amber-300"
-                    }
-                  >
-                    {localCapabilities?.websocketSsh
-                      ? "Active on this host"
-                      : "Requires VPS / Gateway"}
-                  </span>
+                  {localCapabilities === null ? (
+                    <span className="text-slate-400">Detecting…</span>
+                  ) : localCapabilities.websocketSsh ? (
+                    <span className="text-emerald-400">Active on this host</span>
+                  ) : localCapabilities.serverlessSshExec ? (
+                    <span className="text-sky-300">
+                      Serverless Stream Active
+                      <span className="text-slate-500">
+                        {" "}
+                        (Native PTY optional via Gateway)
+                      </span>
+                    </span>
+                  ) : (
+                    <span className="text-amber-300">Requires VPS / Gateway</span>
+                  )}
                 </li>
                 <li>
                   • Live HTML5 RDP:{" "}
@@ -205,9 +209,10 @@ export function GatewaySetupModal({
               <p className="mt-2 text-xs leading-relaxed text-slate-400">
                 On <strong className="text-slate-200">Vercel</strong>, SFTP file management,
                 streaming SSH commands, and live HTML5 RDP desktops run natively on Node
-                serverless functions. Optionally attach a{" "}
+                serverless functions — no VPS needed for SSH, SFTP, or RDP. Optionally attach a{" "}
                 <strong className="text-slate-200">VPS Gateway URL</strong> below if you also
-                want persistent WebSocket PTY shells.
+                want persistent WebSocket PTY shells (full-screen <code className="text-slate-300">vim</code>/
+                <code className="text-slate-300">tmux</code> with resize) and team-shared terminals.
               </p>
             </div>
           </div>

@@ -31,6 +31,7 @@ async function bootstrap() {
         const body = JSON.stringify({
           mode: "gateway",
           websocketSsh: true,
+          sshTransport: "websocket",
           serverlessSshExec: false,
           serverlessSftp: false,
           rdpGuacd: guacdOk,

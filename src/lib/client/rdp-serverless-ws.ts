@@ -253,8 +253,9 @@ export class SushiServerlessRdpWebSocket extends EventTarget {
   private async startTransport(firstFrame: Uint8Array): Promise<void> {
     // Vercel Serverless / AWS Lambda buffers incoming HTTP request bodies until END_STREAM,
     // which hangs open-ended `duplex: "half"` request streams in Chromium. Default straight
-    // to Split-Stream (`POST /api/rdp/stream` JSON + `POST /api/rdp/input` JSON), which starts
-    // immediately on Vercel, Cloudflare, Safari, Firefox, and Chromium alike.
+    // to Split-Stream (`POST /api/rdp/stream` JSON + input batches). Split
+    // requests need the same server process; a persistent gateway is more reliable
+    // on platforms that route separate requests to different instances.
     const tryDuplex =
       Boolean(this.cfg.preferDuplex) &&
       !this.cfg.forceSplitStream &&
@@ -410,6 +411,7 @@ export class SushiServerlessRdpWebSocket extends EventTarget {
 
         let ok = false;
         let lastStatus = 0;
+        let lastError = "";
         for (let attempt = 0; attempt < 2; attempt++) {
           try {
             const res = await fetch(this.cfg.inputUrl, {
@@ -427,6 +429,12 @@ export class SushiServerlessRdpWebSocket extends EventTarget {
               ok = true;
               break;
             }
+            if (res.status === 410) {
+              try {
+                const body = await res.json() as { error?: unknown };
+                if (typeof body.error === "string") lastError = body.error;
+              } catch { /* use the HTTP status */ }
+            }
             if (res.status < 500 || attempt === 1) break;
           } catch {
             if (
@@ -443,7 +451,7 @@ export class SushiServerlessRdpWebSocket extends EventTarget {
           if (this.readyState === SushiServerlessRdpWebSocket.OPEN) {
             this.failAndClose(
               lastStatus === 401 ? 1008 : 1006,
-              lastStatus ? `RDP input HTTP ${lastStatus}` : "RDP input stream interrupted"
+              lastError || (lastStatus ? `RDP input HTTP ${lastStatus}` : "RDP input stream interrupted")
             );
           }
           return;

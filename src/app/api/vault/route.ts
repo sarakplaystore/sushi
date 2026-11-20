@@ -2,7 +2,6 @@ import { NextRequest, NextResponse } from "next/server";
 import { getCorsHeaders } from "@/lib/server/security";
 import { deriveAccountVaultKey, getEffectiveAuthConfig, verifyAdminSession } from "@/lib/server/auth";
 import { isServerVaultEnabled, parseVaultEnvelope, readStoredVault, saveStoredVault } from "@/lib/server/vault-store";
-import { getStateStoreKind } from "@/lib/server/state-store";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -55,11 +54,8 @@ export async function POST(req: NextRequest) {
     if (!envelope || (body.baseRevision !== undefined && body.baseRevision !== null && typeof body.baseRevision !== "string")) {
       return NextResponse.json({ ok: false, error: "Invalid encrypted vault envelope or revision." }, { status: 400, headers: cors });
     }
-    // Vercel limits request bodies; Firestore and Turso HTTP pipelines also
-    // require a bounded snapshot, even on a self-hosted deployment.
-    const kind = getStateStoreKind();
-    const maxBytes = process.env.VERCEL === "1" || kind === "firestore" || kind === "turso"
-      ? 4 * 1024 * 1024 : 32 * 1024 * 1024;
+    // Bound the size of self-hosted encrypted snapshots.
+    const maxBytes = 32 * 1024 * 1024;
     if (Buffer.byteLength(JSON.stringify(envelope), "utf8") > maxBytes) {
       return NextResponse.json({ ok: false, error: "The encrypted vault is too large for this deployment to synchronize." }, { status: 413, headers: cors });
     }

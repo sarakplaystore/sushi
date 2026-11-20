@@ -65,9 +65,9 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // Handling outbound client frames (`action: "input"`) inside the exact same
-    // `/api/rdp/stream` route function lets Vercel Fluid Compute route concurrent
-    // stream + input calls to the same warm Node.js Lambda (0ms in-memory delivery).
+    // Input is delivered only to a tunnel in this process. Serverless hosts may
+    // route requests to different instances; return 410 instead of claiming that
+    // an undelivered input batch was accepted.
     if (body.action === "input" || Array.isArray(body.frames)) {
       if (
         !isValidRdpSessionId(body.sessionId) ||

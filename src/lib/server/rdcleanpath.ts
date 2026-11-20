@@ -1,4 +1,3 @@
-import crypto from "node:crypto";
 import net from "node:net";
 import tls from "node:tls";
 import type { WebSocket } from "ws";
@@ -846,175 +845,6 @@ function applyOrderedTunnelFrames(
   }
 }
 
-/* Optional Turso or Redis cross-instance relay for multi-lambda Vercel Split-Stream */
-interface RelayTursoConfig {
-  httpUrl: string;
-  token: string;
-}
-
-interface RelayRedisConfig {
-  url: string;
-  token: string;
-}
-
-let relayTableEnsuredFor = "";
-
-function getRelayTursoConfig(): RelayTursoConfig | null {
-  const candidates = [
-    [process.env.SUSHI_TURSO_DATABASE_URL, process.env.SUSHI_TURSO_AUTH_TOKEN],
-    [process.env.TURSO_DATABASE_URL, process.env.TURSO_AUTH_TOKEN],
-  ];
-  for (const [rawUrl, rawToken] of candidates) {
-    const url = (rawUrl || "").trim();
-    const token = (rawToken || "").trim();
-    if (!url || !token) continue;
-    try {
-      const isLibsql = /^libsql:\/\//i.test(url);
-      const isWss = /^wss:\/\//i.test(url);
-      const isWs = /^ws:\/\//i.test(url);
-      const normalized =
-        isLibsql || isWss
-          ? url.replace(/^(libsql|wss):\/\//i, "https://")
-          : isWs
-            ? url.replace(/^ws:\/\//i, "http://")
-            : url;
-      const parsed = new URL(normalized);
-      const tlsParam = parsed.searchParams.get("tls");
-      const scheme =
-        isLibsql && tlsParam === "0"
-          ? "http:"
-          : parsed.protocol === "http:"
-            ? "http:"
-            : "https:";
-      const basePath = parsed.pathname.replace(/\/+$/, "");
-      return {
-        httpUrl: `${scheme}//${parsed.host}${basePath}`,
-        token,
-      };
-    } catch {
-      continue;
-    }
-  }
-  return null;
-}
-
-function getRelayRedisConfig(): RelayRedisConfig | null {
-  const candidates = [
-    [process.env.SUSHI_REDIS_REST_URL, process.env.SUSHI_REDIS_REST_TOKEN],
-    [process.env.UPSTASH_REDIS_REST_URL, process.env.UPSTASH_REDIS_REST_TOKEN],
-    [process.env.KV_REST_API_URL, process.env.KV_REST_API_TOKEN],
-  ];
-  for (const [rawUrl, rawToken] of candidates) {
-    const url = (rawUrl || "").trim().replace(/\/+$/, "");
-    const token = (rawToken || "").trim();
-    if (url && token) return { url, token };
-  }
-  return null;
-}
-
-async function execRelayRedisPipeline(
-  cfg: RelayRedisConfig,
-  commands: Array<Array<string | number>>
-): Promise<Array<{ result?: unknown; error?: string }>> {
-  const res = await fetch(`${cfg.url}/pipeline`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${cfg.token}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(commands),
-    cache: "no-store",
-    signal: AbortSignal.timeout(6000),
-  });
-  if (!res.ok) {
-    throw new Error(`RDP Redis relay HTTP ${res.status}`);
-  }
-  return (await res.json()) as Array<{ result?: unknown; error?: string }>;
-}
-
-type RelayTursoRow = Array<{ value?: unknown }>;
-
-async function execRelayTurso(
-  cfg: RelayTursoConfig,
-  stmts: Array<{ sql: string; args: Array<{ type: "text" | "integer"; value: string }> }>,
-  forceCreateTable = false
-): Promise<RelayTursoRow[][]> {
-  const key = crypto.createHash("sha256").update(cfg.httpUrl).digest("hex");
-  const includeCreate = forceCreateTable || relayTableEnsuredFor !== key;
-  const requests: Array<Record<string, unknown>> = [];
-  if (includeCreate) {
-    requests.push({
-      type: "execute",
-      stmt: {
-        sql:
-          "CREATE TABLE IF NOT EXISTS sushi_rdp_relay_v1 (" +
-          "session_id TEXT NOT NULL, " +
-          "seq INTEGER NOT NULL, " +
-          "username TEXT NOT NULL, " +
-          "payload TEXT NOT NULL, " +
-          "created_at INTEGER NOT NULL, " +
-          "PRIMARY KEY (session_id, seq))",
-        args: [],
-        named_args: [],
-        want_rows: false,
-      },
-    });
-  }
-  for (const s of stmts) {
-    requests.push({
-      type: "execute",
-      stmt: {
-        sql: s.sql,
-        args: s.args,
-        named_args: [],
-        want_rows: s.sql.trimStart().toUpperCase().startsWith("SELECT"),
-      },
-    });
-  }
-  requests.push({ type: "close" });
-
-  const res = await fetch(`${cfg.httpUrl}/v2/pipeline`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${cfg.token}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ requests }),
-    cache: "no-store",
-    signal: AbortSignal.timeout(6000),
-  });
-  if (!res.ok) {
-    throw new Error(`RDP relay storage HTTP ${res.status}`);
-  }
-  const data = (await res.json()) as {
-    results?: Array<{
-      type: string;
-      response?: { result?: { rows?: Array<Array<{ value?: unknown }>> } };
-      error?: { message?: string };
-    }>;
-  };
-  const results = data.results || [];
-  for (const r of results) {
-    if (r.type === "error") {
-      const msg = r.error?.message || "RDP relay SQL error";
-      if (!includeCreate && /no such table/i.test(msg)) {
-        relayTableEnsuredFor = "";
-        return execRelayTurso(cfg, stmts, true);
-      }
-      throw new Error(msg);
-    }
-  }
-  relayTableEnsuredFor = key;
-
-  const offset = includeCreate ? 1 : 0;
-  const rowsPerStmt: RelayTursoRow[][] = [];
-  for (let i = 0; i < stmts.length; i++) {
-    const item = results[offset + i];
-    rowsPerStmt.push(item?.response?.result?.rows || []);
-  }
-  return rowsPerStmt;
-}
-
 export function registerRdpHttpTunnel(params: {
   sessionId: string;
   username: string;
@@ -1032,116 +862,10 @@ export function registerRdpHttpTunnel(params: {
   };
   registry.set(params.sessionId, tunnel);
 
-  // Only poll shared storage on Vercel Serverless when Split-Stream mode is used, so
-  // cross-instance input frames still arrive if Fluid Compute routes to a second lambda.
-  const tursoCfg = process.env.VERCEL === "1" ? getRelayTursoConfig() : null;
-  const redisCfg =
-    process.env.VERCEL === "1" && !tursoCfg ? getRelayRedisConfig() : null;
-  const redisListKey = `sushi:rdp:relay:${params.sessionId}`;
-  let pollTimer: ReturnType<typeof setInterval> | null = null;
-  let polling = false;
-
-  if (tursoCfg) {
-    pollTimer = setInterval(async () => {
-      if (polling || !registry.has(params.sessionId)) return;
-      polling = true;
-      try {
-        const resultSets = await execRelayTurso(tursoCfg, [
-          {
-            sql: "SELECT seq, payload FROM sushi_rdp_relay_v1 WHERE session_id = ? AND username = ? AND seq >= ? ORDER BY seq ASC LIMIT 32",
-            args: [
-              { type: "text", value: params.sessionId },
-              { type: "text", value: params.username },
-              { type: "integer", value: String(tunnel.nextSeq) },
-            ],
-          },
-        ]);
-        const rows = resultSets[0] || [];
-        if (rows.length > 0) {
-          let maxSeq = tunnel.nextSeq - 1;
-          for (const row of rows) {
-            const seq = Number(row[0]?.value ?? -1);
-            const rawPayload = String(row[1]?.value ?? "[]");
-            if (!Number.isInteger(seq) || seq < 0) continue;
-            const b64List = JSON.parse(rawPayload) as string[];
-            const buffers = b64List.map((b64) => Buffer.from(b64, "base64"));
-            applyOrderedTunnelFrames(tunnel, seq, buffers);
-            if (seq > maxSeq) maxSeq = seq;
-          }
-          if (maxSeq >= 0) {
-            await execRelayTurso(tursoCfg, [
-              {
-                sql: "DELETE FROM sushi_rdp_relay_v1 WHERE session_id = ? AND seq <= ?",
-                args: [
-                  { type: "text", value: params.sessionId },
-                  { type: "integer", value: String(maxSeq) },
-                ],
-              },
-            ]);
-          }
-        }
-      } catch {
-        // Ignore transient poll errors; next tick will retry.
-      } finally {
-        polling = false;
-      }
-    }, 80);
-  } else if (redisCfg) {
-    pollTimer = setInterval(async () => {
-      if (polling || !registry.has(params.sessionId)) return;
-      polling = true;
-      try {
-        const res = await execRelayRedisPipeline(redisCfg, [
-          ["LRANGE", redisListKey, 0, 63],
-        ]);
-        const items = Array.isArray(res[0]?.result)
-          ? (res[0]!.result as string[])
-          : [];
-        if (items.length > 0) {
-          for (const raw of items) {
-            const parsed = JSON.parse(raw) as {
-              seq: number;
-              username: string;
-              frames: string[];
-            };
-            if (parsed.username !== params.username) continue;
-            const buffers = parsed.frames.map((b64) => Buffer.from(b64, "base64"));
-            applyOrderedTunnelFrames(tunnel, parsed.seq, buffers);
-          }
-          await execRelayRedisPipeline(redisCfg, [
-            ["LTRIM", redisListKey, items.length, -1],
-          ]);
-        }
-      } catch {
-        // Ignore transient poll errors; next tick will retry.
-      } finally {
-        polling = false;
-      }
-    }, 80);
-  }
-
   return {
     dispose: () => {
-      if (pollTimer) {
-        clearInterval(pollTimer);
-        pollTimer = null;
-      }
-      registry.delete(params.sessionId);
-      if (tursoCfg) {
-        void execRelayTurso(tursoCfg, [
-          {
-            sql: "DELETE FROM sushi_rdp_relay_v1 WHERE session_id = ? OR created_at < ?",
-            args: [
-              { type: "text", value: params.sessionId },
-              { type: "integer", value: String(Date.now() - 10 * 60 * 1000) },
-            ],
-          },
-        ]).catch(() => {});
-      } else if (redisCfg) {
-        void execRelayRedisPipeline(redisCfg, [["DEL", redisListKey]]).catch(
-          () => {}
-        );
-      }
+      // A later tunnel may have reused this ID; never remove that one.
+      if (registry.get(params.sessionId) === tunnel) registry.delete(params.sessionId);
     },
   };
 }
@@ -1151,7 +875,7 @@ export async function deliverRdpHttpInput(params: {
   username: string;
   seq: number;
   framesBase64: string[];
-}): Promise<{ ok: boolean; mode: "memory" | "relay"; error?: string }> {
+}): Promise<{ ok: boolean; mode: "memory"; error?: string }> {
   const local = getTunnelRegistry().get(params.sessionId);
   if (local) {
     if (local.username !== params.username) {
@@ -1162,46 +886,11 @@ export async function deliverRdpHttpInput(params: {
     return { ok: true, mode: "memory" };
   }
 
-  const tursoCfg = getRelayTursoConfig();
-  if (tursoCfg) {
-    await execRelayTurso(tursoCfg, [
-      {
-        sql:
-          "INSERT OR IGNORE INTO sushi_rdp_relay_v1 (session_id, seq, username, payload, created_at) " +
-          "VALUES (?, ?, ?, ?, ?)",
-        args: [
-          { type: "text", value: params.sessionId },
-          { type: "integer", value: String(params.seq) },
-          { type: "text", value: params.username },
-          { type: "text", value: JSON.stringify(params.framesBase64) },
-          { type: "integer", value: String(Date.now()) },
-        ],
-      },
-    ]);
-    return { ok: true, mode: "relay" };
-  }
-
-  const redisCfg = getRelayRedisConfig();
-  if (redisCfg) {
-    const redisListKey = `sushi:rdp:relay:${params.sessionId}`;
-    await execRelayRedisPipeline(redisCfg, [
-      [
-        "RPUSH",
-        redisListKey,
-        JSON.stringify({
-          seq: params.seq,
-          username: params.username,
-          frames: params.framesBase64,
-        }),
-      ],
-      ["EXPIRE", redisListKey, 120],
-    ]);
-    return { ok: true, mode: "relay" };
-  }
-
   return {
     ok: false,
     mode: "memory",
-    error: "Active RDP stream session not found (session may have closed).",
+    error: process.env.VERCEL === "1"
+      ? "The RDP stream is unavailable in this serverless instance. Attach a persistent gateway for reliable live RDP."
+      : "Active RDP stream session not found (session may have closed).",
   };
 }

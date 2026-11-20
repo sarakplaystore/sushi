@@ -10,9 +10,9 @@ import {
 /**
  * The view behind `/hosts` inside the app.
  *
- * `/hosts` is the one page that lists every machine. The server cannot list them —
- * the vault is end-to-end encrypted and the key lives in the browser — so the page
- * renders **in the workspace**, after the vault is unlocked, from the same merged
+ * `/hosts` is the one page that lists every machine. The server route does not
+ * decode the encrypted vault, so the page renders **in the workspace**, after the
+ * vault is unlocked, from the same merged
  * entries the sidebar uses. This module holds the parts that are pure logic (search,
  * grouping, deep-link resolution, counts, which vault state the page is in) so they
  * can be tested without a DOM, and the component only does presentation.

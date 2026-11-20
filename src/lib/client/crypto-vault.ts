@@ -191,7 +191,8 @@ export async function encryptVaultData(
 
 export async function decryptVaultEnvelope(
   envelope: EncryptedVaultEnvelope,
-  passphrase?: string | null
+  passphrase?: string | null,
+  options?: { requireVaultData?: boolean }
 ): Promise<VaultPlaintext> {
   const iv = base64ToBytes(envelope.iv);
   const ciphertext = base64ToBytes(envelope.ciphertext);
@@ -214,6 +215,13 @@ export async function decryptVaultEnvelope(
   try {
     const decrypted = await aesGcmDecrypt(key, iv, ciphertext);
     const parsed = JSON.parse(new TextDecoder().decode(decrypted)) as VaultPlaintext;
+    // Recovery must not turn a successfully decrypted but unrelated/invalid
+    // document into an empty vault and then replace the user's old data.
+    if (options?.requireVaultData && (!parsed || parsed.version !== 1 || !Array.isArray(parsed.hosts) ||
+        (parsed.snippets !== undefined && !Array.isArray(parsed.snippets)) ||
+        (parsed.sshKeys !== undefined && !Array.isArray(parsed.sshKeys)))) {
+      throw new Error("The decrypted backup is not a valid Sushi vault.");
+    }
     const workspace = normalizeSyncedWorkspaceState(parsed.workspace);
     return {
       version: 1,
@@ -226,7 +234,8 @@ export async function decryptVaultEnvelope(
       enforceKeyWhitelist: Boolean(parsed.enforceKeyWhitelist),
       ...(workspace ? { workspace } : {}),
     };
-  } catch {
+  } catch (error) {
+    if (error instanceof Error && error.message === "The decrypted backup is not a valid Sushi vault.") throw error;
     throw new Error(
       envelope.mode === "passphrase"
         ? "Incorrect master passphrase."
@@ -239,7 +248,7 @@ export function loadLocalEnvelope(): EncryptedVaultEnvelope | null {
   if (typeof window === "undefined") return null;
   try {
     const raw = localStorage.getItem(VAULT_STORAGE_KEY);
-    if (!raw) return null;
+    if (raw === null) return null;
     const envelope = JSON.parse(raw) as EncryptedVaultEnvelope;
     if (!envelope || envelope.version !== 1 ||
         (envelope.mode !== "device" && envelope.mode !== "passphrase") ||

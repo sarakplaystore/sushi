@@ -485,8 +485,8 @@ for the account and vault; switching stores does not automatically copy data.
    | Gateway host | What you run | Native PTY | Live RDP | Files |
    | --- | --- | --- | --- | --- |
    | **VPS** (Docker/Node) | `docker compose up -d` or `npm run gateway` | ✅ | ✅ via `guacd` | [`Dockerfile`](Dockerfile), [`docker-compose.yml`](docker-compose.yml) |
-   | **Railway** | `railway config apply` → `sushi-gateway` + `guacd` on one private network | ✅ | ✅ via `guacd` | [`.railway/railway.ts`](.railway/railway.ts), [`Dockerfile.gateway`](Dockerfile.gateway) |
-   | **Render** | New + → Blueprint → this repo | ✅ | In-browser IronRDP WASM (Render services get no private hostname for a `guacd` sidecar) | [`render.yaml`](render.yaml), [`Dockerfile.gateway`](Dockerfile.gateway) |
+   | **[Railway](https://railway.com/new)** | `railway config apply` → `sushi-gateway` + `guacd` on one private network | ✅ | ✅ via `guacd` | [`.railway/railway.ts`](.railway/railway.ts), [`Dockerfile.gateway`](Dockerfile.gateway) |
+   | **[Render](https://render.com/deploy?repo=https://github.com/sarakplaystore/sushi)** | New + → Blueprint → this repo | ✅ | In-browser IronRDP WASM (Render services get no private hostname for a `guacd` sidecar) | [`render.yaml`](render.yaml), [`Dockerfile.gateway`](Dockerfile.gateway) |
 
    **Railway** (`railway.json` is deprecated and stops being read on 2026‑12‑01, so Sushi
    ships Railway's Infrastructure-as-Code file instead):
@@ -501,16 +501,22 @@ for the account and vault; switching stores does not automatically copy data.
    ```
 
    Then give `sushi-gateway` a public domain (**Settings → Networking → Generate Domain**) and
-   paste that `https://…up.railway.app` URL plus the token into Sushi's gateway panel.
+   paste that `https://…up.railway.app` URL plus the token into Sushi's gateway panel. Both values
+   live under **sushi-gateway → Variables** in the [Railway dashboard](https://railway.com/new)
+   ([how Railway variables work](https://docs.railway.com/variables)); the same panel in Sushi links
+   there next to its `SUSHI_GATEWAY_TOKEN` field.
 
-   Without the CLI: *New Project → GitHub Repo → this repository*, set
+   Without the CLI: [*New Project → GitHub Repo → this repository*](https://railway.com/new), set
    **Settings → Build Configuration → Dockerfile Path** to `Dockerfile.gateway`, add a second
    service from the Docker image `guacamole/guacd:1.5.5`, point `GUACD_HOST` at that service's
    `RAILWAY_PRIVATE_DOMAIN`, set the two variables above, then **Generate Domain**.
 
-   **Render**: *New + → Blueprint → this repository* (or the Deploy to Render button above).
-   `render.yaml` builds `Dockerfile.gateway` and generates `SUSHI_GATEWAY_TOKEN` for you; set
-   `ALLOWED_ORIGIN` to your Vercel origin and copy the service URL and token into Sushi.
+   **Render**: *New + → Blueprint → this repository* (or the [Deploy to Render button](https://render.com/deploy?repo=https://github.com/sarakplaystore/sushi)
+   above). `render.yaml` builds `Dockerfile.gateway` and **generates `SUSHI_GATEWAY_TOKEN` for
+   you** — read the generated value under **sushi-gateway → Environment** in the
+   [Render dashboard](https://dashboard.render.com), where you also set `ALLOWED_ORIGIN` to your
+   Vercel origin ([Environment Variables and Secrets](https://render.com/docs/configure-environment-variables)).
+   Copy the service URL and that token into Sushi.
 
    **VPS**:
 

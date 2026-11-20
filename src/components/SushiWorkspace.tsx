@@ -57,10 +57,10 @@ import {
 } from "@/lib/client/crypto-vault";
 import {
   type GatewaySettings,
+  fetchGatewayCapabilities,
   getAuthHeaders,
   loadGatewaySettings,
   parseQuickConnectInput,
-  resolveGatewayHttpBase,
   saveGatewaySettings,
 } from "@/lib/client/gateway";
 import {
@@ -836,11 +836,13 @@ export function SushiWorkspace() {
       setLocalCaps(caps);
 
       if (gw.gatewayUrl) {
-        try {
-          const httpBase = resolveGatewayHttpBase(gw.gatewayUrl);
-          const rRes = await fetch(`${httpBase}/api/system/capabilities`, { headers: getAuthHeaders(gw) });
-          if (rRes.ok) setRemoteCaps(await rRes.json() as SystemCapabilities);
-        } catch { /* gateway availability does not affect local vault safety */ }
+        // Bounded on purpose: this runs inside vault boot, and a gateway on a plan
+        // that sleeps when idle (Render's free instance) can take a minute to
+        // answer. Without the timeout this fetch could hang the whole app open,
+        // and a failure here must never affect local vault safety.
+        const probe = await fetchGatewayCapabilities(gw);
+        if (sequence !== bootSequenceRef.current) return;
+        setRemoteCaps(probe.ok && probe.caps ? probe.caps : null);
       }
       if (sequence !== bootSequenceRef.current) return;
       const local = loadLocalEnvelope();
@@ -3535,6 +3537,7 @@ export function SushiWorkspace() {
       <GatewaySetupModal
         isOpen={gatewayModalOpen}
         localCapabilities={localCaps}
+        gatewayCapabilities={remoteCaps}
         gatewaySettings={gatewaySettings}
         onClose={() => setGatewayModalOpen(false)}
         onSaveSettings={(nextSettings, nextRemoteCaps) => {

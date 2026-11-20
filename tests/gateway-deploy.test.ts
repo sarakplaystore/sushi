@@ -339,4 +339,71 @@ for (const href of [RAILWAY_DASHBOARD, RAILWAY_VARIABLES_DOCS, RENDER_DASHBOARD,
   assert.ok(envExample.includes(href), `.env.example names ${href} next to SUSHI_GATEWAY_TOKEN`);
 }
 
+// ---- the runtime matrix must believe an attached gateway --------------------
+// The matrix used to read only the *local* capabilities, so on Vercel the "Native
+// WebSocket PTY" row said "Serverless Stream Active (Native PTY optional via
+// Gateway)" forever — even with a gateway attached whose own probe answered
+// `websocketSsh: true` two lines below it. These assertions keep the row driven by
+// the gateway's capabilities once one is attached.
+assert.ok(
+  modal.includes("gatewayCapabilities?: SystemCapabilities | null"),
+  "the modal accepts the attached gateway's capabilities"
+);
+assert.match(
+  modal,
+  /const attachedCaps =\s*probeStatus\?\.ok && probeStatus\.caps \? probeStatus\.caps : gatewayCapabilities \?\? null;/,
+  "a live probe wins over the boot-time read, so Test Gateway Endpoint updates the matrix at once"
+);
+assert.match(
+  modal,
+  /attachedCaps\?\.websocketSsh \? \(/,
+  "the PTY row is decided by the gateway's capabilities first"
+);
+assert.ok(
+  modal.includes("Active via attached gateway"),
+  "an attached, working gateway is reported as active rather than 'optional'"
+);
+assert.ok(
+  modal.includes("Gateway not verified yet") &&
+    modal.includes("Gateway reached, but it reports no WebSocket PTY"),
+  "the row distinguishes 'not probed' from 'probed and offers no PTY'"
+);
+assert.ok(
+  modal.includes("Attached gateway:"),
+  "the matrix names the attached gateway itself, not just the PTY verdict"
+);
+assert.ok(
+  modal.includes("attachedCaps?.rdpGuacd ?? localCapabilities?.rdpGuacd"),
+  "the RDP row follows the gateway's guacd (a Render gateway has none, Railway does)"
+);
+
+// A sleeping gateway must not be able to stall vault boot or spin forever, so both
+// probes go through one bounded helper.
+const gatewayLib = read("src/lib/client/gateway.ts");
+assert.ok(
+  gatewayLib.includes("export async function fetchGatewayCapabilities"),
+  "there is one shared gateway probe helper"
+);
+assert.match(gatewayLib, /new AbortController\(/, "the probe can be aborted");
+assert.match(gatewayLib, /GATEWAY_PROBE_TIMEOUT_MS = \d{4,}/, "the probe has a real timeout");
+assert.match(gatewayLib, /cache: "no-store"/, "the probe never trusts a cached answer");
+assert.ok(gatewayLib.includes("timedOut"), "a timeout is reported as such, not as a generic failure");
+assert.ok(
+  modal.includes("fetchGatewayCapabilities("),
+  "the modal's Test Gateway Endpoint uses the bounded helper"
+);
+const workspace = read("src/components/SushiWorkspace.tsx");
+assert.ok(
+  workspace.includes("gatewayCapabilities={remoteCaps}"),
+  "the workspace passes the gateway capabilities it already fetched"
+);
+assert.ok(
+  workspace.includes("fetchGatewayCapabilities(gw)"),
+  "vault boot uses the same bounded helper, so a cold gateway cannot hang it"
+);
+assert.ok(
+  !/await fetch\(`\$\{httpBase\}\/api\/system\/capabilities`/.test(workspace),
+  "no unbounded gateway fetch left in vault boot"
+);
+
 console.log("Gateway deployment target tests passed.");

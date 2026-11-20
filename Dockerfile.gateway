@@ -1,0 +1,51 @@
+# Sushi Gateway — the lightweight WebSocket PTY + guacd bridge that pairs with a
+# Vercel-hosted Sushi UI. No Next.js build, no web assets: this image only runs
+# `server.ts` with GATEWAY_ONLY=true, so it builds in seconds and starts in one.
+#
+# It serves /ws/ssh (native interactive PTY), /ws/rdp and /ws/rdp-cleanpath, plus
+# GET /health and GET /api/system/capabilities for platform health checks.
+#
+# Used by railway.json and render.yaml. Locally:
+#   docker build -f Dockerfile.gateway -t sushi-gateway .
+#   docker run --rm -p 3000:3000 -e SUSHI_GATEWAY_TOKEN=dev -e ALLOWED_ORIGIN='*' sushi-gateway
+FROM node:22-alpine AS deps
+WORKDIR /app
+COPY package.json package-lock.json* ./
+# Production deps only: tsx (the runner), ssh2, ws and the shared-store clients.
+# The Next.js toolchain is never needed because the gateway serves no pages.
+RUN npm ci --omit=dev
+
+FROM node:22-alpine AS runner
+WORKDIR /app
+
+ENV NODE_ENV=production
+ENV NEXT_TELEMETRY_DISABLED=1
+ENV HOST=0.0.0.0
+ENV PORT=3000
+# Gateway mode: WebSocket SSH/RDP only. Every other API route 404s on purpose, so
+# the Vercel frontend keeps using its own serverless endpoints (see server.ts).
+ENV GATEWAY_ONLY=true
+# Point at a guacd service on the same private network to also enable live HTML5
+# RDP. The default is the guacd service that railway.json / render.yaml deploy
+# next to this one; on a plain VPS set GUACD_HOST=guacd (docker compose) or
+# 127.0.0.1. With no guacd reachable, RDP falls back to the browser's IronRDP
+# WebAssembly client and the SSH PTY is unaffected.
+ENV GUACD_HOST=guacd.railway.internal
+ENV GUACD_PORT=4822
+
+RUN addgroup --system --gid 1001 nodejs \
+  && adduser --system --uid 1001 sushi
+
+COPY --from=deps --chown=sushi:nodejs /app/node_modules ./node_modules
+COPY --chown=sushi:nodejs package.json tsconfig.json server.ts ./
+COPY --chown=sushi:nodejs ./src ./src
+
+USER sushi
+EXPOSE 3000
+
+# Railway's healthcheckPath and Render's healthCheckPath both hit this; it answers
+# 200 in gateway mode without a token and reports whether guacd is reachable.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+  CMD wget -qO- http://127.0.0.1:3000/api/system/capabilities >/dev/null || exit 1
+
+CMD ["npm", "run", "gateway"]

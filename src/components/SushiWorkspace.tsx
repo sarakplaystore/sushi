@@ -3028,7 +3028,7 @@ export function SushiWorkspace() {
                         <Server className="h-3.5 w-3.5 text-emerald-400" />
                       )}
                       {gatewaySettings.gatewayUrl
-                        ? "VPS Gateway Linked"
+                        ? "Gateway Linked"
                         : localCaps?.mode === "vercel"
                           ? "Vercel Serverless Mode"
                           : "VPS Self-Hosted Mode"}

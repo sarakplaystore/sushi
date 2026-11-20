@@ -2590,8 +2590,8 @@ export function SshTerminalSession({
               className="inline-flex items-center gap-1 rounded-md border border-amber-500/25 bg-amber-500/10 px-2 py-0.5 text-[11px] text-amber-200 transition hover:bg-amber-500/20"
             >
               <Radio className="h-3 w-3" />
-              <span className="hidden sm:inline">Attach VPS Gateway for full PTY</span>
-              <span className="sm:hidden">VPS Gateway</span>
+              <span className="hidden sm:inline">Attach a gateway for full PTY</span>
+              <span className="sm:hidden">Gateway</span>
             </button>
           )}
         </div>

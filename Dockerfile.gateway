@@ -11,7 +11,7 @@
 FROM node:22-alpine AS deps
 WORKDIR /app
 COPY package.json package-lock.json* ./
-# Production deps only: tsx (the runner), ssh2, ws and the shared-store clients.
+# Production deps include tsx (the runner), ssh2 and ws.
 # The Next.js toolchain is never needed because the gateway serves no pages.
 RUN npm ci --omit=dev
 

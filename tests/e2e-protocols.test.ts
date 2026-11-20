@@ -1287,38 +1287,23 @@ async function runTests() {
   assert.equal(verifiedCerts.length, 1);
   assert.equal(verifiedCerts[0].id, "cred-id-123");
 
-  // Verify Interactive Stateless Vercel Setup (VERCEL="1" without SUSHI_AUTH_USERNAME)
+  // Vercel has no persistent account file: it requires environment credentials
+  // and must never allow arbitrary visitors to bootstrap their own account.
   delete process.env.SUSHI_AUTH_USERNAME;
   delete process.env.SUSHI_AUTH_PASSWORD;
   process.env.VERCEL = "1";
   const uninitVercelCfg = await getEffectiveAuthConfig(new Headers());
   assert.equal(uninitVercelCfg.initialized, false);
   assert.equal(uninitVercelCfg.canBootstrapInteractive, false);
+  process.env.SUSHI_ALLOW_STATELESS_SETUP = "true"; // legacy flag must not bypass the guard
+  assert.equal((await getEffectiveAuthConfig(new Headers())).canBootstrapInteractive, false);
   await assert.rejects(
     bootstrapAdminAccount("verceladmin", "vercel-pass-123"),
-    /persistent shared storage/i
+    /SUSHI_AUTH_USERNAME.*SUSHI_AUTH_PASSWORD/i
   );
-  // Stateless browser-local accounts remain available only by explicit opt-in.
-  process.env.SUSHI_ALLOW_STATELESS_SETUP = "true";
-  assert.equal((await getEffectiveAuthConfig(new Headers())).canBootstrapInteractive, true);
 
   const loginKp = generateEd25519KeyPair("vercel-admin@sushi");
   const rogueKp = generateEd25519KeyPair("rogue@attacker");
-  const bootstrappedVercel = await bootstrapAdminAccount(
-    "verceladmin",
-    "vercel-pass-123"
-  );
-  assert.equal(bootstrappedVercel.persistedOnDisk, false);
-  assert.ok(bootstrappedVercel.adminProfileCert);
-
-  const vercelHeaders = new Headers({
-    "x-sushi-admin-cert": bootstrappedVercel.adminProfileCert,
-  });
-  const initVercelCfg = await getEffectiveAuthConfig(vercelHeaders);
-  assert.equal(initVercelCfg.initialized, true);
-  assert.equal(initVercelCfg.username, "verceladmin");
-  assert.equal(await initVercelCfg.verifyPassword("vercel-pass-123"), true);
-  assert.equal(await initVercelCfg.verifyPassword("wrong"), false);
 
   // Restore env for WS tests below
   delete process.env.VERCEL;

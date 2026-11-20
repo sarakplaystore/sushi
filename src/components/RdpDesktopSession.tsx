@@ -58,6 +58,7 @@ interface RdpDesktopSessionProps {
   isActive: boolean;
   guacdAvailable: boolean;
   websocketAvailable?: boolean;
+  serverless?: boolean;
   rdpCleanPathAvailable?: boolean;
   gatewaySettings: GatewaySettings;
   /** Adjust the desktop credentials (Windows user / domain / port). */
@@ -122,6 +123,7 @@ export function RdpDesktopSession({
   isActive,
   guacdAvailable,
   websocketAvailable = false,
+  serverless = false,
   rdpCleanPathAvailable = true,
   gatewaySettings,
   onEditCredentials,
@@ -160,8 +162,8 @@ export function RdpDesktopSession({
   });
   const prefsRef = useRef(prefs);
 
-  // Built-in IronRDP WASM + RDCleanPath works on both Vercel Serverless and VPS,
-  // so every valid RDP host connects live in-browser immediately.
+  // IronRDP can use a native WebSocket or a same-process HTTP tunnel. On
+  // serverless, separate HTTP requests may reach different instances.
   const shouldAttemptStreamDefault = Boolean((profile.host || "").trim());
 
   const [guacdFallback, setGuacdFallback] = useState(false);
@@ -526,8 +528,8 @@ export function RdpDesktopSession({
         });
       }
 
-      const httpBase = resolveGatewayHttpBase(gatewaySettings.gatewayUrl);
-      const wasmUrl = `${httpBase}/api/rdp/wasm`;
+      // Gateway-only services intentionally do not serve application assets.
+      const wasmUrl = "/api/rdp/wasm";
 
       try {
         const handle = await connectIronRdpSession({
@@ -1108,6 +1110,11 @@ export function RdpDesktopSession({
       data-rdp-root=""
       className="flex h-full w-full flex-col overflow-hidden bg-[#090b10]"
     >
+      {serverless && !websocketAvailable && (
+        <div role="status" className="shrink-0 border-b border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
+          Serverless RDP may disconnect when requests reach different instances. Attach a persistent gateway for reliable live RDP.
+        </div>
+      )}
       {/* RDP Control Bar */}
       {/*
         One row, never wrapped: the toolbar's height must not depend on how long the

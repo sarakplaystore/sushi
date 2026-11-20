@@ -15,7 +15,6 @@ const nextConfig: NextConfig = {
     "ssh2",
     "ws",
     "@simplewebauthn/server",
-    "@google-cloud/firestore",
     "ironrdp-wasm",
   ],
   outputFileTracingIncludes: {

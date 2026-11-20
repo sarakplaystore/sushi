@@ -45,7 +45,6 @@ export interface EffectiveAuthConfig {
   authSecret: string;
   sessionVersion?: string;
   serverPasskeys: StoredPasskeyRecord[];
-  adminProfilePayload?: SignedAdminProfilePayload;
 }
 
 // Simple per-IP login brute-force tracker
@@ -138,9 +137,9 @@ function deriveInstanceSecret(seedMaterial?: string): string {
 /**
  * Derives a stable 256-bit account vault encryption key from the server's
  * account `authSecret`. Returned only to verified same-origin admin sessions so
- * encrypted vaults in Turso / Firestore / Redis / Disk unlock automatically on
+ * encrypted vaults on disk or in the browser unlock automatically on
  * Password sign-in, Passkey sign-in, and browser reloads without storing raw
- * keys in localStorage or plaintext SSH secrets in shared storage.
+ * keys in localStorage or plaintext SSH secrets on the server.
  */
 export function deriveAccountVaultKey(authSecret: string): string {
   return Buffer.from(
@@ -366,7 +365,7 @@ export async function getEffectiveAuthConfig(
     return {
       initialized: true,
       canBootstrapOnDisk: isPersistentDiskAvailable(),
-      canBootstrapInteractive: true,
+      canBootstrapInteractive: hasPersistentStateStore(),
       envConfigured: true,
       username: envUser,
       authSecret: derivedSecret,
@@ -395,7 +394,7 @@ export async function getEffectiveAuthConfig(
     };
   }
 
-  // 2. Persistent State Store Auth Record (Self-Hosted Disk, Turso, Firestore, or Redis)
+  // 2. Persistent self-hosted account file
   if (disk) {
     const mergedPasskeysMap = new Map<string, StoredPasskeyRecord>();
     for (const pk of [...envPasskeys, ...disk.passkeys]) {
@@ -423,76 +422,22 @@ export async function getEffectiveAuthConfig(
     };
   }
 
-  // 3. Stateless Interactive Browser-Bootstrapped Admin Certificate (Legacy Vercel opt-in)
-  const serverlessSecret = deriveInstanceSecret();
-  const rawAdminCert = extractAdminCertFromHeaders(headers, explicitAdminCert);
-  const verifiedProfile = verifyAdminProfileCertificate(
-    rawAdminCert,
-    serverlessSecret
-  );
-
-  if (verifiedProfile) {
-    const storeKind = getStateStoreKind();
-    if (storeKind === "redis" || storeKind === "turso" || storeKind === "firestore") {
-      if (!verifiedProfile.passwordSalt || !verifiedProfile.passwordHash) {
-        throw new Error("The existing browser account cannot be migrated without its password profile.");
-      }
-      const now = Date.now();
-      const record: DiskAuthFile = {
-        version: 1,
-        username: verifiedProfile.username,
-        passwordSalt: verifiedProfile.passwordSalt,
-        passwordHash: verifiedProfile.passwordHash,
-        authSecret: serverlessSecret,
-        passkeys: [],
-        createdAt: now,
-        updatedAt: verifiedProfile.updatedAt || now,
-      };
-      // Another browser may have initialized the store at the same time. In
-      // either case, re-read the authoritative record instead of overwriting it.
-      await compareAndSwapStateRecord("auth", null, JSON.stringify(record, null, 2));
-      return getEffectiveAuthConfig(headers, explicitAdminCert);
-    }
-
-    return {
-      initialized: true,
-      canBootstrapOnDisk: isPersistentDiskAvailable(),
-      canBootstrapInteractive: true,
-      envConfigured: false,
-      username: verifiedProfile.username,
-      authSecret: serverlessSecret,
-      sessionVersion: credentialSessionVersion(serverlessSecret, verifiedProfile.username, verifiedProfile.passwordSalt, verifiedProfile.passwordHash),
-      serverPasskeys: envPasskeys,
-      adminProfilePayload: verifiedProfile,
-      verifyPassword: async (candidate: string) => {
-        if (!verifiedProfile.passwordHash) return false;
-        const derived = await scryptHash(candidate, verifiedProfile.passwordSalt);
-        const expected = Buffer.from(verifiedProfile.passwordHash, "hex");
-        return (
-          derived.length === expected.length &&
-          crypto.timingSafeEqual(derived, expected)
-        );
-      },
-    };
-  }
-
-  // 4. Uninitialized — Ready for interactive First-Run Setup in Browser
+  // A serverless instance cannot persist a single authoritative account. Do not
+  // accept client-supplied admin profiles or allow unrestricted first-run setup:
+  // anyone could otherwise create their own account and use the protocol APIs.
   return {
     initialized: false,
     canBootstrapOnDisk: isPersistentDiskAvailable(),
-    canBootstrapInteractive: hasPersistentStateStore() || process.env.SUSHI_ALLOW_STATELESS_SETUP === "true",
+    canBootstrapInteractive: hasPersistentStateStore(),
     envConfigured: false,
     username: "",
-    authSecret: serverlessSecret,
+    authSecret: deriveInstanceSecret(),
     serverPasskeys: envPasskeys,
     verifyPassword: async () => false,
   };
 }
 
-/**
- * Bootstraps an admin account on persistent state storage (or stateless Vercel opt-in,
- * returning a signed `adminProfileCert` cookie + token).
- */
+/** Bootstrap an admin account only on persistent self-hosted disk. */
 export async function bootstrapAdminAccount(
   username: string,
   password: string
@@ -554,30 +499,7 @@ export async function bootstrapAdminAccount(
     };
   }
 
-  if (process.env.SUSHI_ALLOW_STATELESS_SETUP !== "true") {
-    throw new Error("Configure persistent shared storage before creating an account on Vercel.");
-  }
-
-  // Stateless Vercel deployment: seal profile into an HMAC-SHA256 certificate
-  const authSecret = deriveInstanceSecret();
-  const adminProfileCert = issueAdminProfileCertificate(
-    {
-      v: 1,
-      username: cleanUser,
-      passwordSalt: saltHex,
-      passwordHash,
-      updatedAt: now,
-    },
-    authSecret
-  );
-
-  return {
-    username: cleanUser,
-    authSecret,
-    adminProfileCert,
-    persistedOnDisk: false,
-    sessionVersion: credentialSessionVersion(authSecret, cleanUser, saltHex, passwordHash),
-  };
+  throw new Error("On Vercel, configure SUSHI_AUTH_USERNAME and SUSHI_AUTH_PASSWORD as server-side environment variables before signing in.");
 }
 
 // Keep alias for backward compatibility
@@ -636,32 +558,6 @@ export async function updateAdminCredentials(
     };
   }
 
-  if (cfg.adminProfilePayload) {
-    let saltHex = cfg.adminProfilePayload.passwordSalt;
-    let passwordHash = cfg.adminProfilePayload.passwordHash;
-    if (nextPassword && nextPassword.length > 0) {
-      if (nextPassword.length < 6) {
-        throw new Error("New password must be at least 6 characters.");
-      }
-      saltHex = crypto.randomBytes(16).toString("hex");
-      const derived = await scryptHash(nextPassword, saltHex);
-      passwordHash = derived.toString("hex");
-    }
-    const updatedPayload: SignedAdminProfilePayload = {
-      v: 1,
-      username: cleanUser,
-      passwordSalt: saltHex,
-      passwordHash,
-      updatedAt: Date.now(),
-    };
-    return {
-      adminProfileCert: issueAdminProfileCertificate(
-        updatedPayload,
-        cfg.authSecret
-      ),
-      sessionVersion: credentialSessionVersion(cfg.authSecret, cleanUser, saltHex, passwordHash),
-    };
-  }
 
   throw new Error(
     "Credentials configured via environment variables must be updated in your hosting dashboard."

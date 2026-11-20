@@ -21,7 +21,7 @@ import {
 } from "@/lib/client/auth-storage";
 import { isInsecureBrowserContext } from "@/lib/client/web-crypto";
 import { AiDisclaimer } from "./AiDisclaimer";
-import { StorageSetupGuide } from "./StorageSetupGuide";
+import { EnvironmentLoginGuide } from "./EnvironmentLoginGuide";
 
 const PASSKEY_HTTPS_REQUIRED =
   "Passkeys need HTTPS: browsers disable WebAuthn on plain-HTTP pages like this one. Sign in with your password, or serve Sushi over HTTPS (Caddy / Nginx) to use passkeys.";
@@ -382,14 +382,9 @@ export function AuthGateScreen({
     );
   }
 
-  // A serverless deployment needs durable shared storage before first setup.
+  // A serverless deployment uses one explicitly configured admin account.
   if (!authStatus.initialized && !authStatus.canBootstrapInteractive) {
-    return (
-      <StorageSetupGuide
-        storageSetup={authStatus.storageSetup}
-        onRefreshStatus={onRefreshStatus}
-      />
-    );
+    return <EnvironmentLoginGuide onRefreshStatus={onRefreshStatus} />;
   }
 
   // First-run interactive setup

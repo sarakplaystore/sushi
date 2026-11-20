@@ -6,7 +6,7 @@ import {
   verifySignedPasskeyCertificates,
 } from "@/lib/server/auth";
 import { getCorsHeaders } from "@/lib/server/security";
-import { getStateStoreKind, getStorageSetupStatus } from "@/lib/server/state-store";
+import { getStateStoreKind } from "@/lib/server/state-store";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -50,7 +50,6 @@ async function buildStatusResponse(
       envConfigured: cfg.envConfigured,
       mode,
       storage: getStateStoreKind(),
-      storageSetup: getStorageSetupStatus(),
       username: authCheck.ok ? authCheck.username || cfg.username : undefined,
       passkeyCount: mergedPasskeys.length,
     },
@@ -62,7 +61,7 @@ export async function GET(req: NextRequest) {
   try {
     return await buildStatusResponse(req);
   } catch (error) {
-    return NextResponse.json({ ok: false, error: error instanceof Error ? error.message : "Account storage is unavailable.", storageSetup: getStorageSetupStatus() }, {
+    return NextResponse.json({ ok: false, error: error instanceof Error ? error.message : "Account storage is unavailable." }, {
       status: 503, headers: getCorsHeaders(req.headers.get("origin")),
     });
   }
@@ -84,7 +83,7 @@ export async function POST(req: NextRequest) {
   try {
     return await buildStatusResponse(req, certs, adminProfileCert);
   } catch (error) {
-    return NextResponse.json({ ok: false, error: error instanceof Error ? error.message : "Account storage is unavailable.", storageSetup: getStorageSetupStatus() }, {
+    return NextResponse.json({ ok: false, error: error instanceof Error ? error.message : "Account storage is unavailable." }, {
       status: 503, headers: getCorsHeaders(req.headers.get("origin")),
     });
   }

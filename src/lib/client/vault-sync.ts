@@ -28,8 +28,9 @@ export function getLocalSyncMetadata(): LocalSyncMetadata | null {
   }
 }
 
-/** Save ciphertext before its revision, so a partial cache update is detected. */
-export function cacheSyncedVault(envelope: EncryptedVaultEnvelope, revision: string): boolean {
+/** Only call while holding the local vault lock, after checking the expected copy.
+ * Save ciphertext before its revision, so a partial cache update is detected. */
+function cacheSyncedVault(envelope: EncryptedVaultEnvelope, revision: string): boolean {
   try {
     saveLocalEnvelope(envelope);
     localStorage.setItem(SYNC_METADATA_KEY, JSON.stringify({ revision, iv: envelope.iv }));
@@ -41,6 +42,15 @@ export function cacheSyncedVault(envelope: EncryptedVaultEnvelope, revision: str
 
 export function clearLocalSyncMetadata(): void {
   try { localStorage.removeItem(SYNC_METADATA_KEY); } catch { /* no cache */ }
+}
+
+/** Preserve even an invalid local envelope for recovery and safe comparison. */
+export function readLocalVaultSnapshot(): string | null {
+  try {
+    return localStorage.getItem(VAULT_STORAGE_KEY);
+  } catch {
+    throw new Error("Could not read browser vault storage. No data was changed.");
+  }
 }
 
 export function sameVaultEnvelope(a: EncryptedVaultEnvelope, b: EncryptedVaultEnvelope): boolean {
@@ -149,8 +159,38 @@ export async function saveLocalVaultIfUnchanged(
   });
 }
 
+/** Recovery compares exact raw bytes, including when the old envelope is invalid. */
+export async function replaceLocalVaultSnapshotIfUnchanged(
+  expected: string | null,
+  next: EncryptedVaultEnvelope
+): Promise<void> {
+  await withLocalVaultLock(() => {
+    if (readLocalVaultSnapshot() !== expected) {
+      throw new Error("The browser vault changed in another tab. No data was replaced; retry recovery with the latest copy.");
+    }
+    saveLocalEnvelope(next);
+    clearLocalSyncMetadata();
+  });
+}
+
 async function jsonResponse(res: Response): Promise<Record<string, unknown>> {
   try { return await res.json() as Record<string, unknown>; } catch { return {}; }
+}
+
+/** Recover a browser-cached session-key vault after moving off server storage.
+ * The endpoint only returns the key to an authenticated, same-origin admin. */
+export async function fetchSessionVaultKey(settings: GatewaySettings): Promise<string> {
+  let res: Response;
+  try {
+    res = await fetch("/api/vault", { headers: getAuthHeaders(settings), cache: "no-store" });
+  } catch {
+    throw new Error("Could not retrieve the vault key. Your browser copy was not changed.");
+  }
+  const data = await jsonResponse(res);
+  if (!res.ok || !data.ok || typeof data.vaultKey !== "string" || !data.vaultKey) {
+    throw new Error(typeof data.error === "string" ? data.error : "Could not retrieve the vault key. Your browser copy was not changed.");
+  }
+  return data.vaultKey;
 }
 
 export async function fetchRemoteVault(settings: GatewaySettings): Promise<RemoteVault> {
@@ -220,4 +260,18 @@ export async function saveRemoteVault(
     throw new Error(message);
   }
   return data.revision;
+}
+
+/** A successful remote write stays successful even if the local cache cannot be
+ * updated. In particular, do not retry a failed local CAS with an unconditional
+ * write: another tab may have saved a newer browser vault in the meantime. */
+export async function saveRemoteVaultAndCacheIfUnchanged(
+  settings: GatewaySettings,
+  envelope: EncryptedVaultEnvelope,
+  baseRevision: string | null,
+  expectedLocal: EncryptedVaultEnvelope | null
+): Promise<{ revision: string; cached: boolean }> {
+  const revision = await saveRemoteVault(settings, envelope, baseRevision);
+  const cached = await cacheSyncedVaultIfUnchanged(expectedLocal, envelope, revision);
+  return { revision, cached };
 }

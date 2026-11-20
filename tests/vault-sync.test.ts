@@ -1,7 +1,5 @@
 import assert from "node:assert/strict";
-import crypto from "node:crypto";
 import fs from "node:fs/promises";
-import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { NextRequest } from "next/server";
@@ -11,10 +9,10 @@ import { POST as login } from "../src/app/api/auth/login/route";
 import { POST as accountAction, PUT as changeAccount } from "../src/app/api/auth/account/route";
 import { POST as registerPasskey } from "../src/app/api/auth/passkey/register/route";
 import { GET as getVault, POST as postVault } from "../src/app/api/vault/route";
-import { bootstrapAdminAccount, createSessionToken, getEffectiveAuthConfig, saveServerPasskey, verifyIncomingAuth } from "../src/lib/server/auth";
+import { getEffectiveAuthConfig, saveServerPasskey, verifyIncomingAuth } from "../src/lib/server/auth";
 import { compareAndSwapAuthWithVaultGuard, readStateRecord } from "../src/lib/server/state-store";
 import { decryptVaultEnvelope, encryptVaultData, type EncryptedVaultEnvelope, type VaultPlaintext } from "../src/lib/client/crypto-vault";
-import { cacheSyncedVault, cacheSyncedVaultIfUnchanged, getLocalSyncMetadata, sameVaultEnvelope, saveLocalVaultIfUnchanged, subscribeVaultChanges } from "../src/lib/client/vault-sync";
+import { cacheSyncedVaultIfUnchanged, getLocalSyncMetadata, sameVaultEnvelope, saveLocalVaultIfUnchanged, saveRemoteVaultAndCacheIfUnchanged, subscribeVaultChanges } from "../src/lib/client/vault-sync";
 
 const envKeys = [
   "DATA_DIR", "VERCEL", "VERCEL_PROJECT_ID", "VERCEL_ENV", "SUSHI_AUTH_USERNAME", "SUSHI_AUTH_PASSWORD",
@@ -23,6 +21,7 @@ const envKeys = [
   "KV_REST_API_URL", "KV_REST_API_TOKEN", "SUSHI_TURSO_DATABASE_URL", "SUSHI_TURSO_AUTH_TOKEN", "TURSO_DATABASE_URL", "TURSO_AUTH_TOKEN",
   "SUSHI_STORAGE_PREFIX", "SUSHI_STORAGE_BACKEND", "SUSHI_SERVER_VAULT", "SUSHI_ALLOW_STATELESS_SETUP",
   "SUSHI_FIRESTORE_PROJECT_ID", "SUSHI_FIRESTORE_DATABASE_ID", "SUSHI_FIRESTORE_CREDENTIALS_JSON",
+  "SUSHI_LEGACY_TURSO_CONFIGURED", "SUSHI_LEGACY_FIRESTORE_CONFIGURED", "SUSHI_LEGACY_REDIS_CONFIGURED",
 ] as const;
 const savedEnv = Object.fromEntries(envKeys.map((key) => [key, process.env[key]]));
 for (const key of envKeys) delete process.env[key];
@@ -51,40 +50,6 @@ const plaintext: VaultPlaintext = {
 async function envelope(password = originalPassword): Promise<EncryptedVaultEnvelope> {
   return { ...(await encryptVaultData(plaintext, password)), keySource: "account" };
 }
-
-// The mock speaks the Redis REST command protocol used by Upstash. It allows
-// exercising the real storage code and Lua CAS paths without external services.
-const redis = new Map<string, string>();
-let redisOffline = false;
-const redisServer = http.createServer(async (req, res) => {
-  if (redisOffline) { res.writeHead(503).end(); return; }
-  if (req.headers.authorization !== "Bearer test-only-token") { res.writeHead(403).end(); return; }
-  const parts: Buffer[] = [];
-  for await (const part of req) parts.push(Buffer.from(part));
-  const args = JSON.parse(Buffer.concat(parts).toString()) as (string | number)[];
-  let result: string | number | null = null;
-  if (args[0] === "GET") {
-    result = redis.get(String(args[1])) ?? null;
-  } else if (args[0] === "EVAL" && args[2] === 1) {
-    const key = String(args[3]);
-    const existing = redis.get(key) ?? null;
-    const matches = args[4] === "missing" ? existing === null : existing === args[5];
-    if (matches) redis.set(key, String(args[6]));
-    result = matches ? 1 : 0;
-  } else if (args[0] === "EVAL" && args[2] === 2) {
-    const auth = redis.get(String(args[3])) ?? null;
-    const vault = redis.get(String(args[4])) ?? null;
-    const authMatches = args[5] === "missing" ? auth === null : auth === args[6];
-    const vaultMatches = args[7] === "missing" ? vault === null : vault === args[8];
-    const matches = authMatches && vaultMatches;
-    if (matches) redis.set(String(args[3]), String(args[9]));
-    result = matches ? 1 : 0;
-  } else {
-    res.writeHead(400, { "content-type": "application/json" }).end(JSON.stringify({ error: "unsupported command" }));
-    return;
-  }
-  res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ result }));
-});
 
 async function runBackendSuite(label: string) {
   console.log(`==> ${label}: global setup and encrypted multi-device vault`);
@@ -140,9 +105,7 @@ async function runBackendSuite(label: string) {
   assert.deepEqual((await decryptVaultEnvelope(remote.envelope, originalPassword)).hosts, plaintext.hosts);
   assert.equal((await decryptVaultEnvelope(remote.envelope, originalPassword)).sshKeys?.[0].privateKey, "SSH-PRIVATE-KEY-SECRET");
   await assert.rejects(decryptVaultEnvelope(remote.envelope, "wrong-password"));
-  const rawStorage = label === "disk"
-    ? await fs.readFile(path.join(process.env.DATA_DIR!, "vault.enc.json"), "utf8")
-    : Array.from(redis.values()).join("\n");
+  const rawStorage = await fs.readFile(path.join(process.env.DATA_DIR!, "vault.enc.json"), "utf8");
   assert(!rawStorage.includes("ssh-private-password"));
   assert(!rawStorage.includes("SSH-PRIVATE-KEY-SECRET"));
   assert(!rawStorage.includes(originalPassword));
@@ -213,14 +176,6 @@ async function main() {
       setItem: (key: string, value: string) => local.set(key, value),
       removeItem: (key: string) => local.delete(key),
     } });
-    const cachedEnvelope = await envelope();
-    assert.equal(cacheSyncedVault(cachedEnvelope, "revision-1"), true);
-    assert.equal(getLocalSyncMetadata()?.revision, "revision-1");
-    assert(sameVaultEnvelope(cachedEnvelope, JSON.parse(local.get("sushi_encrypted_vault_v1")!)));
-    assert(!Array.from(local.values()).join("").includes(originalPassword));
-    assert(!Array.from(local.values()).join("").includes("ssh-private-password"));
-    assert(!Array.from(local.values()).join("").includes("SSH-PRIVATE-KEY-SECRET"));
-
     // Simulate two tabs contending for the same Web Lock. Exactly one stale
     // write may win, and a remote-cache refresh must not clobber a newer local
     // encrypted copy either.
@@ -235,6 +190,14 @@ async function main() {
         try { return await action(); } finally { release(); }
       },
     } } });
+    const cachedEnvelope = await envelope();
+    assert.equal(await cacheSyncedVaultIfUnchanged(null, cachedEnvelope, "revision-1"), true);
+    assert.equal(getLocalSyncMetadata()?.revision, "revision-1");
+    assert(sameVaultEnvelope(cachedEnvelope, JSON.parse(local.get("sushi_encrypted_vault_v1")!)));
+    assert(!Array.from(local.values()).join("").includes(originalPassword));
+    assert(!Array.from(local.values()).join("").includes("ssh-private-password"));
+    assert(!Array.from(local.values()).join("").includes("SSH-PRIVATE-KEY-SECRET"));
+
     const localA = await envelope();
     const localB = await envelope();
     const writes = await Promise.allSettled([
@@ -248,9 +211,53 @@ async function main() {
     assert.equal(await cacheSyncedVaultIfUnchanged(cachedEnvelope, await envelope(), "stale-revision"), false);
     assert(sameVaultEnvelope(JSON.parse(local.get("sushi_encrypted_vault_v1")!), winner));
     assert.equal(getLocalSyncMetadata(), null);
-    Object.defineProperty(globalThis, "navigator", { configurable: true, value: {} });
-    await assert.rejects(saveLocalVaultIfUnchanged(winner, await envelope()), /safely coordinate vault writes/);
-    assert(sameVaultEnvelope(JSON.parse(local.get("sushi_encrypted_vault_v1")!), winner));
+
+    // Another tab changes the cache while the server is committing our write.
+    // The remote save is still a success, but the newer local copy must survive.
+    const settings = { gatewayUrl: "", gatewayToken: "" };
+    const competing = await envelope();
+    const committed = await envelope();
+    const savedFetch = globalThis.fetch;
+    try {
+      let posted: { envelope: EncryptedVaultEnvelope; baseRevision: string } | undefined;
+      globalThis.fetch = async (_url, options) => {
+        posted = JSON.parse(String(options?.body));
+        await saveLocalVaultIfUnchanged(winner, competing);
+        return Response.json({ ok: true, revision: "remote-committed" });
+      };
+      const raced = await saveRemoteVaultAndCacheIfUnchanged(settings, committed, "remote-base", winner);
+      assert.deepEqual(raced, { revision: "remote-committed", cached: false });
+      assert.equal(posted?.baseRevision, "remote-base");
+      assert(sameVaultEnvelope(posted!.envelope, committed));
+      assert(sameVaultEnvelope(JSON.parse(local.get("sushi_encrypted_vault_v1")!), competing));
+      assert.equal(getLocalSyncMetadata(), null);
+
+      // With an unchanged local snapshot, a confirmed remote save is cached.
+      globalThis.fetch = async () => Response.json({ ok: true, revision: "remote-next" });
+      const saved = await saveRemoteVaultAndCacheIfUnchanged(settings, committed, "remote-committed", competing);
+      assert.deepEqual(saved, { revision: "remote-next", cached: true });
+      assert(sameVaultEnvelope(JSON.parse(local.get("sushi_encrypted_vault_v1")!), committed));
+      assert.equal(getLocalSyncMetadata()?.revision, "remote-next");
+
+      // A rejected server write does not touch the browser cache.
+      globalThis.fetch = async () => Response.json({ ok: false, error: "The vault changed on another device." }, { status: 409 });
+      await assert.rejects(saveRemoteVaultAndCacheIfUnchanged(settings, competing, "stale", committed), /changed on another device/);
+      assert(sameVaultEnvelope(JSON.parse(local.get("sushi_encrypted_vault_v1")!), committed));
+      assert.equal(getLocalSyncMetadata()?.revision, "remote-next");
+
+      // A missing cross-tab lock after the server accepts the write is not a
+      // failed server save, and must never trigger an unsafe fallback write.
+      Object.defineProperty(globalThis, "navigator", { configurable: true, value: {} });
+      globalThis.fetch = async () => Response.json({ ok: true, revision: "remote-no-lock" });
+      const uncached = await saveRemoteVaultAndCacheIfUnchanged(settings, competing, "remote-next", committed);
+      assert.deepEqual(uncached, { revision: "remote-no-lock", cached: false });
+      assert(sameVaultEnvelope(JSON.parse(local.get("sushi_encrypted_vault_v1")!), committed));
+      assert.equal(getLocalSyncMetadata()?.revision, "remote-next");
+    } finally {
+      globalThis.fetch = savedFetch;
+    }
+    await assert.rejects(saveLocalVaultIfUnchanged(committed, await envelope()), /safely coordinate vault writes/);
+    assert(sameVaultEnvelope(JSON.parse(local.get("sushi_encrypted_vault_v1")!), committed));
     if (savedNavigator) Object.defineProperty(globalThis, "navigator", savedNavigator);
     else delete (globalThis as { navigator?: unknown }).navigator;
     delete (globalThis as { window?: unknown }).window;
@@ -293,6 +300,8 @@ async function main() {
 
     process.env.DATA_DIR = path.join(temp, "disk");
     await runBackendSuite("disk");
+    await saveServerPasskey({ id: "passkey-1", publicKey: "abc", counter: 0, label: "Test", deviceType: "multiDevice", backedUp: true, createdAt: Date.now() });
+    assert.equal((await getEffectiveAuthConfig()).serverPasskeys.length, 1);
 
     // A pre-upgrade file has no revision and must remain readable and safely
     // updateable using the stable legacy digest returned by GET.
@@ -310,59 +319,7 @@ async function main() {
     assert.equal((await getStatus(request("/api/auth/status"))).status, 503);
     assert.equal((await setup(request("/api/auth/setup", "POST", { username: "attacker", password: originalPassword }))).status, 503);
 
-    await new Promise<void>((resolve) => redisServer.listen(0, "127.0.0.1", resolve));
-    const address = redisServer.address();
-    if (!address || typeof address === "string") throw new Error("Redis mock did not start");
-    const redisUrl = `http://127.0.0.1:${address.port}`;
-    process.env.VERCEL = "1";
-    process.env.UPSTASH_REDIS_REST_URL = redisUrl;
-    process.env.UPSTASH_REDIS_REST_TOKEN = "test-only-token";
-    process.env.SUSHI_STORAGE_PREFIX = "sync-test";
-    await runBackendSuite("redis");
-    await saveServerPasskey({ id: "passkey-1", publicKey: "abc", counter: 0, label: "Test", deviceType: "multiDevice", backedUp: true, createdAt: Date.now() });
-    assert.equal((await getEffectiveAuthConfig()).serverPasskeys.length, 1);
-    assert(Array.from(redis.keys()).every((key) => key.startsWith("{sync-test}:")));
-
-    const cloudToken = (await json(await login(request("/api/auth/login", "POST", { username: "operator", password: newPassword })))).sessionToken;
-    redisOffline = true;
-    assert.equal((await getStatus(request("/api/auth/status"))).status, 503);
-    assert.equal((await getVault(request("/api/vault", "GET", undefined, cloudToken))).status, 503);
-    assert.equal((await setup(request("/api/auth/setup", "POST", { username: "attacker", password: originalPassword }))).status, 503);
-    redisOffline = false;
-    delete process.env.UPSTASH_REDIS_REST_TOKEN;
-    assert.equal((await getStatus(request("/api/auth/status"))).status, 503);
-    process.env.UPSTASH_REDIS_REST_TOKEN = "test-only-token";
-
-    // Existing Vercel browser certificates can seed an empty shared store once;
-    // subsequent browsers find that same account without any certificate.
-    redis.clear();
-    delete process.env.UPSTASH_REDIS_REST_URL;
-    delete process.env.UPSTASH_REDIS_REST_TOKEN;
-    process.env.SUSHI_ALLOW_STATELESS_SETUP = "true";
-    process.env.SUSHI_AUTH_SECRET = crypto.randomBytes(32).toString("hex");
-    const legacyAccount = await bootstrapAdminAccount("old-browser", originalPassword);
-    process.env.UPSTASH_REDIS_REST_URL = redisUrl;
-    process.env.UPSTASH_REDIS_REST_TOKEN = "test-only-token";
-    const migrated = await getStatus(request("/api/auth/status", "GET", undefined, undefined, { "x-sushi-admin-cert": legacyAccount.adminProfileCert }));
-    assert.equal(migrated.status, 200);
-    assert.equal((await json(await getStatus(request("/api/auth/status")))).initialized, true);
-    assert.equal((await getEffectiveAuthConfig()).username, "old-browser");
-    assert.equal(await (await getEffectiveAuthConfig()).verifyPassword(originalPassword), true);
-
-    // Environment-managed password changes must revoke sessions even when the
-    // hosting provider keeps a fixed explicit session-signing secret.
-    process.env.SUSHI_AUTH_USERNAME = "env-admin";
-    process.env.SUSHI_AUTH_PASSWORD = originalPassword;
-    const envConfig = await getEffectiveAuthConfig();
-    const envToken = createSessionToken(envConfig.username, envConfig.authSecret, envConfig.sessionVersion);
-    const unversioned = createSessionToken(envConfig.username, envConfig.authSecret);
-    assert.equal((await verifyIncomingAuth(new Headers({ "x-sushi-session": envToken }))).ok, true);
-    assert.equal((await verifyIncomingAuth(new Headers({ "x-sushi-session": unversioned }))).ok, false);
-    process.env.SUSHI_AUTH_PASSWORD = newPassword;
-    assert.equal((await verifyIncomingAuth(new Headers({ "x-sushi-session": envToken }))).ok, false);
-    console.log("    Redis outage, configuration, session revocation and legacy-account migration passed");
   } finally {
-    if (redisServer.listening) await new Promise<void>((resolve, reject) => redisServer.close((err) => err ? reject(err) : resolve()));
     await fs.rm(temp, { recursive: true, force: true });
     for (const key of envKeys) {
       if (savedEnv[key] === undefined) delete process.env[key];

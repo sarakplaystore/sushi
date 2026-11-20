@@ -14,10 +14,9 @@ export const dynamic = "force-dynamic";
  * SSH / SFTP / RDP address of every way in), instead of one row per saved profile in
  * three different lists.
  *
- * The vault is end-to-end encrypted, so the honest default is an *index*:
- * `encrypted: true` and every entry redacted (`host #1`) but still complete
- * structurally — id, protocols, ports, profile counts, access URLs. Open `/hosts` in
- * Sushi (or unlock the vault) to see names and connect.
+ * This endpoint does not decode the encrypted vault. Without a clear-text
+ * inventory it returns a placeholder empty list and cannot determine host counts;
+ * open `/hosts` in Sushi to see the actual saved hosts.
  *
  * Deployments that keep a clear-text inventory on purpose can opt in with
  * `SUSHI_HOSTS_INVENTORY` = a JSON document (or a file path) of the shape
@@ -96,10 +95,9 @@ export async function GET(req: NextRequest) {
       });
     }
 
-    // 2. Otherwise describe the encrypted vault: one entry per machine, redacted.
+    // 2. Otherwise describe the vault without attempting to decode its contents.
     if (!isServerVaultEnabled()) {
-      // Device-key vaults (or none yet) are only reachable from the browser that
-      // holds the key: the index is empty but the shape is complete.
+      // The server has no browser-local vault contents to enumerate.
       const empty = buildUnifiedInventory([], {
         resolve: false,
         encrypted: true,
@@ -108,16 +106,15 @@ export async function GET(req: NextRequest) {
       return NextResponse.json(
         {
           ...empty,
-          hint: "This Sushi has no shared vault: the connection list lives in the browser that created it. Open /hosts in Sushi to see and connect to your hosts.",
+          hint: "This Sushi has no shared vault: the connection list lives in the browser that created it. The empty index does not indicate how many hosts are saved. Open /hosts in Sushi to see and connect to them.",
         },
         { headers: { ...cors, "Cache-Control": "no-store" } }
       );
     }
 
     const stored = await readStoredVault();
-    // The envelope cannot be opened here (that is the point of the vault); its mode
-    // and revision are still useful to a client, and the count of hosts is not known
-    // until a browser unlocks it.
+    // This endpoint does not decode the envelope. Its mode and revision remain
+    // useful to a client; host counts are not known here.
     const envelope = stored?.envelope;
     const inventory = buildUnifiedInventory([], {
       resolve: false,

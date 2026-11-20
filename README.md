@@ -469,7 +469,9 @@ for the account and vault; switching stores does not automatically copy data.
 3. Open the deployed URL and create the account once. Other devices visiting
    that deployment see sign-in and can open the same encrypted vault. Without
    persistent storage, first-time interactive setup is blocked instead of
-   silently creating a different browser-local account. Existing env-configured
+   silently creating a different browser-local account. The blocked screen
+   shows a guided, copy-paste setup for Turso, Firestore, or Redis and
+   highlights which environment variables are still missing. Existing env-configured
    accounts can still sign in, but have no shared vault until storage is set up.
    For legacy browser-local behavior only, `SUSHI_ALLOW_STATELESS_SETUP=true`
    explicitly opts back in; it does **not** provide cross-device sync.

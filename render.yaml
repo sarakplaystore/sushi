@@ -1,0 +1,54 @@
+# Sushi Gateway on Render — the WebSocket PTY companion for a Sushi UI deployed
+# on Vercel. Vercel functions cannot accept a WebSocket upgrade, so one small
+# always-on process elsewhere provides the native PTY (`vim`, `htop`, `tmux`,
+# terminal resize) and team-shared shells.
+#
+#   Render dashboard → New + → Blueprint → pick this repository
+#   (or use the "Deploy to Render" button in the README)
+#
+# Render reads this file and creates the `sushi-gateway` web service from
+# Dockerfile.gateway. SUSHI_GATEWAY_TOKEN is generated for you; copy it and
+# ALLOWED_ORIGIN from the service's Environment tab into Sushi → Hybrid VPS &
+# Vercel Deployment Settings, together with the service URL
+# (https://sushi-gateway.onrender.com).
+#
+# Two Render-specific notes:
+#   * A free instance sleeps after ~15 minutes idle and a sleeping service cannot
+#     accept the WebSocket handshake, so use a paid plan for a gateway that must
+#     always answer (or keep the tab's "Keep this gateway awake" toggle on).
+#   * Render gives services no private hostname to each other, so the
+#     guacamole/guacd sidecar that .railway/railway.ts deploys cannot be
+#     addressed from a Render web service. The SSH PTY is unaffected; live HTML5
+#     RDP then runs through the browser's IronRDP WebAssembly client instead of
+#     guacd. Use Railway (or one VPS with docker compose) when you want
+#     guacd-backed RDP streaming next to the PTY.
+services:
+  - type: web
+    name: sushi-gateway
+    runtime: docker
+    plan: free
+    region: oregon
+    dockerfilePath: ./Dockerfile.gateway
+    dockerContext: .
+    healthCheckPath: /api/system/capabilities
+    envVars:
+      # The secret the Vercel UI presents when it opens /ws/ssh. Render creates
+      # it once; read it in the service's Environment tab. Generate your own
+      # instead with: openssl rand -hex 24
+      - key: SUSHI_GATEWAY_TOKEN
+        generateValue: true
+      # The exact origin of your Vercel deployment (no trailing slash), e.g.
+      # https://your-app.vercel.app
+      - key: ALLOWED_ORIGIN
+        sync: false
+      - key: GATEWAY_ONLY
+        value: "true"
+      - key: NODE_ENV
+        value: production
+      - key: HOST
+        value: 0.0.0.0
+      # Only useful if you expose a guacd instance Render can address.
+      - key: GUACD_HOST
+        value: 127.0.0.1
+      - key: GUACD_PORT
+        value: "4822"

@@ -14,7 +14,7 @@
 
 It is designed around a **Hybrid VPS + Serverless Architecture**:
 - **Self-Hosted on a VPS (Docker Compose or Node.js)**: Runs a unified HTTP + WebSocket server (`server.ts`) paired with Apache Guacamole's `guacd` daemon for full interactive `xterm.js` PTY SSH terminals, graphical SFTP file management + remote code editing, and live 60fps HTML5 Remote Desktop (RDP) sessions.
-- **Deployed on Vercel (Serverless Node.js)**: Uses Google Cloud Firestore or a Redis-compatible REST database for a persistent account and cross-device vault (see setup below). Graphical **SFTP** file browsing/uploads/downloads/editing, **Serverless Streaming SSH** execution, and **MS-RDPBCGR X.224 / TLS / NLA** server probes work natively on Vercel Serverless Functions — and you can optionally link any VPS Gateway URL (`wss://...`) inside the UI to unlock persistent WebSocket PTY shells and live browser RDP streaming.
+- **Deployed on Vercel (Serverless Node.js)**: Uses Google Cloud Firestore or a Redis-compatible REST database for a persistent account and cross-device vault (see setup below). Graphical **SFTP** file browsing/uploads/downloads/editing, **Serverless Streaming SSH** execution, and **MS-RDPBCGR X.224 / TLS / NLA** server probes work natively on Vercel Serverless Functions — and you can optionally link any Gateway URL (`wss://...`) inside the UI to unlock persistent WebSocket PTY shells and live browser RDP streaming — hosted on a **VPS**, on **Railway** ([`.railway/railway.ts`](.railway/railway.ts) deploys the gateway *and* `guacd`), or on **Render** ([`render.yaml`](render.yaml)), all three built from the slim [`Dockerfile.gateway`](Dockerfile.gateway).
 
 ---
 
@@ -210,7 +210,7 @@ Where it works, and where it does not:
 | --- | --- |
 | VPS / Docker install (`server.ts`) | ✅ |
 | `GATEWAY_ONLY=true` gateway | ✅ |
-| Vercel serverless | ❌ serverless has no process to hold a PTY open — the Share panel says so and offers *Attach a VPS gateway* |
+| Vercel serverless | ❌ serverless has no process to hold a PTY open — the Share panel says so and offers *Attach a gateway* (VPS, Railway or Render) |
 
 Managing shares: **Share → Other shared sessions here** lists everything currently
 published on this server, with **Rejoin** and **Stop**. The same list is available to
@@ -367,7 +367,8 @@ The database is parsed with SQLite compiled to WebAssembly (`sql.js`) and decryp
 | **Docker Compose, no clone** | `curl -fsSLO https://raw.githubusercontent.com/sarakplaystore/sushi/main/docker-compose.prebuilt.yml && docker compose -f docker-compose.prebuilt.yml up -d` | Sushi **+ guacd** from the published image |
 | **Python 3.9+** (no Docker needed) | `python3 install.py` | Cross-platform (Linux, macOS, Windows via WSL). Downloads the source, `npm ci`, builds, starts in the background and health-checks it |
 | **Node.js 22 only** | `git clone https://github.com/sarakplaystore/sushi.git && cd sushi && npm ci && npm run build && npm start` | The manual equivalent |
-| **Vercel** | Import the repo, add Turso/Firestore/Redis | See [Deploy to Vercel](#3-deploy-to-vercel--optional-companion-vps-gateway) |
+| **Vercel** | Import the repo, add Turso/Firestore/Redis | See [Deploy to Vercel](#3-deploy-to-vercel--optional-companion-gateway-vps-railway-or-render) |
+| **Vercel + native PTY** | Vercel for the UI, Railway or Render for [`Dockerfile.gateway`](Dockerfile.gateway) | See [Deploy to Vercel](#3-deploy-to-vercel--optional-companion-gateway-vps-railway-or-render) — no server to maintain |
 
 Useful installer flags: `--port 8080`, `--dir ~/sushi`, `--https your.domain` (adds Caddy with
 automatic HTTPS), `--prebuilt` (skip the build), `--node` (no Docker: Node.js + systemd), and
@@ -383,6 +384,13 @@ automatic HTTPS), `--prebuilt` (skip the build), `--node` (no Docker: Node.js + 
 
 [![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fsarakplaystore%2Fsushi&repository-name=sushi)
 *(Vercel needs a Turso / Firestore / Redis database before the admin account can be created — see §3.)*
+
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/sarakplaystore/sushi)
+*(Deploys the **gateway** from [`render.yaml`](render.yaml) — the native WebSocket PTY companion for a Vercel UI, not the whole app. See §3.)*
+
+**Railway** has no repo-based one-click button: run `railway config apply` against
+[`.railway/railway.ts`](.railway/railway.ts), which creates the `sushi-gateway` **and** `guacd`
+services in one step (see §3 for both the CLI and dashboard routes).
 
 ```bash
 # Docker, one line, everything included (Sushi + guacd)
@@ -434,7 +442,7 @@ for the account and vault; switching stores does not automatically copy data.
 > server passwords/keys you send travel unencrypted, and **passkeys only work on HTTPS** (or
 > `http://localhost`). Sushi shows a dismissible notice when it is opened over plain HTTP.
 
-### 3. Deploy to Vercel (+ Optional Companion VPS Gateway)
+### 3. Deploy to Vercel (+ Optional Companion Gateway: VPS, Railway or Render)
 
 1. Provision **Turso (libSQL)**, **[Google Cloud Firestore](#google-cloud-firestore)**,
    or a **Redis database with an Upstash-compatible REST API**. Sushi does not
@@ -466,15 +474,67 @@ for the account and vault; switching stores does not automatically copy data.
    For legacy browser-local behavior only, `SUSHI_ALLOW_STATELESS_SETUP=true`
    explicitly opts back in; it does **not** provide cross-device sync.
 4. On Vercel, SFTP and serverless SSH work natively, and RDP can probe/export a
-   `.rdp` file. *(Optional)* For persistent WebSocket PTY shells and live RDP,
-   run a companion VPS gateway:
+   `.rdp` file. A Vercel function can never accept a WebSocket upgrade, so
+   *(optional)* attach a **gateway** — one small always-on process — for
+   persistent WebSocket PTY shells (full-screen `vim`/`htop`/`tmux`, terminal
+   resize), team-shared terminals, and live guacd RDP. All three routes below end
+   the same way: one `wss://` URL plus its token, pasted into Sushi's
+   **Settings → Gateway** (the panel offers the same snippets behind its
+   *VPS / Railway / Render* tabs).
+
+   | Gateway host | What you run | Native PTY | Live RDP | Files |
+   | --- | --- | --- | --- | --- |
+   | **VPS** (Docker/Node) | `docker compose up -d` or `npm run gateway` | ✅ | ✅ via `guacd` | [`Dockerfile`](Dockerfile), [`docker-compose.yml`](docker-compose.yml) |
+   | **Railway** | `railway config apply` → `sushi-gateway` + `guacd` on one private network | ✅ | ✅ via `guacd` | [`.railway/railway.ts`](.railway/railway.ts), [`Dockerfile.gateway`](Dockerfile.gateway) |
+   | **Render** | New + → Blueprint → this repo | ✅ | In-browser IronRDP WASM (Render services get no private hostname for a `guacd` sidecar) | [`render.yaml`](render.yaml), [`Dockerfile.gateway`](Dockerfile.gateway) |
+
+   **Railway** (`railway.json` is deprecated and stops being read on 2026‑12‑01, so Sushi
+   ships Railway's Infrastructure-as-Code file instead):
+
+   ```bash
+   npm i -g @railway/cli
+   railway login && railway init          # or: railway link
+   npm i --no-save railway                # SDK, only to evaluate .railway/railway.ts
+   railway config plan && railway config apply
+   railway variable set SUSHI_GATEWAY_TOKEN="$(openssl rand -hex 24)" --service sushi-gateway
+   railway variable set ALLOWED_ORIGIN="https://your-app.vercel.app" --service sushi-gateway
+   ```
+
+   Then give `sushi-gateway` a public domain (**Settings → Networking → Generate Domain**) and
+   paste that `https://…up.railway.app` URL plus the token into Sushi's gateway panel.
+
+   Without the CLI: *New Project → GitHub Repo → this repository*, set
+   **Settings → Build Configuration → Dockerfile Path** to `Dockerfile.gateway`, add a second
+   service from the Docker image `guacamole/guacd:1.5.5`, point `GUACD_HOST` at that service's
+   `RAILWAY_PRIVATE_DOMAIN`, set the two variables above, then **Generate Domain**.
+
+   **Render**: *New + → Blueprint → this repository* (or the Deploy to Render button above).
+   `render.yaml` builds `Dockerfile.gateway` and generates `SUSHI_GATEWAY_TOKEN` for you; set
+   `ALLOWED_ORIGIN` to your Vercel origin and copy the service URL and token into Sushi.
+
+   **VPS**:
+
    ```bash
    docker compose up -d guacd
    SUSHI_GATEWAY_TOKEN="your-secret" ALLOWED_ORIGIN="https://your-app.vercel.app" npm run gateway
    ```
+
    Put Caddy/Nginx HTTPS in front of the VPS and enter its URL and matching token
    in Sushi's **Settings → Gateway**. A gateway token authorizes protocol access;
    it is not an admin sign-in and cannot read or change the shared vault.
+
+   > **Idle sleep.** A managed host that suspends idle services (Render's free instance plan,
+   > an unscaled Railway service) cannot answer a WebSocket handshake while asleep, and the
+   > first shell then waits for a cold start or fails. Use an always-on plan, keep Sushi's
+   > **Keep this gateway awake** toggle on in the gateway panel (pings `/health` every
+   > 4 minutes while that tab is open), or run the gateway on a VPS. A sleep also drops every
+   > session the gateway was holding — no keepalive can bring those back.
+
+   The gateway image is deliberately slim: it contains no Next.js build and no web assets,
+   only `server.ts` with `GATEWAY_ONLY=true`, so it starts in about a second and answers
+   `GET /health` and `GET /api/system/capabilities` for platform health checks. Every other
+   API route 404s on purpose, which is what makes the Vercel frontend keep using its own
+   serverless endpoints (for example *Test SSH Auth* → the Vercel `/api/ssh/test`).
 
 **Upgrading an existing browser-local Vercel account:** Back up the old vault
 first. Preserve the existing `SUSHI_AUTH_SECRET` and deployment identity, add

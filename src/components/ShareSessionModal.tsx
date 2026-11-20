@@ -158,7 +158,8 @@ export function ShareSessionModal({
                   <p className="font-medium">This terminal is running on the serverless shell.</p>
                   <p className="text-amber-100/80">
                     Team sharing needs a real WebSocket PTY that stays open between browsers, which
-                    only a Sushi VPS, Docker install, or VPS gateway provides.
+                    only a Sushi VPS, Docker install, or attached gateway (VPS, Railway or Render)
+                    provides.
                   </p>
                   <button
                     type="button"
@@ -166,7 +167,7 @@ export function ShareSessionModal({
                     className="inline-flex items-center gap-1.5 rounded-lg border border-amber-400/40 bg-amber-500/10 px-2.5 py-1 text-xs font-medium text-amber-100 transition hover:bg-amber-500/20"
                   >
                     <Radio className="h-3.5 w-3.5" />
-                    Attach a VPS gateway
+                    Attach a gateway
                   </button>
                 </div>
               </div>
@@ -457,7 +458,7 @@ export function ShareSessionModal({
             <p className="flex items-start gap-2 rounded-lg border border-white/10 bg-white/[0.03] px-3 py-2 text-[12px] leading-relaxed text-slate-400">
               <Info className="mt-0.5 h-3.5 w-3.5 shrink-0" />
               This Sushi is running serverless, so it cannot host a shared shell itself. Attach a
-              VPS gateway and share from a terminal that connects through it.
+              gateway (VPS, Railway or Render) and share from a terminal that connects through it.
             </p>
           )}
 

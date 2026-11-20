@@ -343,7 +343,7 @@ The database is parsed with SQLite compiled to WebAssembly (`sql.js`) and decryp
 | **Docker Compose, no clone** | `curl -fsSLO https://raw.githubusercontent.com/sarakplaystore/sushi/main/docker-compose.prebuilt.yml && docker compose -f docker-compose.prebuilt.yml up -d` | Sushi **+ guacd** from the published image |
 | **Python 3.9+** (no Docker needed) | `python3 install.py` | Cross-platform (Linux, macOS, Windows via WSL). Downloads the source, `npm ci`, builds, starts in the background and health-checks it |
 | **Node.js 22 only** | `git clone https://github.com/sarakplaystore/sushi.git && cd sushi && npm ci && npm run build && npm start` | The manual equivalent |
-| **Vercel** | Import the repo, configure admin environment variables | See [Deploy to Vercel](#3-deploy-to-vercel--optional-companion-gateway-vps-railway-or-render) |
+| **Vercel** | Import the repo, then import a private `.env` with the deploy helper | See [Deploy to Vercel](#3-deploy-to-vercel--optional-companion-gateway-vps-railway-or-render) |
 | **Vercel + native PTY** | Vercel for the UI, Railway or Render for [`Dockerfile.gateway`](Dockerfile.gateway) | See [Deploy to Vercel](#3-deploy-to-vercel--optional-companion-gateway-vps-railway-or-render) — no server to maintain |
 
 Useful installer flags: `--port 8080`, `--dir ~/sushi`, `--https your.domain` (adds Caddy with
@@ -359,7 +359,7 @@ automatic HTTPS), `--prebuilt` (skip the build), `--node` (no Docker: Node.js + 
 ### 0. One-click deploys
 
 [![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fsarakplaystore%2Fsushi&repository-name=sushi)
-*(Set server-side admin credentials in Vercel before signing in — see §3.)*
+*(Import private server-side admin credentials before signing in — see §3.)*
 
 [![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/sarakplaystore/sushi)
 *(Deploys the **gateway** from [`render.yaml`](render.yaml) — the native WebSocket PTY companion for a Vercel UI, not the whole app. See §3.)*
@@ -420,19 +420,75 @@ disables disk vault sync and keeps the vault only in each browser. No database i
 ### 3. Deploy to Vercel (+ Optional Companion Gateway: VPS, Railway or Render)
 
 1. Import `sarakplaystore/sushi` into Vercel (Next.js, Node.js `22.x`). No
-   database integration is needed.
-2. In **Project Settings → Environment Variables**, set these as **server-only**
-   secrets for the environments you deploy. Never use a `NEXT_PUBLIC_` prefix or
-   commit their values:
-   - `SUSHI_AUTH_USERNAME`: your admin username.
-   - `SUSHI_AUTH_PASSWORD`: a long, unique admin password.
-   - `SUSHI_AUTH_SECRET`: a stable, random signing secret (strongly recommended;
-     generate one with `openssl rand -hex 32`). Preserve it when redeploying.
-3. Redeploy and sign in. The same credentials work on each device, but the
-   **encrypted vault is browser-local** and will not sync between devices. Make a
-   portable encrypted backup and restore it on each browser. Vercel cannot safely
-   offer public interactive account creation without a persistent account store;
-   the old `SUSHI_ALLOW_STATELESS_SETUP` flag no longer enables it.
+   database integration is needed. In a local checkout, authenticate the Vercel
+   CLI and link it to **that existing project**:
+
+   ```bash
+   npx --yes vercel@66.5.0 login
+   npx --yes vercel@66.5.0 link
+   ```
+
+   Select the existing GitHub-linked Sushi project when linking. The checkout's
+   Git `origin` must point to the same GitHub repository as the project (use your
+   fork's checkout if you deployed a fork). The helper uses the CLI's existing
+   login (or the standard CI `VERCEL_TOKEN`) and needs permission to manage
+   project environment variables and deployments.
+2. Import a private `.env` and deploy the linked **production Git branch**:
+
+   ```bash
+   npm run deploy:vercel -- --env-file .env
+   ```
+
+   The file must contain `SUSHI_AUTH_USERNAME` and `SUSHI_AUTH_PASSWORD` (or
+   `SUSHI_AUTH_PASSWORD_HASH`, as a 64-character SHA-256 hex digest or
+   `hex-salt:128-character-scrypt-hex` using scrypt N=16384, r=8, p=1).
+   `SUSHI_AUTH_SECRET` is strongly recommended and must be kept stable. Values
+   are read literally, without shell execution or `$` expansion; quote values
+   containing `#` or spaces. Only these admin entries are imported: other `.env`
+   entries are not uploaded. The password, hash and signing secret are stored as
+   write-only Vercel Secrets, for **production only**; preview deployments need
+   their own separate settings. The helper does not upload the file, and rejects
+   credentials inside the checkout unless they are untracked and Git-ignored.
+   Ensure no Git branch or history contains the file. The helper starts a Git-based
+   production deployment, waits for it to be ready, and verifies sign-in when
+   deployment protection allows. It deploys the latest commit on the linked
+   production branch, **not uncommitted local changes**.
+
+   For a **fresh install with no vault to recover**, generate credentials instead:
+
+   ```bash
+   npm run deploy:vercel -- --new
+   ```
+
+   This creates `.env.sushi.local` with a random password and signing secret;
+   open it privately to sign in and keep a secure backup. The helper never prints
+   those values, commits them, or overwrites an existing file or project secret.
+   To reuse the file later, use `--env-file .env.sushi.local`. If a project already
+   has admin credentials, they are left untouched; the helper checks which keys
+   exist but cannot compare write-only values with the file. An incomplete or
+   ambiguous configuration stops the import to avoid changing the vault key.
+   If an import is interrupted, some variables may have been saved: retain the
+   file and inspect the project before retrying. `--import-only` saves the
+   variables without starting a deployment; a subsequent deployment is required.
+
+   **Migration:** use the original effective signing secret or a verified portable
+   backup; do not use `--new` for an existing session-key vault. If the old account
+   used environment credentials without `SUSHI_AUTH_SECRET`, retaining those
+   credentials and leaving the secret unset preserves the derived key. See
+   [migration](#migrating-from-database-storage). Never commit any filled-in
+   `.env` file, use a `NEXT_PUBLIC_` prefix for secrets, or expose it publicly.
+
+   Vercel does not read a local, Git-ignored `.env` during a Git build and does
+   not grant that build permission to create project secrets. The first import
+   requires an authenticated, linked CLI (or an authorized CI job); it cannot be
+   performed automatically by an unauthenticated Git deployment. Once imported,
+   Vercel retains the settings for later production Git deployments. You can also
+   set the same server-only values through Vercel's project settings.
+3. Sign in. The same credentials work on each device, but the **encrypted vault
+   is browser-local** and will not sync between devices. Make a portable encrypted
+   backup and restore it on each browser. Vercel cannot safely offer public
+   interactive account creation without a persistent account store; the old
+   `SUSHI_ALLOW_STATELESS_SETUP` flag no longer enables it.
 4. On Vercel, SFTP, serverless SSH, and RDP probes work natively. Direct live RDP
    over split HTTP requests depends on those requests reaching the same process;
    it may disconnect on serverless platforms. Attach a **gateway** — one small
@@ -518,8 +574,9 @@ account. The services and their contents are **not deleted** by this upgrade.
    Keep a secure backup of the old database and its settings until the new
    deployment has been checked. Export or re-enroll passkeys as needed. Do not
    clear the original browser data.
-2. For Vercel, set `SUSHI_AUTH_USERNAME` and `SUSHI_AUTH_PASSWORD` in the hosting
-   dashboard. Keep a stable `SUSHI_AUTH_SECRET`. To open a cached vault whose
+2. For Vercel, import the original admin settings from a private `.env` with the
+   deploy helper above, or configure them in the hosting dashboard. Keep a stable
+   `SUSHI_AUTH_SECRET`. To open a cached vault whose
    `keySource` is `session` without restoring the backup, this must be the **same
    effective secret** used by the old deployment (from its old server-side
    setting or protected account record). Handle it as a secret; never paste it in

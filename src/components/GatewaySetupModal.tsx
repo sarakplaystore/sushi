@@ -17,6 +17,7 @@ import {
 import type { SystemCapabilities } from "@/types/connection";
 import {
   type GatewaySettings,
+  fetchGatewayCapabilities,
   getAuthHeaders,
   resolveGatewayHttpBase,
 } from "@/lib/client/gateway";
@@ -25,6 +26,14 @@ import { copyTextToClipboard } from "@/lib/client/clipboard";
 interface GatewaySetupModalProps {
   isOpen: boolean;
   localCapabilities: SystemCapabilities | null;
+  /**
+   * Capabilities of the attached gateway, as the workspace last read them. The
+   * matrix below is about *this Sushi*, and on Vercel this Sushi can never accept
+   * a WebSocket upgrade — so without the gateway's own capabilities the "Native
+   * WebSocket PTY" row would keep saying "Serverless Stream Active" even after a
+   * gateway was attached and proven to work.
+   */
+  gatewayCapabilities?: SystemCapabilities | null;
   gatewaySettings: GatewaySettings;
   onClose: () => void;
   onSaveSettings: (
@@ -193,6 +202,7 @@ export const GATEWAY_TOKEN_LINKS: Record<
 export function GatewaySetupModal({
   isOpen,
   localCapabilities,
+  gatewayCapabilities,
   gatewaySettings,
   onClose,
   onSaveSettings,
@@ -250,6 +260,25 @@ export function GatewaySetupModal({
   const activeTokenLocation = GATEWAY_TOKEN_LINKS[activeTarget.id];
   const activeTokenLinks = activeTokenLocation.links;
 
+  /**
+   * What the attached gateway can do. A live probe wins over what the workspace
+   * read at boot, so pressing *Test Gateway Endpoint* updates the matrix above
+   * immediately instead of only after a reload.
+   */
+  const attachedCaps =
+    probeStatus?.ok && probeStatus.caps ? probeStatus.caps : gatewayCapabilities ?? null;
+  const gatewayAttached = Boolean(gatewayUrl.trim()) || attachedCaps !== null;
+  /** The gateway's host, for "Active via attached gateway (sushi-gw.onrender.com)". */
+  const gatewayLabel = (() => {
+    const raw = gatewayUrl.trim();
+    if (!raw) return "";
+    try {
+      return new URL(resolveGatewayHttpBase(raw)).host;
+    } catch {
+      return raw.replace(/^https?:\/\//, "").split("/")[0];
+    }
+  })();
+
   const copyText = (id: string, value: string) => {
     void copyTextToClipboard(value);
     setCopiedId(id);
@@ -269,35 +298,33 @@ export function GatewaySetupModal({
 
     setProbing(true);
     setProbeStatus(null);
-    try {
-      const httpBase = resolveGatewayHttpBase(trimmed);
-      const res = await fetch(`${httpBase}/api/system/capabilities`, {
-        headers: getAuthHeaders({ gatewayUrl: trimmed, gatewayToken }),
-      });
-      if (!res.ok) {
-        throw new Error(`Gateway returned HTTP ${res.status}`);
-      }
-      const caps = (await res.json()) as SystemCapabilities;
-      setProbeStatus({
-        ok: true,
-        message: `Connected to ${caps.mode.toUpperCase()} Gateway • WS SSH: ${
-          caps.websocketSsh ? "Ready" : "Off"
-        } • RDP guacd: ${caps.rdpGuacd ? "Ready" : "Not running"}`,
-        caps,
-      });
-      return caps;
-    } catch (err) {
+    // Shared with the workspace's boot probe, so both honour the same timeout: a
+    // gateway that is asleep must never leave this spinner running forever.
+    const result = await fetchGatewayCapabilities({
+      gatewayUrl: trimmed,
+      gatewayToken,
+    });
+    setProbing(false);
+
+    if (!result.ok || !result.caps) {
       setProbeStatus({
         ok: false,
-        message:
-          err instanceof Error
-            ? `Unable to reach gateway: ${err.message}`
-            : "Gateway connection failed.",
+        message: result.timedOut
+          ? `Gateway did not answer in time. ${result.error}`
+          : `Unable to reach gateway: ${result.error}`,
       });
       return null;
-    } finally {
-      setProbing(false);
     }
+
+    const caps = result.caps;
+    setProbeStatus({
+      ok: true,
+      message: `Connected to ${caps.mode.toUpperCase()} Gateway • WS SSH: ${
+        caps.websocketSsh ? "Ready" : "Off"
+      } • RDP guacd: ${caps.rdpGuacd ? "Ready" : "Not running"}`,
+      caps,
+    });
+    return caps;
   };
 
   const handleSave = async () => {
@@ -357,11 +384,27 @@ export function GatewaySetupModal({
                 </li>
                 <li>
                   • Native WebSocket PTY:{" "}
-                  {localCapabilities === null ? (
+                  {attachedCaps?.websocketSsh ? (
+                    <span className="text-emerald-400">
+                      Active via attached gateway
+                      {gatewayLabel ? ` (${gatewayLabel})` : ""}
+                      {attachedCaps.sharedSsh ? " · team sharing on" : ""}
+                    </span>
+                  ) : localCapabilities === null && !gatewayAttached ? (
                     <span className="text-slate-400">Detecting…</span>
-                  ) : localCapabilities.websocketSsh ? (
+                  ) : localCapabilities?.websocketSsh ? (
                     <span className="text-emerald-400">Active on this host</span>
-                  ) : localCapabilities.serverlessSshExec ? (
+                  ) : gatewayAttached ? (
+                    <span className="text-amber-300">
+                      {attachedCaps
+                        ? "Gateway reached, but it reports no WebSocket PTY"
+                        : "Gateway not verified yet"}
+                      <span className="text-slate-500">
+                        {" "}
+                        — run <em>Test Gateway Endpoint</em> below
+                      </span>
+                    </span>
+                  ) : localCapabilities?.serverlessSshExec ? (
                     <span className="text-sky-300">
                       Serverless Stream Active
                       <span className="text-slate-500">
@@ -378,11 +421,25 @@ export function GatewaySetupModal({
                 <li>
                   • Live HTML5 RDP:{" "}
                   <span className="text-emerald-400">
-                    {localCapabilities?.rdpGuacd
+                    {(attachedCaps?.rdpGuacd ?? localCapabilities?.rdpGuacd)
                       ? "Active (guacd)"
                       : "Active (IronRDP WebAssembly)"}
                   </span>
                 </li>
+                {gatewayAttached && (
+                  <li className="border-t border-white/8 pt-1.5">
+                    • Attached gateway:{" "}
+                    {attachedCaps ? (
+                      <span className="text-emerald-400">
+                        {attachedCaps.mode.toUpperCase()} · reachable · Node{" "}
+                        {attachedCaps.nodeVersion}
+                        {attachedCaps.requiresGatewayToken ? " · token required" : ""}
+                      </span>
+                    ) : (
+                      <span className="text-slate-400">URL saved, not probed yet</span>
+                    )}
+                  </li>
+                )}
               </ul>
             </div>
 

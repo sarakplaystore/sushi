@@ -1,4 +1,4 @@
-import type { ProtocolType } from "@/types/connection";
+import type { ProtocolType, SystemCapabilities } from "@/types/connection";
 import {
   getStoredAdminProfileCert,
   getStoredSessionToken,
@@ -52,6 +52,69 @@ export function resolveGatewayHttpBase(gatewayUrl?: string): string {
   if (raw.startsWith("ws://")) return "http://" + raw.slice(5);
   if (raw.startsWith("http://") || raw.startsWith("https://")) return raw;
   return `https://${raw}`;
+}
+
+/** How long Sushi waits for a gateway to answer before treating it as absent. */
+export const GATEWAY_PROBE_TIMEOUT_MS = 8000;
+
+export interface GatewayProbeResult {
+  ok: boolean;
+  /** The gateway's own capabilities, when it answered in time. */
+  caps?: SystemCapabilities;
+  /** Human-readable failure reason (`ok: false` only). */
+  error?: string;
+  /** True when the gateway simply did not answer in time. */
+  timedOut?: boolean;
+}
+
+/**
+ * Reads a remote gateway's `/api/system/capabilities`.
+ *
+ * Two details matter for managed hosts (a Render free instance sleeps after ~15
+ * minutes idle, an unscaled Railway service can be cold):
+ *
+ *  - **It always settles.** A sleeping gateway can take a minute to boot, and this
+ *    runs during vault boot — an unbounded `fetch` there would hang the whole app
+ *    open, so the request is aborted after `GATEWAY_PROBE_TIMEOUT_MS` and reported
+ *    as `timedOut` instead of stalling.
+ *  - **It never uses a cached answer.** `cache: "no-store"` keeps a CDN or browser
+ *    from reporting a gateway as healthy (or `websocketSsh: true`) when the
+ *    deployment behind it has changed.
+ *
+ * Note that this HTTP probe succeeding does not by itself prove the WebSocket PTY
+ * works — it proves the process is awake and what it claims to serve.
+ */
+export async function fetchGatewayCapabilities(
+  settings: GatewaySettings,
+  timeoutMs = GATEWAY_PROBE_TIMEOUT_MS
+): Promise<GatewayProbeResult> {
+  const raw = settings.gatewayUrl.trim();
+  if (!raw) return { ok: false, error: "No gateway URL is set." };
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(`${resolveGatewayHttpBase(raw)}/api/system/capabilities`, {
+      headers: getAuthHeaders(settings),
+      cache: "no-store",
+      signal: controller.signal,
+    });
+    if (!res.ok) return { ok: false, error: `Gateway returned HTTP ${res.status}` };
+    return { ok: true, caps: (await res.json()) as SystemCapabilities };
+  } catch (err) {
+    if (controller.signal.aborted) {
+      return {
+        ok: false,
+        timedOut: true,
+        error: `Gateway did not answer within ${Math.round(timeoutMs / 1000)} s. If it is on a plan that sleeps when idle, wake it and try again.`,
+      };
+    }
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : "Gateway connection failed.",
+    };
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /**

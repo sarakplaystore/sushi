@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
+import type { StorageBackendSetup, StorageSetupStatus } from "@/types/auth";
 import {
   compareAndSwapTursoAuthWithVaultGuard,
   compareAndSwapTursoRecord,
@@ -192,6 +193,109 @@ async function firestoreStore() {
 
 export function hasPersistentStateStore(): boolean {
   return getStateStoreKind() !== "none";
+}
+
+/** Env var groups per backend. Each inner array is one complete credential
+ * pair; any fully-present group makes that backend usable. */
+const TURSO_ENV_GROUPS: readonly (readonly string[])[] = [
+  ["SUSHI_TURSO_DATABASE_URL", "SUSHI_TURSO_AUTH_TOKEN"],
+  ["TURSO_DATABASE_URL", "TURSO_AUTH_TOKEN"],
+];
+const REDIS_ENV_GROUPS: readonly (readonly string[])[] = [
+  ["SUSHI_REDIS_REST_URL", "SUSHI_REDIS_REST_TOKEN"],
+  ["UPSTASH_REDIS_REST_URL", "UPSTASH_REDIS_REST_TOKEN"],
+  ["KV_REST_API_URL", "KV_REST_API_TOKEN"],
+];
+const FIRESTORE_ENV_GROUPS: readonly (readonly string[])[] = [
+  ["SUSHI_FIRESTORE_PROJECT_ID"],
+  ["SUSHI_FIRESTORE_DATABASE_ID"],
+  ["SUSHI_FIRESTORE_CREDENTIALS_JSON"],
+];
+
+function envVarPresent(name: string): boolean {
+  return (process.env[name] ?? "").trim().length > 0;
+}
+
+function describeBackend(
+  key: StorageBackendSetup["key"],
+  name: string,
+  description: string,
+  groups: readonly (readonly string[])[]
+): StorageBackendSetup {
+  const present: string[] = [];
+  const missing: string[] = [];
+  let configured = false;
+  for (const group of groups) {
+    const groupPresent = group.filter(envVarPresent);
+    present.push(...groupPresent);
+    if (groupPresent.length === group.length) {
+      configured = true;
+      continue;
+    }
+    for (const name of group) {
+      if (!groupPresent.includes(name) && !missing.includes(name)) {
+        missing.push(name);
+      }
+    }
+  }
+  return {
+    key,
+    name,
+    description,
+    configured,
+    present: Array.from(new Set(present)),
+    missing: Array.from(new Set(missing)),
+  };
+}
+
+/**
+ * Safe, value-free snapshot of the shared storage configuration so the UI can
+ * guide the user to a working backend. Only env var names are reported, never
+ * their values. Never throws: configuration errors are returned as `error`.
+ */
+export function getStorageSetupStatus(): StorageSetupStatus {
+  let backend: StorageSetupStatus["backend"] = "none";
+  let error: string | undefined;
+  try {
+    backend = getStateStoreKind();
+  } catch (err) {
+    error = err instanceof Error ? err.message : "Shared storage is misconfigured.";
+  }
+
+  const backends = [
+    describeBackend(
+      "turso",
+      "Turso (libSQL)",
+      "Fast edge SQL database with a Turso Marketplace one-click install.",
+      TURSO_ENV_GROUPS
+    ),
+    describeBackend(
+      "redis",
+      "Redis REST",
+      "Any Redis database with an Upstash-compatible REST API.",
+      REDIS_ENV_GROUPS
+    ),
+    describeBackend(
+      "firestore",
+      "Google Cloud Firestore",
+      "Google Cloud's server database; uses IAM credentials on the server.",
+      FIRESTORE_ENV_GROUPS
+    ),
+  ];
+
+  const recommended =
+    backends.find((b) => b.configured)?.key ??
+    backends.reduce((best, b) =>
+      b.present.length > best.present.length ? b : best
+    ).key;
+
+  return {
+    configured: backend !== "none",
+    backend,
+    ...(error ? { error } : {}),
+    backends,
+    recommended,
+  };
 }
 
 /** Used by the offline migration command; never overwrites a target namespace. */

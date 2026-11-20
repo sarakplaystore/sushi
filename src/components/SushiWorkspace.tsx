@@ -35,7 +35,7 @@ import {
   Square,
   Heart,
 } from "lucide-react";
-import type { AuthStatusResponse } from "@/types/auth";
+import type { AuthStatusResponse, StorageSetupStatus } from "@/types/auth";
 import type {
   CommandSnippet,
   HostProfile,
@@ -96,6 +96,7 @@ import { HostProfileModal } from "./HostProfileModal";
 import { GatewaySetupModal } from "./GatewaySetupModal";
 import { VaultSecurityModal, type VaultModalTab } from "./VaultSecurityModal";
 import { AuthGateScreen } from "./AuthGateScreen";
+import { StorageSetupGuide } from "./StorageSetupGuide";
 import { AccountPasskeysModal } from "./AccountPasskeysModal";
 import { DonateModal } from "./DonateModal";
 import { AiDisclaimer } from "./AiDisclaimer";
@@ -156,6 +157,7 @@ export function SushiWorkspace() {
   const [authChecking, setAuthChecking] = useState(true);
   const [authStatus, setAuthStatus] = useState<AuthStatusResponse | null>(null);
   const [authError, setAuthError] = useState<string | null>(null);
+  const [storageSetup, setStorageSetup] = useState<StorageSetupStatus | null>(null);
   const [authUsername, setAuthUsername] = useState<string>("admin");
   const [accountModalOpen, setAccountModalOpen] = useState(false);
 
@@ -478,6 +480,7 @@ export function SushiWorkspace() {
         }),
       });
       const data = await res.json();
+      if (data.storageSetup) setStorageSetup(data.storageSetup as StorageSetupStatus);
       if (!res.ok || !data.ok) throw new Error(data.error || "Account storage is unavailable.");
       const statusData = data as AuthStatusResponse;
       setAuthStatus(statusData);
@@ -2109,6 +2112,19 @@ export function SushiWorkspace() {
   }
 
   if (!authStatus) {
+    // Misconfigured storage makes the status endpoint fail; surface the
+    // guided setup experience instead of a bare error when we have details.
+    if (storageSetup) {
+      return (
+        <StorageSetupGuide
+          storageSetup={storageSetup}
+          onRefreshStatus={async () => {
+            setAuthChecking(true);
+            await refreshAuthStatus();
+          }}
+        />
+      );
+    }
     return (
       <div role="alert" className="flex h-full w-full items-center justify-center bg-[#090b10] p-4">
         <div className="w-full max-w-md space-y-4 rounded-2xl border border-rose-500/30 bg-[#0f131b] p-6 text-sm text-slate-200">

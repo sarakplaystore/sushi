@@ -240,4 +240,103 @@ assert.match(envExample, /^GATEWAY_ONLY=/m, ".env.example documents GATEWAY_ONLY
 assert.match(envExample, /^SUSHI_GATEWAY_TOKEN=/m, ".env.example still documents the gateway token");
 assert.match(envExample, /^ALLOWED_ORIGIN=/m, ".env.example still documents ALLOWED_ORIGIN");
 
+// ---- where SUSHI_GATEWAY_TOKEN is set, per target ---------------------------
+// The token is the one value every deployer has to carry from a platform
+// dashboard into Sushi, and each host keeps it somewhere different. The gateway
+// panel links to those places; these assertions keep those links pointing at the
+// same hosts the README and the deploy manifests name, so a doc reorganisation
+// on Railway's or Render's side shows up here instead of as a dead link in the UI.
+const RAILWAY_DASHBOARD = "https://railway.com/new";
+const RAILWAY_VARIABLES_DOCS = "https://docs.railway.com/variables";
+const RENDER_DASHBOARD = "https://dashboard.render.com";
+const RENDER_ENV_DOCS = "https://render.com/docs/configure-environment-variables";
+const RENDER_BLUEPRINT =
+  "https://render.com/deploy?repo=https://github.com/sarakplaystore/sushi";
+
+assert.ok(
+  modal.includes("export const GATEWAY_TOKEN_LINKS"),
+  "the gateway panel keeps one exported table of token locations"
+);
+// Every managed host gets its console *and* its env-var docs, so a user who has
+// not deployed yet can still read where the token will end up.
+for (const [name, href] of [
+  ["Railway dashboard", RAILWAY_DASHBOARD],
+  ["Railway variables docs", RAILWAY_VARIABLES_DOCS],
+  ["Render dashboard", RENDER_DASHBOARD],
+  ["Render environment docs", RENDER_ENV_DOCS],
+] as Array<[string, string]>) {
+  assert.ok(modal.includes(href), `gateway panel links to the ${name}`);
+  assert.ok(readme.includes(href), `README links to the ${name}`);
+}
+assert.ok(modal.includes(RENDER_BLUEPRINT), "the Render target links to the Blueprint deploy flow");
+assert.ok(readme.includes(RENDER_BLUEPRINT), "README links to the Render Blueprint deploy flow");
+
+// Nothing may link off to a host that is not one of the three gateway targets or
+// this repository, and no link may be relative (these all open in a new tab).
+const tokenSection = modal.slice(modal.indexOf("GATEWAY_TOKEN_LINKS"));
+for (const href of [...tokenSection.matchAll(/href: "([^"]+)"/g)].map((m) => m[1])) {
+  assert.ok(href.startsWith("https://"), `token link is absolute https: ${href}`);
+  assert.match(
+    href,
+    /^https:\/\/(railway\.com|docs\.railway\.com|render\.com|dashboard\.render\.com|github\.com\/sarakplaystore\/sushi)\b/,
+    `token link stays on a known host: ${href}`
+  );
+}
+// Every link in the panel leaves Sushi (a dashboard or the docs), so each one
+// has to open in its own tab and carry the rel that stops the opened page from
+// driving this one through window.opener.
+const anchors = [...modal.matchAll(/<a\s([\s\S]*?)>/g)].map((m) => m[1]);
+assert.ok(anchors.length >= 3, `the panel renders outbound links (${anchors.length} <a> elements)`);
+for (const attrs of anchors) {
+  assert.match(attrs, /href=(?:\{|["'`])/, `anchor has an href: ${attrs.slice(0, 60)}…`);
+  assert.match(attrs, /target="_blank"/, `anchor opens in a new tab: ${attrs.slice(0, 60)}…`);
+  const rel = /rel="([^"]+)"/.exec(attrs)?.[1] ?? "";
+  assert.ok(
+    rel.split(/\s+/).includes("noopener") && rel.split(/\s+/).includes("noreferrer"),
+    `anchor rel="${rel}" includes noopener noreferrer`
+  );
+}
+assert.ok(
+  modal.includes("Copy it from") && modal.includes("ExternalLink"),
+  "the token field says where the value comes from, with an outbound-link icon"
+);
+
+// Each target names itself in prose ("On Railway that secret lives in …"), so a
+// hardcoded two-way ternary here once called the VPS tab "Render". The sentence
+// has to be driven by the target list, not by an id comparison.
+assert.ok(
+  modal.includes("On {activeTarget.short} that secret lives in"),
+  "the token sentence takes the platform name from the selected target"
+);
+assert.ok(
+  !/deployTarget === "railway" \?/.test(modal),
+  "no hardcoded railway-or-render ternary left in the panel"
+);
+assert.ok(
+  modal.includes('activeTokenLinks[0].href'),
+  "the footer link comes from the same table as the token field's links"
+);
+for (const short of ['short: "a VPS"', 'short: "Railway"', 'short: "Render"']) {
+  assert.ok(modal.includes(short), `every target has a prose name (${short})`);
+}
+// Every target must say where its token lives, including the one with no dashboard.
+assert.ok(
+  /vps: \{\s*where: "/.test(modal) &&
+    /railway: \{\s*where: "/.test(modal) &&
+    /render: \{\s*where: "/.test(modal),
+  "all three targets document where SUSHI_GATEWAY_TOKEN is kept"
+);
+
+// The manifests and .env.example point at the same dashboards they name in the UI.
+assert.ok(read("render.yaml").includes(RENDER_DASHBOARD), "render.yaml says where to read the token");
+assert.ok(read("render.yaml").includes(RENDER_ENV_DOCS), "render.yaml links the env-var docs");
+assert.ok(read(".railway/railway.ts").includes(RAILWAY_DASHBOARD), ".railway/railway.ts links the Railway dashboard");
+assert.ok(
+  read(".railway/railway.ts").includes(RAILWAY_VARIABLES_DOCS),
+  ".railway/railway.ts links the Railway variables docs"
+);
+for (const href of [RAILWAY_DASHBOARD, RAILWAY_VARIABLES_DOCS, RENDER_DASHBOARD, RENDER_ENV_DOCS]) {
+  assert.ok(envExample.includes(href), `.env.example names ${href} next to SUSHI_GATEWAY_TOKEN`);
+}
+
 console.log("Gateway deployment target tests passed.");

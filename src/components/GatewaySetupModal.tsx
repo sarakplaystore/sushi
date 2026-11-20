@@ -12,6 +12,7 @@ import {
   Check,
   Radio,
   Zap,
+  ExternalLink,
 } from "lucide-react";
 import type { SystemCapabilities } from "@/types/connection";
 import {
@@ -79,8 +80,12 @@ const DEPLOY_TARGETS = [
   {
     id: "vps",
     label: "VPS / Docker",
+    /** How the target is named inside sentences. */
+    short: "a VPS",
     blurb:
       "Full Sushi + guacd on one Linux box: interactive PTY, team-shared shells and live RDP. Pick this when you already have a server.",
+    // No console to link to: the commands below are the whole setup.
+    link: null,
     blocks: [
       { id: "compose", title: "Full self-host (Docker Compose + guacd RDP)", code: DOCKER_COMPOSE_SNIPPET },
       { id: "gw", title: "Companion gateway only (pair with the Vercel UI)", code: GATEWAY_ONLY_SNIPPET },
@@ -89,8 +94,14 @@ const DEPLOY_TARGETS = [
   {
     id: "railway",
     label: "Railway",
+    short: "Railway",
     blurb:
       "Push this repo and .railway/railway.ts deploys sushi-gateway + guacd on Railway's private network — native PTY and guacd RDP with no server to maintain.",
+    link: {
+      label: "railway.com/new",
+      href: "https://railway.com/new",
+      title: "Open Railway and create the project that .railway/railway.ts describes",
+    },
     blocks: [
       { id: "railway-cli", title: "Railway CLI (two services from .railway/railway.ts)", code: RAILWAY_SNIPPET },
       { id: "railway-dash", title: "Railway dashboard (no CLI)", code: RAILWAY_DASHBOARD_SNIPPET },
@@ -99,13 +110,85 @@ const DEPLOY_TARGETS = [
   {
     id: "render",
     label: "Render",
+    short: "Render",
     blurb:
       "New + → Blueprint reads render.yaml and creates the sushi-gateway web service from Dockerfile.gateway. PTY over WebSocket; RDP uses the browser's IronRDP WASM client because Render services cannot address a guacd sidecar.",
+    link: {
+      label: "render.com/deploy",
+      href: "https://render.com/deploy?repo=https://github.com/sarakplaystore/sushi",
+      title: "Open Render's Blueprint flow for this repository (reads render.yaml)",
+    },
     blocks: [{ id: "render", title: "Render Blueprint (render.yaml)", code: RENDER_SNIPPET }],
   },
 ] as const;
 
 type DeployTargetId = (typeof DEPLOY_TARGETS)[number]["id"];
+
+/** One external link, rendered with the "leaves Sushi" affordances. */
+interface ExternalDocLink {
+  label: string;
+  href: string;
+  /** What the link is for, shown as the tooltip. */
+  title: string;
+}
+
+/**
+ * Where each gateway target keeps `SUSHI_GATEWAY_TOKEN` — the value that has to
+ * be copied into the field above. Every host stores it somewhere different
+ * (Railway's Variables tab, the value Render generated from `render.yaml`, a
+ * VPS `.env`), which is the part people actually get stuck on, so the token
+ * field links straight there instead of only naming the variable.
+ *
+ * Single source of truth on purpose: `tests/gateway-deploy.test.ts` reads these
+ * URLs and checks them against the README and `.env.example`, so a link cannot
+ * drift into a 404 in one place while the docs still point somewhere else.
+ */
+export const GATEWAY_TOKEN_LINKS: Record<
+  DeployTargetId,
+  { where: string; links: ExternalDocLink[] }
+> = {
+  vps: {
+    where: "the gateway's .env (or the environment of `npm run gateway`)",
+    links: [
+      {
+        label: ".env.example",
+        href: "https://github.com/sarakplaystore/sushi/blob/main/.env.example",
+        title: "SUSHI_GATEWAY_TOKEN as documented in the repository's .env.example",
+      },
+    ],
+  },
+  railway: {
+    where: "sushi-gateway → Variables",
+    links: [
+      {
+        label: "Railway dashboard",
+        href: "https://railway.com/new",
+        title: "Open Railway: your project's sushi-gateway service → Variables tab",
+      },
+      {
+        label: "Variables docs",
+        href: "https://docs.railway.com/variables",
+        title: "How Railway service variables work, and how to add or seal one",
+      },
+    ],
+  },
+  render: {
+    where: "sushi-gateway → Environment",
+    links: [
+      {
+        label: "Render dashboard",
+        href: "https://dashboard.render.com",
+        title: "Open Render: your sushi-gateway service → Environment tab",
+      },
+      {
+        label: "Environment docs",
+        href: "https://render.com/docs/configure-environment-variables",
+        title:
+          "Where Render shows the SUSHI_GATEWAY_TOKEN that render.yaml generated, and how to change it",
+      },
+    ],
+  },
+};
 
 export function GatewaySetupModal({
   isOpen,
@@ -160,6 +243,12 @@ export function GatewaySetupModal({
   }, [isOpen, keepAwake, gatewayUrl, gatewayToken]);
 
   if (!isOpen) return null;
+
+  /** The selected target, and where it keeps `SUSHI_GATEWAY_TOKEN`. */
+  const activeTarget =
+    DEPLOY_TARGETS.find((target) => target.id === deployTarget) ?? DEPLOY_TARGETS[0];
+  const activeTokenLocation = GATEWAY_TOKEN_LINKS[activeTarget.id];
+  const activeTokenLinks = activeTokenLocation.links;
 
   const copyText = (id: string, value: string) => {
     void copyTextToClipboard(value);
@@ -338,7 +427,8 @@ export function GatewaySetupModal({
               </div>
               <div>
                 <label className="mb-1 block text-[11px] text-slate-400">
-                  Gateway Token (SUSHI_GATEWAY_TOKEN)
+                  Gateway Token (
+                  <code className="font-mono-code text-slate-300">SUSHI_GATEWAY_TOKEN</code>)
                 </label>
                 <input
                   type="password"
@@ -349,6 +439,27 @@ export function GatewaySetupModal({
                 />
               </div>
             </div>
+
+            {/* Where the token you just pasted comes from, per gateway target. */}
+            <p className="flex flex-wrap items-baseline gap-x-1.5 gap-y-1 text-[11px] leading-relaxed text-slate-500">
+              <span>
+                Copy it from {activeTokenLocation.where}
+                {activeTokenLinks.length > 0 ? " —" : "."}
+              </span>
+              {activeTokenLinks.map((doc) => (
+                <a
+                  key={doc.href}
+                  href={doc.href}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  title={doc.title}
+                  className="inline-flex items-center gap-1 rounded-md border border-white/10 bg-white/5 px-1.5 py-0.5 text-[11px] text-sky-300 transition hover:border-sky-400/40 hover:bg-sky-500/10 hover:text-sky-200"
+                >
+                  {doc.label}
+                  <ExternalLink className="h-2.5 w-2.5" />
+                </a>
+              ))}
+            </p>
 
             <div className="flex items-center justify-between pt-1">
               <button
@@ -439,7 +550,24 @@ export function GatewaySetupModal({
 
             {DEPLOY_TARGETS.filter((target) => target.id === deployTarget).map((target) => (
               <div key={target.id} className="space-y-3">
-                <p className="text-xs leading-relaxed text-slate-400">{target.blurb}</p>
+                <p className="text-xs leading-relaxed text-slate-400">
+                  {target.blurb}
+                  {target.link && (
+                    <>
+                      {" "}
+                      <a
+                        href={target.link.href}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        title={target.link.title}
+                        className="inline-flex items-center gap-1 font-medium text-sky-300 underline decoration-sky-500/40 underline-offset-2 transition hover:text-sky-200"
+                      >
+                        {target.link.label}
+                        <ExternalLink className="h-3 w-3" />
+                      </a>
+                    </>
+                  )}
+                </p>
                 {target.blocks.map((block) => (
                   <div key={block.id} className="space-y-2">
                     <div className="flex items-center justify-between gap-2">
@@ -474,7 +602,23 @@ export function GatewaySetupModal({
               terminal resize and team-shared shells. Set{" "}
               <code className="text-slate-400">ALLOWED_ORIGIN</code> to this app's exact origin and{" "}
               <code className="text-slate-400">SUSHI_GATEWAY_TOKEN</code> to a fresh secret, then
-              paste both below.
+              paste both below.{" "}
+              {activeTokenLinks.length > 0 && (
+                <>
+                  On {activeTarget.short} that secret lives in{" "}
+                  <a
+                    href={activeTokenLinks[0].href}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    title={activeTokenLinks[0].title}
+                    className="inline-flex items-center gap-1 text-sky-400 underline decoration-sky-500/40 underline-offset-2 transition hover:text-sky-300"
+                  >
+                    {activeTokenLocation.where}
+                    <ExternalLink className="h-2.5 w-2.5" />
+                  </a>
+                  .
+                </>
+              )}
             </p>
           </div>
         </div>

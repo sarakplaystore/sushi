@@ -26,19 +26,29 @@ export function EnvironmentLoginGuide({ onRefreshStatus }: { onRefreshStatus: ()
         </div>
 
         <p className="text-xs leading-relaxed text-slate-300">
-          In your hosting project’s server-side environment settings, add these variables,
-          then redeploy. Use a long, unique password and never put secrets in
-          <code className="text-slate-200"> NEXT_PUBLIC_ </code> variables.
+          Import a private <code>.env</code> file from a local checkout linked to this
+          Vercel project. The deploy helper saves the admin settings securely and
+          starts a new production deployment:
+        </p>
+        <div className="overflow-x-auto rounded-lg border border-white/10 bg-white/5 px-3 py-2 font-mono text-xs text-slate-200">
+          npm run deploy:vercel -- --env-file .env
+        </div>
+        <p className="text-[11px] leading-relaxed text-slate-400">
+          For a fresh install with no vault to recover, use <code className="text-slate-200">npm run deploy:vercel -- --new</code> to
+          generate credentials in <code className="text-slate-200">.env.sushi.local</code>. An authenticated Vercel CLI
+          and linked project are required. Existing credentials are never overwritten;
+          ordinary Git deployments reuse the saved settings. See the{" "}
+          <a href="https://github.com/sarakplaystore/sushi#3-deploy-to-vercel--optional-companion-gateway-vps-railway-or-render" target="_blank" rel="noreferrer" className="underline underline-offset-2">setup guide</a>.
         </p>
         <div className="space-y-2 font-mono text-xs">
           <div className="rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-slate-200">SUSHI_AUTH_USERNAME</div>
-          <div className="rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-slate-200">SUSHI_AUTH_PASSWORD</div>
+          <div className="rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-slate-200">SUSHI_AUTH_PASSWORD <span className="font-sans text-slate-400">(or SUSHI_AUTH_PASSWORD_HASH)</span></div>
           <div className="rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-slate-200">SUSHI_AUTH_SECRET <span className="font-sans text-slate-400">(recommended; keep it stable)</span></div>
         </div>
         <p className="text-[11px] leading-relaxed text-slate-400">
-          Generate a random signing secret with <code className="text-slate-200">openssl rand -hex 32</code>.
-          Vercel vaults stay in this browser and do not sync to other devices; download
-          a portable encrypted backup before clearing browser data.
+          Keep the file private and never commit it. Vercel vaults stay in this browser
+          and do not sync to other devices; download a portable encrypted backup before
+          clearing browser data.
         </p>
         <p className="text-[11px] leading-relaxed text-amber-200">
           Upgrading an existing deployment? Back up its account and vault before

@@ -65,6 +65,17 @@ async function testGatewayGuide() {
     return found as HTMLButtonElement;
   };
   const click = async (label: string) => { await act(async () => { button(label).click(); await flush(); }); };
+  const tokenInput = () => {
+    const found = container.querySelector<HTMLInputElement>("#gateway-token");
+    assert(found);
+    return found;
+  };
+  const tokenToggle = () => {
+    const found = container.querySelector<HTMLButtonElement>('button[aria-controls="gateway-token"]');
+    assert(found);
+    return found;
+  };
+  const toggleToken = async () => { await act(async () => { tokenToggle().click(); await flush(); }); };
   const setInput = async (id: string, value: string) => {
     const input = container.querySelector<HTMLInputElement>(`#${id}`);
     assert(input, `input not found: ${id}`);
@@ -115,7 +126,27 @@ async function testGatewayGuide() {
     assert(guide().compareDocumentPosition(container.querySelector("#gateway-url")!) & dom.window.Node.DOCUMENT_POSITION_FOLLOWING);
     assert.equal((container.querySelector('label[for="gateway-url"]') as HTMLLabelElement)?.htmlFor, "gateway-url");
     assert.equal((container.querySelector('label[for="gateway-token"]') as HTMLLabelElement)?.htmlFor, "gateway-token");
-    assert.equal(container.querySelector<HTMLInputElement>("#gateway-token")?.type, "password");
+    assert.equal(tokenInput().type, "password", "the token is masked by default");
+    assert.equal(tokenInput().getAttribute("aria-describedby"), "gateway-token-visibility-note");
+    assert.equal(tokenToggle().type, "button");
+    assert.equal(tokenToggle().tabIndex, 0, "the visibility control is keyboard focusable");
+    assert.equal(tokenToggle().getAttribute("aria-label"), "Show gateway token");
+    assert.match(container.querySelector("#gateway-token-visibility-note")?.textContent || "", /cannot fetch a\s+token from the gateway host/i);
+    await setInput("gateway-token", "example+gateway/token==");
+    tokenToggle().focus();
+    assert.equal(dom.window.document.activeElement, tokenToggle());
+    await toggleToken();
+    assert.equal(dom.window.document.activeElement, tokenToggle(), "toggling keeps keyboard focus on the control");
+    assert.equal(tokenInput().type, "text", "the button reveals the token already in the field");
+    assert.equal(tokenInput().value, "example+gateway/token==");
+    assert.equal(tokenToggle().getAttribute("aria-label"), "Hide gateway token");
+    await toggleToken();
+    assert.equal(tokenInput().type, "password", "the same button masks it again");
+    assert.equal(tokenInput().value, "example+gateway/token==", "visibility does not edit the token");
+    assert.equal(calls.length, 0, "revealing a token never contacts a gateway or provider");
+    assert.equal(saves.length, 0, "revealing a token does not save settings");
+    assert.equal(clipboard.length, 0, "revealing a token does not copy it to the clipboard");
+    await setInput("gateway-token", "");
     assert.match(guide().textContent || "", /https:\/\/sushi\.example\.test/);
     assert.match(guide().textContent || "", /https:\/\/sushi-lyart-three\.vercel\.app/);
     assert.match(guide().textContent || "", /only\s+when\s+ALLOWED_ORIGIN\s+is absent/i);
@@ -162,6 +193,14 @@ async function testGatewayGuide() {
     // capabilities that were probed for the previously saved URL or token.
     await render({ gatewayUrl: "https://old.onrender.com", gatewayToken: "old-test-token" }, gatewayCaps);
     assert.equal(button("Render").getAttribute("aria-pressed"), "true");
+    assert.equal(tokenInput().type, "password", "saved tokens start masked");
+    await toggleToken();
+    assert.equal(tokenInput().type, "text");
+    assert.equal(tokenInput().value, "old-test-token", "the saved token can be revealed locally");
+    await render({ gatewayUrl: "https://old.onrender.com", gatewayToken: "updated-test-token" }, gatewayCaps);
+    assert.equal(tokenInput().type, "password", "changed saved settings are masked again");
+    assert.equal(tokenInput().value, "updated-test-token");
+    await render({ gatewayUrl: "https://old.onrender.com", gatewayToken: "old-test-token" }, gatewayCaps);
     assert.match(container.textContent || "", /Gateway advertises PTY/);
     const pendingOld = deferred<Response>();
     replies.push(() => pendingOld.promise);
@@ -200,6 +239,13 @@ async function testGatewayGuide() {
     assert.equal(button("Close").disabled, true);
     assert.equal(dialog.querySelector<HTMLButtonElement>('button[aria-label="Close gateway settings"]')?.disabled, true);
     assert.equal(container.querySelector<HTMLInputElement>("#gateway-url")?.disabled, true);
+    assert.equal(tokenToggle().disabled, false, "visibility remains controllable while probing");
+    const callsBeforeToggle = calls.length;
+    await toggleToken();
+    assert.equal(tokenInput().type, "text");
+    await toggleToken();
+    assert.equal(tokenInput().type, "password", "a token can be hidden during a slow probe");
+    assert.equal(calls.length, callsBeforeToggle, "the visibility control does not start another probe");
     assert.equal(calls.at(-1)?.url, "https://new.onrender.com/api/system/capabilities");
     assert.equal(calls.at(-1)?.init?.headers, undefined, "the public test does not send account or gateway tokens");
     assert.equal(calls.at(-1)?.init?.credentials, "omit", "nor does it send browser cookies");
@@ -215,6 +261,12 @@ async function testGatewayGuide() {
     assert.match(container.textContent || "", /does not verify the token or WebSocket/);
     assert.match(container.textContent || "", /Gateway advertises PTY/);
     assert.doesNotMatch(container.textContent || "", /Connected to GATEWAY Gateway/);
+    const callsBeforeReveal = calls.length;
+    await toggleToken();
+    assert.equal(tokenInput().value, "test-gateway-token");
+    assert.match(container.textContent || "", /HTTP endpoint reached/, "visibility does not invalidate a successful probe");
+    assert.equal(calls.length, callsBeforeReveal);
+    await toggleToken();
 
     await setInput("gateway-token", "");
     assert.doesNotMatch(container.textContent || "", /HTTP endpoint reached/);
@@ -229,6 +281,8 @@ async function testGatewayGuide() {
 
     replies.push(async () => response(gatewayCaps));
     await click("Test Gateway Endpoint");
+    await toggleToken();
+    assert.equal(tokenInput().type, "text", "save is exercised with the token revealed");
     const requestsBeforeSave = calls.length;
     await click("Save Gateway Settings");
     assert.equal(calls.length, requestsBeforeSave, "saving a just-tested URL does not repeat the HTTP probe");
@@ -239,7 +293,11 @@ async function testGatewayGuide() {
     });
     assert.equal(closed, 1);
     assert.equal(dom.window.localStorage.getItem("sushi_encrypted_vault_v1"), "existing-vault-must-not-change");
+    assert.equal(tokenInput().type, "password", "saving masks the token");
+    await toggleToken();
     await click("Reset to Same-Origin");
+    assert.equal(tokenInput().type, "password", "reset masks the token before new input");
+    assert.equal(tokenInput().value, "");
     await click("Test Gateway Endpoint");
     assert.doesNotMatch(container.textContent || "", /Attached gateway:|Gateway advertises PTY/,
       "testing same-origin settings must not present local capabilities as a remote gateway");
@@ -304,6 +362,21 @@ async function testGatewayGuide() {
     assert.equal(dom.window.document.activeElement, mobileNavigation, "closing the dialog restores focus to visible mobile navigation");
     hiddenSettings.remove();
     mobileNavigation.remove();
+
+    // A revealed token must not remain visible when the persistent modal is reopened.
+    const reopenedSettings = { gatewayUrl: "https://gateway.example.test", gatewayToken: "saved-token-for-reopen" };
+    await render(reopenedSettings);
+    await toggleToken();
+    assert.equal(tokenInput().type, "text");
+    await act(async () => {
+      root.render(<GatewaySetupModal isOpen={false} localCapabilities={localCaps} gatewaySettings={reopenedSettings} onClose={() => {}} onSaveSettings={() => {}} />);
+      await flush();
+    });
+    assert.equal(container.querySelector("#gateway-token"), null);
+    await render(reopenedSettings);
+    assert.equal(tokenInput().type, "password", "reopening always masks the saved token");
+    assert.equal(tokenInput().value, "saved-token-for-reopen", "hiding the token does not remove it");
+    assert.equal(tokenToggle().getAttribute("aria-label"), "Show gateway token");
   } finally {
     await act(async () => { root.unmount(); await flush(); });
     globalThis.fetch = oldFetch;

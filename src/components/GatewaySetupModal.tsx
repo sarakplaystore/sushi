@@ -10,6 +10,8 @@ import {
   Loader2,
   Copy,
   Check,
+  Eye,
+  EyeOff,
   Radio,
   Zap,
   ExternalLink,
@@ -267,6 +269,7 @@ export function GatewaySetupModal({
 }: GatewaySetupModalProps) {
   const [gatewayUrl, setGatewayUrl] = useState(gatewaySettings.gatewayUrl);
   const [gatewayToken, setGatewayToken] = useState(gatewaySettings.gatewayToken);
+  const [showGatewayToken, setShowGatewayToken] = useState(false);
   const [probing, setProbing] = useState(false);
   const [hasProbedGateway, setHasProbedGateway] = useState(false);
   const dialogRef = useRef<HTMLDivElement>(null);
@@ -283,6 +286,8 @@ export function GatewaySetupModal({
   const [keepAwake, setKeepAwake] = useState(false);
 
   useEffect(() => {
+    // Never carry a revealed token into another visit or changed saved settings.
+    setShowGatewayToken(false);
     if (!isOpen) return;
     setGatewayUrl(gatewaySettings.gatewayUrl);
     setGatewayToken(gatewaySettings.gatewayToken);
@@ -441,6 +446,7 @@ export function GatewaySetupModal({
       },
       remoteCaps
     );
+    setShowGatewayToken(false);
     onClose();
   };
 
@@ -616,7 +622,7 @@ export function GatewaySetupModal({
                   autoCapitalize="none"
                   autoCorrect="off"
                   spellCheck={false}
-                  className="font-mono-code w-full rounded-xl border border-white/10 bg-[#0b0e14] px-3.5 py-2 text-xs text-white placeholder-slate-600 outline-none focus:border-white/25 disabled:opacity-60"
+                  className="font-mono-code h-11 w-full rounded-xl border border-white/10 bg-[#0b0e14] px-3.5 py-2 text-xs text-white placeholder-slate-600 outline-none focus:border-white/25 disabled:opacity-60"
                 />
               </div>
               <div>
@@ -624,19 +630,32 @@ export function GatewaySetupModal({
                   Gateway Token (
                   <code className="font-mono-code text-slate-300">SUSHI_GATEWAY_TOKEN</code>)
                 </label>
-                <input
-                  id="gateway-token"
-                  type="password"
-                  value={gatewayToken}
-                  disabled={probing}
-                  onChange={(e) => { setGatewayToken(e.target.value); setProbeStatus(null); }}
-                  placeholder="Matching gateway token"
-                  autoComplete="off"
-                  autoCapitalize="none"
-                  autoCorrect="off"
-                  spellCheck={false}
-                  className="font-mono-code w-full rounded-xl border border-white/10 bg-[#0b0e14] px-3.5 py-2 text-xs text-white placeholder-slate-600 outline-none focus:border-white/25 disabled:opacity-60"
-                />
+                <div className="relative">
+                  <input
+                    id="gateway-token"
+                    type={showGatewayToken ? "text" : "password"}
+                    aria-describedby="gateway-token-visibility-note"
+                    value={gatewayToken}
+                    disabled={probing}
+                    onChange={(e) => { setGatewayToken(e.target.value); setProbeStatus(null); }}
+                    placeholder="Matching gateway token"
+                    autoComplete="off"
+                    autoCapitalize="none"
+                    autoCorrect="off"
+                    spellCheck={false}
+                    className="font-mono-code h-11 w-full rounded-xl border border-white/10 bg-[#0b0e14] py-2 pl-3.5 pr-12 text-xs text-white placeholder-slate-600 outline-none focus:border-white/25 disabled:opacity-60"
+                  />
+                  <button
+                    type="button"
+                    aria-controls="gateway-token"
+                    aria-label={showGatewayToken ? "Hide gateway token" : "Show gateway token"}
+                    title={showGatewayToken ? "Hide gateway token" : "Show gateway token"}
+                    onClick={() => setShowGatewayToken((visible) => !visible)}
+                    className="absolute inset-y-0 right-0 flex w-11 items-center justify-center rounded-r-xl text-slate-400 transition hover:text-white focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-sky-300"
+                  >
+                    {showGatewayToken ? <EyeOff aria-hidden="true" className="h-4 w-4" /> : <Eye aria-hidden="true" className="h-4 w-4" />}
+                  </button>
+                </div>
               </div>
             </div>
 
@@ -659,6 +678,10 @@ export function GatewaySetupModal({
                   <ExternalLink className="h-2.5 w-2.5" />
                 </a>
               ))}
+            </p>
+            <p id="gateway-token-visibility-note" className="text-[11px] leading-relaxed text-slate-500">
+              The show button reveals only the token entered in this browser; it cannot fetch a
+              token from the gateway host.
             </p>
 
             <p className="text-[11px] leading-relaxed text-slate-400">
@@ -692,6 +715,7 @@ export function GatewaySetupModal({
                   onClick={() => {
                     setGatewayUrl("");
                     setGatewayToken("");
+                    setShowGatewayToken(false);
                     setProbeStatus(null);
                   }}
                   className="text-xs text-slate-400 hover:text-white disabled:opacity-50"

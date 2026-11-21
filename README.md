@@ -641,8 +641,9 @@ and the [Firestore migration instructions](#migrate-an-existing-disk-or-redis-st
    do not append `/ws/ssh` or use a private/`guacd` address. Click **Test Gateway Endpoint**,
    save, and open an SSH session. The test checks public HTTP capabilities only, without sending
    credentials—it does not validate the token or prove that a WebSocket session works. Only use a
-   trusted gateway; Sushi saves the token in this browser's local storage. If a token is sealed or
-   hidden, use a previously saved copy; if you no longer have it, generate and deploy a new strong
+   trusted gateway; Sushi saves the token in this browser's local storage. The show button reveals
+   only the token entered here; it cannot retrieve a token from the gateway host. If a token is sealed
+   or hidden, use a previously saved copy; if you no longer have it, generate and deploy a new strong
    token and update every gateway client. Never share it in chat or commit it. Some RDP WebSocket
    URLs contain tokens in query parameters: configure proxies and monitoring not to log query
    strings or credentials.

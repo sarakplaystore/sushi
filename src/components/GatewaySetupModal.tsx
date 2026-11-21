@@ -100,8 +100,9 @@ const RAILWAY_DASHBOARD_SNIPPET = `# Railway without the CLI: New Project → Gi
 #      = Dockerfile.gateway   (the root Dockerfile builds the whole app instead)
 # 2. + New → Docker Image → guacamole/guacd:1.5.5   (name it "guacd")
 # 3. Variables: GUACD_HOST = guacd's RAILWAY_PRIVATE_DOMAIN.
-#    Generate a token locally with openssl rand -hex 24; paste its output (not
-#    the command) as SUSHI_GATEWAY_TOKEN. The dashboard does not auto-generate it.
+#    If SUSHI_GATEWAY_TOKEN is absent, generate it in the Sushi panel above,
+#    then copy it into Railway as a new SUSHI_GATEWAY_TOKEN variable. Sushi
+#    does not write to Railway. Never overwrite an existing or sealed token.
 #    ALLOWED_ORIGIN defaults to ${DEFAULT_GATEWAY_ALLOWED_ORIGIN} if absent;
 #    add it to Variables only if your Sushi frontend uses a different origin.
 # 4. Settings → Networking → Generate Domain → paste it below`;
@@ -292,6 +293,10 @@ export function GatewaySetupModal({
   const [gatewayUrl, setGatewayUrl] = useState(gatewaySettings.gatewayUrl);
   const [gatewayToken, setGatewayToken] = useState(gatewaySettings.gatewayToken);
   const [showGatewayToken, setShowGatewayToken] = useState(false);
+  const [confirmedTokenAbsent, setConfirmedTokenAbsent] = useState(false);
+  const [generatedToken, setGeneratedToken] = useState(false);
+  const [tokenGenerationError, setTokenGenerationError] = useState<string | null>(null);
+  const [saveError, setSaveError] = useState<string | null>(null);
   const [probing, setProbing] = useState(false);
   const [hasProbedGateway, setHasProbedGateway] = useState(false);
   const dialogRef = useRef<HTMLDivElement>(null);
@@ -304,6 +309,8 @@ export function GatewaySetupModal({
   const [copyResult, setCopyResult] = useState<{ id: string; ok: boolean } | null>(null);
   const copyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const copyRequestRef = useRef(0);
+  // Protect against two clicks before React has rendered the first new token.
+  const tokenGenerationLockRef = useRef(false);
   const mountedRef = useRef(false);
   const [deployTarget, setDeployTarget] = useState<DeployTargetId>("railway");
   const [appOrigin, setAppOrigin] = useState("");
@@ -320,9 +327,23 @@ export function GatewaySetupModal({
   }, []);
 
   useEffect(() => {
-    // Never carry a revealed token into another visit or changed saved settings.
+    // Never carry a revealed or unsaved generated token into another visit.
     setShowGatewayToken(false);
-    if (!isOpen) return;
+    setConfirmedTokenAbsent(false);
+    setGeneratedToken(false);
+    setTokenGenerationError(null);
+    setSaveError(null);
+    tokenGenerationLockRef.current = false;
+    copyRequestRef.current += 1;
+    if (copyTimerRef.current !== null) {
+      clearTimeout(copyTimerRef.current);
+      copyTimerRef.current = null;
+    }
+    setCopyResult(null);
+    if (!isOpen) {
+      setGatewayToken(gatewaySettings.gatewayToken);
+      return;
+    }
     setGatewayUrl(gatewaySettings.gatewayUrl);
     setGatewayToken(gatewaySettings.gatewayToken);
     setProbeStatus(null);
@@ -331,7 +352,7 @@ export function GatewaySetupModal({
     setOriginCopyState("idle");
     const detectedTarget = targetFromGatewayUrl(gatewaySettings.gatewayUrl);
     if (detectedTarget) setDeployTarget(detectedTarget);
-  }, [isOpen, gatewaySettings]);
+  }, [isOpen, gatewaySettings.gatewayUrl, gatewaySettings.gatewayToken]);
 
   useEffect(() => {
     if (!isOpen) return;
@@ -421,9 +442,43 @@ export function GatewaySetupModal({
     }, 1800);
   };
 
+  const clearCopyFeedback = () => {
+    copyRequestRef.current += 1;
+    if (copyTimerRef.current !== null) {
+      clearTimeout(copyTimerRef.current);
+      copyTimerRef.current = null;
+    }
+    setCopyResult(null);
+  };
+
   const copyAppOrigin = async () => {
     if (!appOrigin) return;
     setOriginCopyState(await copyTextToClipboard(appOrigin) ? "copied" : "failed");
+  };
+
+  const generateGatewayToken = () => {
+    // This is only for a confirmed missing token. Never replace a typed or
+    // previously saved value, and never generate while a probe is in flight.
+    if (!confirmedTokenAbsent || gatewayToken.length > 0 ||
+        gatewaySettings.gatewayToken.length > 0 || probing || tokenGenerationLockRef.current) return;
+    tokenGenerationLockRef.current = true;
+    try {
+      if (!window.isSecureContext || !window.crypto?.getRandomValues) throw new Error();
+      const bytes = new Uint8Array(24);
+      window.crypto.getRandomValues(bytes);
+      const token = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+      bytes.fill(0);
+      clearCopyFeedback();
+      setGatewayToken(token);
+      setShowGatewayToken(true);
+      setGeneratedToken(true);
+      setTokenGenerationError(null);
+      setProbeStatus(null);
+    } catch {
+      tokenGenerationLockRef.current = false;
+      // No Math.random fallback: failure must never create a predictable token.
+      setTokenGenerationError("Secure random generation is unavailable. Open Sushi over HTTPS in a modern browser; no token was created.");
+    }
   };
 
   const probeGateway = async (): Promise<SystemCapabilities | null> => {
@@ -472,6 +527,7 @@ export function GatewaySetupModal({
   };
 
   const handleSave = async () => {
+    setSaveError(null);
     const trimmed = gatewayUrl.trim();
     let remoteCaps: SystemCapabilities | null = null;
     if (trimmed) {
@@ -479,13 +535,19 @@ export function GatewaySetupModal({
       // the user wait for a second cold-start-prone request when saving.
       remoteCaps = probeStatus?.ok && probeStatus.caps ? probeStatus.caps : await probeGateway();
     }
-    onSaveSettings(
-      {
-        gatewayUrl: trimmed,
-        gatewayToken: gatewayToken.trim(),
-      },
-      remoteCaps
-    );
+    try {
+      onSaveSettings(
+        {
+          gatewayUrl: trimmed,
+          gatewayToken: gatewayToken.trim(),
+        },
+        remoteCaps
+      );
+    } catch {
+      // Keep the value in the form for a private copy/retry; never log it.
+      setSaveError("Could not save gateway settings in this browser. Keep this panel open, copy your token privately, and check browser storage before retrying.");
+      return;
+    }
     setShowGatewayToken(false);
     onClose();
   };
@@ -562,7 +624,14 @@ export function GatewaySetupModal({
                 <button
                   key={target.id}
                   type="button"
-                  onClick={() => setDeployTarget(target.id)}
+                  onClick={() => {
+                    if (deployTarget !== target.id) {
+                      setConfirmedTokenAbsent(false);
+                      setTokenGenerationError(null);
+                      clearCopyFeedback();
+                    }
+                    setDeployTarget(target.id);
+                  }}
                   aria-pressed={deployTarget === target.id}
                   className={`rounded-lg border px-3 py-2 text-xs font-medium transition focus-visible:outline-2 focus-visible:outline-sky-300 ${
                     deployTarget === target.id
@@ -647,8 +716,8 @@ export function GatewaySetupModal({
             <div className="text-xs font-semibold text-white">
               Remote WebSocket Gateway (optional)
             </div>
-            <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
-              <div className="sm:col-span-2">
+            <div className="grid grid-cols-1 gap-3">
+              <div>
                 <label htmlFor="gateway-url" className="mb-1 block text-[11px] text-slate-400">
                   Gateway URL (leave blank to use same-origin server)
                 </label>
@@ -657,7 +726,13 @@ export function GatewaySetupModal({
                   type="text"
                   value={gatewayUrl}
                   disabled={probing}
-                  onChange={(e) => { setGatewayUrl(e.target.value); setProbeStatus(null); }}
+                  onChange={(e) => {
+                    setGatewayUrl(e.target.value);
+                    setProbeStatus(null);
+                    setConfirmedTokenAbsent(false);
+                    setTokenGenerationError(null);
+                    clearCopyFeedback();
+                  }}
                   placeholder={postDeployGuide.example}
                   autoCapitalize="none"
                   autoCorrect="off"
@@ -677,7 +752,15 @@ export function GatewaySetupModal({
                     aria-describedby="gateway-token-visibility-note"
                     value={gatewayToken}
                     disabled={probing}
-                    onChange={(e) => { setGatewayToken(e.target.value); setProbeStatus(null); }}
+                    onChange={(e) => {
+                      setGatewayToken(e.target.value);
+                      if (!e.target.value) tokenGenerationLockRef.current = false;
+                      setProbeStatus(null);
+                      setConfirmedTokenAbsent(false);
+                      setGeneratedToken(false);
+                      setTokenGenerationError(null);
+                      clearCopyFeedback();
+                    }}
                     placeholder="Matching gateway token"
                     autoComplete="off"
                     autoCapitalize="none"
@@ -724,6 +807,85 @@ export function GatewaySetupModal({
               token from the gateway host.
             </p>
 
+            <section aria-labelledby="gateway-token-generator-title" className="space-y-2.5 rounded-lg border border-amber-400/20 bg-amber-400/5 p-3">
+              <h4 id="gateway-token-generator-title" className="text-xs font-semibold text-amber-100">
+                Need a new gateway token?
+              </h4>
+              <p className="text-[11px] leading-relaxed text-slate-300">
+                Generate one here only if the gateway has no <code>SUSHI_GATEWAY_TOKEN</code>.
+                A sealed or hidden variable still counts as existing; if present, use your saved
+                value instead. Replacing an existing token can break other clients; they would all
+                need to be updated.
+              </p>
+              <label className="flex items-start gap-2 text-[11px] leading-relaxed text-slate-300">
+                <input
+                  id="gateway-token-absent"
+                  type="checkbox"
+                  checked={confirmedTokenAbsent}
+                  disabled={probing}
+                  onChange={(event) => {
+                    setConfirmedTokenAbsent(event.target.checked);
+                    setTokenGenerationError(null);
+                    clearCopyFeedback();
+                  }}
+                  className="mt-0.5 h-3.5 w-3.5 shrink-0 accent-[#ff6b57]"
+                />
+                <span>I checked this gateway service on {activeTarget.short}: <code>SUSHI_GATEWAY_TOKEN</code> is absent (not sealed or hidden).</span>
+              </label>
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={generateGatewayToken}
+                  disabled={!confirmedTokenAbsent || gatewayToken.length > 0 || gatewaySettings.gatewayToken.length > 0 || probing}
+                  className="rounded-lg border border-amber-300/30 bg-amber-400/10 px-3 py-1.5 text-xs font-medium text-amber-100 hover:bg-amber-400/20 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-amber-200 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  Generate and show token
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void copyText("gateway-token", gatewayToken)}
+                  disabled={!gatewayToken || (generatedToken && !confirmedTokenAbsent)}
+                  className="inline-flex items-center gap-1 rounded-lg border border-white/12 bg-white/5 px-3 py-1.5 text-xs font-medium text-slate-200 hover:bg-white/10 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-300 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  <Copy aria-hidden="true" className="h-3.5 w-3.5" /> Copy token
+                </button>
+              </div>
+              {(gatewayToken.length > 0 || gatewaySettings.gatewayToken.length > 0) && !generatedToken && (
+                <p className="text-[11px] leading-relaxed text-slate-400">
+                  A token is already entered or saved here, so generation is disabled to avoid replacing it.
+                </p>
+              )}
+              {tokenGenerationError && <p role="alert" className="text-[11px] text-rose-300">{tokenGenerationError}</p>}
+              <p role="status" aria-live="polite" className="text-[11px] leading-relaxed text-slate-300">
+                {copyResult?.id === "gateway-token"
+                  ? copyResult.ok
+                    ? "Token copied to your clipboard. Paste it privately into your gateway, not chat."
+                    : "Could not copy. Show the token above, then select and copy it manually."
+                  : generatedToken
+                    ? confirmedTokenAbsent
+                      ? `Token generated and ${showGatewayToken ? "shown" : "hidden"} in the field above. It is not saved or configured on the gateway yet.`
+                      : "Confirm this gateway has no token before copying the generated value."
+                    : "Sushi generates the token locally; it does not contact a provider or change the gateway."}
+              </p>
+              {generatedToken && (
+                <ol className="list-decimal space-y-1 pl-4 text-[11px] leading-relaxed text-slate-300">
+                  <li>
+                    Copy the token. On {activeTarget.short}, open {activeTokenLocation.where} and add
+                    <code> SUSHI_GATEWAY_TOKEN</code> with that exact value. If it already exists, stop; do not overwrite it.
+                  </li>
+                  <li>
+                    Deploy or restart the gateway. For a separate gateway, enter its public HTTPS address
+                    in Gateway URL above, then save these settings and open a real SSH session to verify
+                    the token and WebSocket.
+                  </li>
+                  <li>
+                    Until saved, closing this panel discards the new token. After saving, it is stored
+                    in this browser’s local storage. Never share it in chat.
+                  </li>
+                </ol>
+              )}
+            </section>
+
             <p className="text-[11px] leading-relaxed text-slate-400">
               Paste the public address and matching token above, then test and save. The test checks
               the HTTP capabilities endpoint only; it does not verify the token or WebSocket. Open
@@ -756,6 +918,11 @@ export function GatewaySetupModal({
                     setGatewayUrl("");
                     setGatewayToken("");
                     setShowGatewayToken(false);
+                    tokenGenerationLockRef.current = false;
+                    setConfirmedTokenAbsent(false);
+                    setGeneratedToken(false);
+                    setTokenGenerationError(null);
+                    clearCopyFeedback();
                     setProbeStatus(null);
                   }}
                   className="text-xs text-slate-400 hover:text-white disabled:opacity-50"
@@ -767,6 +934,7 @@ export function GatewaySetupModal({
 
             <label className="flex cursor-pointer items-start gap-2.5 rounded-lg border border-white/8 bg-[#0b0e14] px-3 py-2.5">
               <input
+                id="gateway-keep-awake"
                 type="checkbox"
                 checked={keepAwake}
                 onChange={(e) => setKeepAwake(e.target.checked)}
@@ -992,6 +1160,7 @@ export function GatewaySetupModal({
         </div>
 
         <div className="flex flex-wrap items-center justify-end gap-2.5 border-t border-white/8 bg-[#0b0e14] px-4 py-3 sm:px-6 sm:py-4">
+          {saveError && <p role="alert" className="w-full text-xs leading-relaxed text-rose-300">{saveError}</p>}
           <button
             type="button"
             onClick={onClose}

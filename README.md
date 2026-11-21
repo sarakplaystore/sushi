@@ -591,10 +591,14 @@ and the [Firestore migration instructions](#migrate-an-existing-disk-or-redis-st
    Without the CLI: [*New Project → GitHub Repo → this repository*](https://railway.com/new), set
    **Settings → Build Configuration → Dockerfile Path** to `Dockerfile.gateway`, add a second
    service from the Docker image `guacamole/guacd:1.5.5`, and point `GUACD_HOST` at that service's
-   `RAILWAY_PRIVATE_DOMAIN`. For a new gateway, generate a token locally with
-   `openssl rand -hex 24` and paste the **output**, not the command, into the gateway's
-   `SUSHI_GATEWAY_TOKEN` variable. This dashboard-only route is manual. Add `ALLOWED_ORIGIN`
-   if you need to override the default, then **Generate Domain** and deploy the changes.
+   `RAILWAY_PRIVATE_DOMAIN`. If the gateway has no `SUSHI_GATEWAY_TOKEN`, Sushi's **Settings →
+   Gateway** panel can generate and show a 24-byte random hex token locally in an HTTPS browser.
+   Confirm the variable is absent (a sealed token counts as existing), generate and copy the value,
+   then add it as `SUSHI_GATEWAY_TOKEN` under the gateway service's **Variables**. Alternatively,
+   run `openssl rand -hex 24` on a trusted machine and privately paste its output into both places.
+   This route requires a private paste: Sushi cannot write Railway variables automatically. Never
+   replace an existing token unintentionally. Add `ALLOWED_ORIGIN` if you need to override the
+   default, then **Generate Domain** and deploy the changes.
 
    **Render**: *New + → Blueprint → this repository* (or the [Deploy to Render button](https://render.com/deploy?repo=https://github.com/sarakplaystore/sushi)
    above). `render.yaml` builds `Dockerfile.gateway`; Render creates and retains a **256-bit base64**
@@ -652,9 +656,13 @@ and the [Firestore migration instructions](#migrate-an-existing-disk-or-redis-st
    save, and open an SSH session. The test checks public HTTP capabilities only, without sending
    credentials—it does not validate the token or prove that a WebSocket session works. Only use a
    trusted gateway; Sushi saves the token in this browser's local storage. The show button reveals
-   only the token entered here; it cannot retrieve a token from the gateway host. If a token is sealed
-   or hidden, use a previously saved copy; if you no longer have it, generate and deploy a new strong
-   token and update every gateway client. Never share it in chat or commit it. Some RDP WebSocket
+   only the token entered here; it cannot retrieve a token from the gateway host. When the gateway
+   token is absent, the panel's **Generate and show token** button uses browser cryptographic randomness
+   and leaves the value in the form; it neither contacts the provider nor saves or copies it until you
+   choose to do so. Add the exact same value to the gateway and deploy its changes. Generation is
+   disabled while a token is entered or saved here. If a token is sealed or hidden, use a previously
+   saved copy; if you no longer have it, deliberately rotate it on the gateway and update every client.
+   Never share it in chat or commit it. Some RDP WebSocket
    URLs contain tokens in query parameters: configure proxies and monitoring not to log query
    strings or credentials.
 

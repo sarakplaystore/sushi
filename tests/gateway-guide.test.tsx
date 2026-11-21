@@ -250,7 +250,7 @@ async function testGatewayGuide() {
     await setInput("gateway-token", "test-gateway-token");
     assert(!container.textContent?.includes("test-gateway-token"), "the token is never rendered as visible text");
     assert.equal(dom.window.localStorage.getItem("sushi_encrypted_vault_v1"), "existing-vault-must-not-change");
-    const keepAwake = container.querySelector<HTMLInputElement>('input[type="checkbox"]');
+    const keepAwake = container.querySelector<HTMLInputElement>("#gateway-keep-awake");
     assert(keepAwake);
     replies.push(async () => response(gatewayCaps));
     await act(async () => { keepAwake.click(); await flush(); });

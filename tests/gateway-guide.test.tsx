@@ -3,6 +3,7 @@ import React, { act } from "react";
 import { JSDOM } from "jsdom";
 import type { SystemCapabilities } from "../src/types/connection";
 import type { GatewaySettings } from "../src/lib/client/gateway";
+import railwayTemplateVariables from "../.railway/gateway-template-variables.json";
 
 const localCaps: SystemCapabilities = {
   mode: "vercel", websocketSsh: false, serverlessSshExec: true, serverlessSftp: true,
@@ -157,6 +158,33 @@ async function testGatewayGuide() {
     assert.match(guide().textContent || "", /set and\s+deploy it on the gateway, then update all gateway clients/i);
     assert.match(container.textContent || "", /asleep, open its public URL in another tab/i);
     assert.equal(calls.length, 0, "viewing the guide does not contact a provider or alter a service");
+
+    const deploymentDetails = container.querySelector<HTMLDetailsElement>("details");
+    assert(deploymentDetails);
+    deploymentDetails.open = true;
+    assert.match(deploymentDetails.textContent || "", /template must first be created in Railway/i);
+    assert.match(deploymentDetails.textContent || "", /NOT an existing service/i);
+    assert.match(deploymentDetails.textContent || "", /will not fill the separately hosted Sushi UI/i);
+    assert(deploymentDetails.querySelector('a[href="https://railway.com/workspace/templates"][target="_blank"]'));
+    const copyTemplate = deploymentDetails.querySelector<HTMLButtonElement>('button[aria-label="Copy Template variables (JSON)"]');
+    assert(copyTemplate);
+    const shownJson = copyTemplate.closest("div.space-y-2")?.querySelector("pre")?.textContent;
+    assert.equal(shownJson, JSON.stringify(railwayTemplateVariables, null, 2), "the panel displays the checked-in template variables");
+    await act(async () => { copyTemplate.click(); await flush(); });
+    assert.deepEqual(clipboard, [shownJson], "copy the symbolic defaults, not a real gateway token");
+    assert.equal(copyTemplate.getAttribute("aria-label"), "Copied Template variables (JSON)");
+    Object.defineProperty(dom.window.navigator, "clipboard", { configurable: true, value: { writeText: async () => { throw new Error("denied"); } } });
+    await act(async () => { copyTemplate.click(); await flush(); });
+    assert.equal(copyTemplate.getAttribute("aria-label"), "Could not copy Template variables (JSON)", "a denied clipboard is not reported as copied");
+    assert.match(copyTemplate.title, /select the text/i);
+    Object.defineProperty(dom.window.navigator, "clipboard", {
+      configurable: true, value: { writeText: async (text: string) => { clipboard.push(text); } },
+    });
+    assert.equal(tokenInput().value, "", "copying template settings does not populate or rotate the gateway token");
+    assert.equal(saves.length, 0);
+    assert.equal(calls.length, 0, "copying the recipe does not contact Railway or change a deployment");
+    clipboard.length = 0;
+    deploymentDetails.open = false;
 
     await click("Copy Sushi origin");
     assert.deepEqual(clipboard, ["https://sushi.example.test"], "copy the origin, not the page path or a token");

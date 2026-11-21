@@ -117,6 +117,9 @@ async function testGatewayGuide() {
     assert.equal((container.querySelector('label[for="gateway-token"]') as HTMLLabelElement)?.htmlFor, "gateway-token");
     assert.equal(container.querySelector<HTMLInputElement>("#gateway-token")?.type, "password");
     assert.match(guide().textContent || "", /https:\/\/sushi\.example\.test/);
+    assert.match(guide().textContent || "", /https:\/\/sushi-lyart-three\.vercel\.app/);
+    assert.match(guide().textContent || "", /only\s+when\s+ALLOWED_ORIGIN\s+is absent/i);
+    assert.match(guide().textContent || "", /Existing overrides are kept/i);
     assert.match(guide().textContent || "", /without\s+\/ws\/ssh/i);
     assert.match(guide().textContent || "", /local storage/i);
     assert.match(guide().textContent || "", /sealed or hidden/i);

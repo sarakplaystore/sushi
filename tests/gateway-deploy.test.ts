@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { parse as parseYaml } from "yaml";
+import { DEFAULT_GATEWAY_ALLOWED_ORIGIN } from "../src/lib/gateway-defaults.mjs";
 
 /**
  * The Vercel deployment can never accept a WebSocket upgrade, so a native PTY
@@ -42,6 +43,24 @@ assert.ok(
 );
 assert.match(gatewayDockerfile, /^USER sushi$/m, "runs as an unprivileged user");
 assert.match(gatewayDockerfile, /GUACD_PORT=4822/, "carries the guacd endpoint for live RDP");
+assert.match(gatewayDockerfile, /^COPY .*\.\/src \.\/src$/m,
+  "the image includes the shared gateway default module under src");
+assert.ok(existsSync("src/lib/gateway-defaults.mjs"), "the default module exists in the copied tree");
+
+const gatewayCompose = parseYaml(read("docker-compose.gateway.yml")) as {
+  services: Record<string, { build?: { dockerfile?: string }; env_file?: string[];
+    environment?: Record<string, string>; ports?: string[]; image?: string }>;
+};
+assert.equal(gatewayCompose.services.gateway.build?.dockerfile, GATEWAY_IMAGE);
+assert.deepEqual(gatewayCompose.services.gateway.env_file, [".env.gateway.local"], "compose loads the provisioned private file");
+assert.equal(gatewayCompose.services.gateway.environment?.GATEWAY_ONLY, "true");
+assert.equal(gatewayCompose.services.gateway.environment?.GUACD_HOST, "guacd");
+assert.deepEqual(gatewayCompose.services.gateway.ports, ["127.0.0.1:${SUSHI_GATEWAY_PORT:-3000}:3000"],
+  "the gateway is reachable by a local HTTPS reverse proxy, not exposed in plaintext");
+assert.equal(gatewayCompose.services.guacd.image, "guacamole/guacd:1.5.5");
+assert.equal(gatewayCompose.services.guacd.ports, undefined, "guacd remains on the private compose network");
+assert.match(read(".gitignore"), /^\.env\*\.local$/m, "the generated file is gitignored");
+assert.match(read(".dockerignore"), /^\.env\*\.local$/m, "the generated file is excluded from Docker build contexts");
 
 // The CMD has to be a real script, and it has to be the gateway one.
 const pkg = JSON.parse(read("package.json")) as {
@@ -90,12 +109,14 @@ assert.ok(
   !/SUSHI_GATEWAY_TOKEN:\s*["'][^"']+["']/.test(railway),
   "no literal gateway token in the IaC file"
 );
-// The CLI recipe has to use commands that exist (`railway variable set`, not the
-// old `railway variables --set`), and the SDK is installed without touching
-// package.json so a Vercel build never sees it.
+// Railway IaC preserves but does not generate secrets; the helper wraps apply
+// and provisions missing values without putting a token on the command line.
 assert.match(railway, /railway config apply/, "documents `railway config apply`");
-assert.match(railway, /railway variable set SUSHI_GATEWAY_TOKEN=/, "documents `railway variable set`");
-assert.match(railway, /npm i --no-save railway/, "installs the IaC SDK without adding it to package.json");
+assert.match(railway, /node scripts\/provision-gateway\.mjs railway --apply/, "documents the safe provisioning wrapper");
+assert.match(railway, /entire selected environment/, "warns that applying IaC may change other resources");
+assert.match(railway, /--apply with --environment requires 5\.64\.0\+/, "documents the scoped-apply CLI minimum");
+assert.match(railway, /npm i --no-save railway@3\.17\.0/,
+  "installs the known IaC SDK without adding it to package.json");
 assert.ok(
   !/railway variables --set/.test(railway),
   "does not use the non-existent `railway variables --set` form"
@@ -127,7 +148,7 @@ const renderEnv = new Map<string, Record<string, unknown>>(
     v as Record<string, unknown>,
   ])
 );
-for (const key of ["SUSHI_GATEWAY_TOKEN", "ALLOWED_ORIGIN", "GATEWAY_ONLY"]) {
+for (const key of ["SUSHI_GATEWAY_TOKEN", "GATEWAY_ONLY"]) {
   assert.ok(renderEnv.has(key), `render.yaml sets ${key}`);
 }
 assert.equal(renderEnv.get("GATEWAY_ONLY")!.value, "true", "render runs the gateway in gateway-only mode");
@@ -136,11 +157,14 @@ assert.equal(
   true,
   "render generates the gateway token instead of shipping one"
 );
-assert.equal(
-  renderEnv.get("ALLOWED_ORIGIN")!.sync,
-  false,
-  "ALLOWED_ORIGIN is prompted for, because it is the deployer's Vercel origin"
-);
+assert.equal(renderEnv.has("ALLOWED_ORIGIN"), false,
+  "the Blueprint neither prompts nor overwrites a dashboard origin on sync");
+assert.equal(DEFAULT_GATEWAY_ALLOWED_ORIGIN, "https://sushi-lyart-three.vercel.app");
+assert.match(read("server.ts"), /gatewayOnly && process\.env\.ALLOWED_ORIGIN === undefined/,
+  "only an absent gateway-only origin gets the shared default");
+assert.match(read("server.ts"), /process\.env\.ALLOWED_ORIGIN = DEFAULT_GATEWAY_ALLOWED_ORIGIN/,
+  "the runtime, including the Render image, supplies the default");
+assert.ok(read("render.yaml").includes(DEFAULT_GATEWAY_ALLOWED_ORIGIN), "Render documents its runtime default");
 assert.ok(
   !render.services!.some((s) => s.image === "guacamole/guacd:1.5.5" || s.name === "guacd"),
   "the default Render blueprint does not provision a guacd service"
@@ -159,9 +183,14 @@ for (const label of ["VPS / Docker", "Railway", "Render"]) {
 assert.ok(modal.includes(".railway/railway.ts"), "the Railway snippet names the IaC file it deploys from");
 assert.ok(modal.includes(GATEWAY_IMAGE), "the panel names the gateway image");
 assert.ok(modal.includes("render.yaml"), "the Render snippet names the blueprint it deploys from");
+assert.match(modal, /--apply with --environment NAME requires Railway CLI 5\.64\.0\+/,
+  "the UI documents the scoped-apply CLI minimum");
+assert.match(modal, /--apply manages the entire environment/,
+  "the UI warns about the scope of an IaC apply");
 assert.ok(
-  modal.includes("railway config apply") && modal.includes("railway variable set"),
-  "the Railway snippet uses current CLI commands"
+  modal.includes("node scripts/provision-gateway.mjs railway --apply") &&
+    modal.includes("node scripts/provision-gateway.mjs local"),
+  "the panel uses the provisioning helper for Railway and the VPS gateway"
 );
 assert.ok(
   !modal.includes("railway.json") && !modal.includes("railway variables --set"),
@@ -186,6 +215,10 @@ assert.ok(
 
 // ---- README -----------------------------------------------------------------
 const readme = read("README.md");
+assert.match(readme, /node --env-file=\.env\.gateway\.local --import tsx server\.ts/,
+  "the Node-only command loads secrets directly into the gateway process");
+assert.match(readme, /Do not combine `--env-file`\s+with `node --run gateway`/,
+  "the guide warns against Node --run losing env-file values");
 for (const needle of [
   "render.yaml",
   ".railway/railway.ts",

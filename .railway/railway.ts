@@ -11,17 +11,27 @@
  * file; Config as Code stops being read on 2026-12-01 and new services cannot
  * use it at all, so this is the only Railway config Sushi ships.
  *
- * Apply it with the Railway CLI (the SDK is needed only to evaluate this file,
- * which is why it is installed with --no-save and not added to package.json):
+ * Apply it to a new, dedicated Railway project (the SDK is needed only to
+ * evaluate this file, so it is installed with --no-save).
+ * IMPORTANT: This file manages the entire selected environment. Applying it can
+ * delete resources and variables not listed here. Review the plan and cancel
+ * unintended changes. For an existing gateway, link it and run the helper
+ * without --apply to avoid changing other resources.
  *
  *   npm i -g @railway/cli
  *   railway login
- *   railway init            # or: railway link   (existing project)
- *   npm i --no-save railway
- *   railway config plan     # preview
- *   railway config apply    # create both services
- *   railway variable set SUSHI_GATEWAY_TOKEN="$(openssl rand -hex 24)" --service sushi-gateway
- *   railway variable set ALLOWED_ORIGIN="https://your-app.vercel.app" --service sushi-gateway
+ *   railway init            # new, dedicated project
+ *   railway status          # verify linked project and environment
+ *   npm i --no-save railway@3.17.0
+ *   env -u _ railway config plan   # preview; works around SDK _ handling
+ *   node scripts/provision-gateway.mjs railway --apply
+ *
+ * The helper runs railway config apply with confirmation, then creates only
+ * missing gateway variables. Railway CLI 5.47.2+ is required to recognize
+ * sealed values; --apply with --environment requires 5.64.0+. For a new
+ * non-default frontend add --origin https://your-app.vercel.app. Existing values
+ * (including sealed secrets) are never deliberately rotated; don't edit these
+ * variables concurrently while the helper is running.
  *
  * Then give sushi-gateway a public HTTPS domain — the service's Settings →
  * Networking → Generate Domain — and paste that URL plus the token into
@@ -61,11 +71,12 @@ export default defineRailway(() => {
       // Typed cross-service reference: resolves to guacd's private DNS name.
       GUACD_HOST: guacd.env.RAILWAY_PRIVATE_DOMAIN,
       GUACD_PORT: "4822",
-      // Set once on Railway (`railway variable set …` or the Variables tab) and
-      // kept there: preserve() means "do not overwrite what Railway holds", so a
-      // secret never has to live in this file.
-      //   SUSHI_GATEWAY_TOKEN → paste into Sushi → Gateway settings
-      //   ALLOWED_ORIGIN      → this Vercel app's exact origin, no trailing slash
+      // preserve() does NOT generate a value. The provisioning helper creates
+      // missing values once after apply, then future applies leave them alone.
+      // On a dashboard-only deploy, set a secure token manually. The gateway
+      // supplies its default origin when ALLOWED_ORIGIN is absent.
+      //   SUSHI_GATEWAY_TOKEN → paste privately into Sushi → Gateway settings
+      //   ALLOWED_ORIGIN      → the frontend's exact origin, no trailing slash
       // Both live under sushi-gateway → Variables (https://railway.com/dashboard,
       // and https://docs.railway.com/variables for how Railway variables work).
       SUSHI_GATEWAY_TOKEN: preserve(),

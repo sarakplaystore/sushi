@@ -83,9 +83,9 @@ It is designed around a **Hybrid VPS + Serverless Architecture**:
 
 If shared storage is disabled or not configured, only tabs using the same browser
 profile and exact origin share the local vault. Other devices, private browsing,
-and different Sushi hostnames cannot see it. On Vercel, configure Firestore or
-Redis REST storage before expecting cross-device sync; keep the original browser's
-data until migration is complete.
+and different Sushi hostnames cannot see it. On Vercel, configure Turso, Firestore,
+or Redis REST storage before expecting cross-device sync; keep the original
+browser's data until migration is complete.
 
 New shared vaults use the **account password** in the browser for PBKDF2 and
 AES-256-GCM. It is kept in memory while unlocked, not stored as plaintext in
@@ -444,15 +444,46 @@ for the account and vault; switching stores does not automatically copy data.
 
 ### 3. Deploy to Vercel (+ Optional Companion Gateway: VPS, Railway or Render)
 
+If a new deployment shows **Connect shared storage**, the guide links to the
+[Turso Cloud](https://vercel.com/marketplace/tursocloud/database) and
+[Upstash Redis](https://vercel.com/marketplace/upstash/upstash-kv) Marketplace
+integrations. Choose **one**, review the provider's plan, and create a database or
+connect an existing Vercel-managed resource. On the resource's **Projects** tab,
+connect the Sushi project to the environment you use (normally **Production**)
+and leave the custom environment-variable prefix blank. Existing external
+Turso/Upstash databases can instead be connected with the server-side settings
+below. Sushi does not provision a database or enable billing on your behalf.
+
+After connecting a resource or changing variables, open the project's
+**Deployments**, redeploy the latest deployment for that environment, and wait
+for **Ready**. Return to the production domain or the new deployment URL and
+click **Check connection**. An old, unique deployment URL retains its old
+settings. If you used `vercel deploy --prebuilt`, create a fresh build and
+deployment with the latest settings rather than reusing the old prebuilt output.
+The check reads the account status; merely seeing variable names in Vercel does
+not prove that the database is reachable or that a vault is healthy. Never paste database
+credentials into Sushi, chat, `NEXT_PUBLIC_` variables, or the repository.
+
+**Already using Sushi?** Back up the original store and verify a portable vault
+backup before changing anything. Reconnect the original database and namespace;
+a new database does not contain or automatically migrate your account and vault.
+Keep the original browser's data, existing effective signing secret, and
+existing environment-managed credentials. If prompted unexpectedly to create
+an account, stop and check the database and namespace instead of creating a new
+one. See [existing vaults](#one-account-and-saved-connections-on-multiple-devices)
+and the [Firestore migration instructions](#migrate-an-existing-disk-or-redis-store-to-firestore).
+
 1. Provision **Turso (libSQL)**, **[Google Cloud Firestore](#google-cloud-firestore)**,
    or a **Redis database with an Upstash-compatible REST API**. Sushi does not
    create a database or enable billing for you. Back up and migrate existing data
    before changing an existing deployment's backend (see below).
 2. Import `sarakplaystore/sushi` into Vercel (Next.js, Node.js `22.x`):
    - **Turso (libSQL):** Connect a Turso database from the Vercel Marketplace
-     (which injects `TURSO_DATABASE_URL` and `TURSO_AUTH_TOKEN`), or set
-     `SUSHI_TURSO_DATABASE_URL` + `SUSHI_TURSO_AUTH_TOKEN` as server-side secrets.
-     Sushi automatically provisions the `sushi_state_v1` table over Turso's HTTPS
+     (with no custom variable prefix, it injects `TURSO_DATABASE_URL` and
+     `TURSO_AUTH_TOKEN`), or set `SUSHI_TURSO_DATABASE_URL` +
+     `SUSHI_TURSO_AUTH_TOKEN` as server-side secrets. Sushi does not recognize
+     arbitrary Marketplace variable prefixes. Sushi automatically provisions
+     the `sushi_state_v1` table over Turso's HTTPS
      pipeline (`/v2/pipeline`) on first use.
    - **Firestore:** Use the server-side settings in the next section.
    - **Redis:** Set one complete pair of **server-side** environment variables:
@@ -543,12 +574,15 @@ for the account and vault; switching stores does not automatically copy data.
    serverless endpoints (for example *Test SSH Auth* → the Vercel `/api/ssh/test`).
 
 **Upgrading an existing browser-local Vercel account:** Back up the old vault
-first. Preserve the existing `SUSHI_AUTH_SECRET` and deployment identity, add
-Firestore or Redis configuration, and open the upgraded deployment first in the
-original browser, before another visitor creates an account. Its valid signed
-account profile initializes the empty shared account atomically. Unlock the
-original vault and enable account-password sync as above. Passkeys that existed
-only as local browser certificates may need to be registered again.
+first. Preserve the existing effective signing secret and deployment identity,
+add Turso, Firestore, or Redis configuration, and open the upgraded deployment
+first in the original browser, before another visitor creates an account. If
+`SUSHI_AUTH_SECRET` was set, keep its existing value; otherwise changing
+`SUSHI_AUTH_USERNAME` / `SUSHI_AUTH_PASSWORD` or other inputs used to derive
+the secret can make existing sessions or session-key vaults inaccessible. Its
+valid signed account profile initializes the empty shared account atomically.
+Unlock the original vault and enable account-password sync as above. Passkeys
+that existed only as local browser certificates may need to be registered again.
 
 ### Google Cloud Firestore
 

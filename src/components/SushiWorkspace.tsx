@@ -35,7 +35,7 @@ import {
   Square,
   Heart,
 } from "lucide-react";
-import type { AuthStatusResponse } from "@/types/auth";
+import type { AuthStatusResponse, AuthStorageProblem } from "@/types/auth";
 import type {
   CommandSnippet,
   HostProfile,
@@ -96,6 +96,7 @@ import { HostProfileModal } from "./HostProfileModal";
 import { GatewaySetupModal } from "./GatewaySetupModal";
 import { VaultSecurityModal, type VaultModalTab } from "./VaultSecurityModal";
 import { AuthGateScreen } from "./AuthGateScreen";
+import { StorageSetupGuide } from "./StorageSetupGuide";
 import { AccountPasskeysModal } from "./AccountPasskeysModal";
 import { DonateModal } from "./DonateModal";
 import { AiDisclaimer } from "./AiDisclaimer";
@@ -140,6 +141,14 @@ import {
   writeLocalWorkspaceState,
 } from "@/lib/client/session-resume";
 
+function isAuthStorageProblem(value: unknown): value is AuthStorageProblem {
+  if (!value || typeof value !== "object") return false;
+  const problem = value as Record<string, unknown>;
+  return (problem.mode === "vercel" || problem.mode === "vps" || problem.mode === "gateway") &&
+    (problem.reason === "configuration" || problem.reason === "unavailable") &&
+    (problem.backend === null || problem.backend === "disk" || problem.backend === "turso" || problem.backend === "redis" || problem.backend === "firestore");
+}
+
 function downloadEncryptedVault(envelope: EncryptedVaultEnvelope, filename: string) {
   const url = URL.createObjectURL(new Blob([JSON.stringify(envelope, null, 2)], { type: "application/json" }));
   const link = document.createElement("a");
@@ -156,6 +165,9 @@ export function SushiWorkspace() {
   const [authChecking, setAuthChecking] = useState(true);
   const [authStatus, setAuthStatus] = useState<AuthStatusResponse | null>(null);
   const [authError, setAuthError] = useState<string | null>(null);
+  const [authStorageProblem, setAuthStorageProblem] = useState<AuthStorageProblem | null>(null);
+  // Keep the guide visible if a subsequent retry fails before the server can respond.
+  const [storageGuideVisible, setStorageGuideVisible] = useState(false);
   const [authUsername, setAuthUsername] = useState<string>("admin");
   const [accountModalOpen, setAccountModalOpen] = useState(false);
 
@@ -466,29 +478,46 @@ export function SushiWorkspace() {
 
   const refreshAuthStatus = useCallback(async () => {
     const gw = loadGatewaySettings();
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), 25_000);
     try {
       const certs = getStoredPasskeyCertificates().map((c) => c.cert);
       const adminCert = getStoredAdminProfileCert();
       const res = await fetch("/api/auth/status", {
         method: "POST",
         headers: getAuthHeaders(gw),
+        cache: "no-store",
+        signal: controller.signal,
         body: JSON.stringify({
           signedCertificates: certs,
           adminProfileCert: adminCert || undefined,
         }),
       });
-      const data = await res.json();
-      if (!res.ok || !data.ok) throw new Error(data.error || "Account storage is unavailable.");
+      const data = await res.json() as Partial<AuthStatusResponse> & { error?: unknown; storageProblem?: unknown };
+      if (!res.ok || !data.ok) {
+        const problem = isAuthStorageProblem(data.storageProblem) ? data.storageProblem : null;
+        setAuthStatus(null);
+        setAuthError(typeof data.error === "string" ? data.error : "Account storage is unavailable.");
+        setAuthStorageProblem(problem);
+        if (problem) setStorageGuideVisible(problem.mode === "vercel");
+        return null;
+      }
       const statusData = data as AuthStatusResponse;
       setAuthStatus(statusData);
       setAuthError(null);
+      setAuthStorageProblem(null);
+      setStorageGuideVisible(statusData.mode === "vercel" && !statusData.initialized && !statusData.canBootstrapInteractive);
       if (statusData.username) setAuthUsername(statusData.username);
       return statusData;
-    } catch (error) {
+    } catch {
       setAuthStatus(null);
-      setAuthError(error instanceof Error ? error.message : "Could not check account status.");
+      setAuthStorageProblem(null);
+      setAuthError(controller.signal.aborted
+        ? "The account status check timed out. Check your connection and try again."
+        : "Could not reach Sushi or read its response. Check your connection and try again.");
       return null;
     } finally {
+      window.clearTimeout(timeout);
       setAuthChecking(false);
     }
   }, []);
@@ -2105,6 +2134,20 @@ export function SushiWorkspace() {
       <div className="flex h-full w-full items-center justify-center bg-[#090b10]">
         <Loader2 className="h-6 w-6 animate-spin text-[#ff6b57]" />
       </div>
+    );
+  }
+
+  if (storageGuideVisible && (!authStatus || (!authStatus.initialized && !authStatus.canBootstrapInteractive))) {
+    return (
+      <StorageSetupGuide
+        problem={authStorageProblem}
+        error={authError}
+        onRefreshStatus={async () => {
+          const status = await refreshAuthStatus();
+          if (status?.authenticated) await bootAuthenticatedWorkspace();
+          return status;
+        }}
+      />
     );
   }
 

@@ -14,6 +14,14 @@ import {
 type RecordName = "auth" | "vault";
 export type StoreKind = "disk" | "redis" | "turso" | "firestore" | "none";
 
+/** Configuration errors contain only fixed messages and variable names, never values. */
+export class StorageConfigurationError extends Error {
+  constructor(message: string, readonly backend: "redis" | "turso" | "firestore" | null = null) {
+    super(message);
+    this.name = "StorageConfigurationError";
+  }
+}
+
 function storagePrefix(): string {
   const fallback = [
     "sushi",
@@ -22,7 +30,7 @@ function storagePrefix(): string {
   ].join(":");
   const prefix = process.env.SUSHI_STORAGE_PREFIX?.trim() || fallback;
   if (!/^[a-zA-Z0-9:_-]{1,160}$/.test(prefix)) {
-    throw new Error("SUSHI_STORAGE_PREFIX must contain only letters, numbers, colons, underscores, or hyphens.");
+    throw new StorageConfigurationError("SUSHI_STORAGE_PREFIX must contain only letters, numbers, colons, underscores, or hyphens.");
   }
   return prefix;
 }
@@ -31,10 +39,10 @@ function firestoreConfig() {
   const projectId = process.env.SUSHI_FIRESTORE_PROJECT_ID?.trim() || "";
   const databaseId = process.env.SUSHI_FIRESTORE_DATABASE_ID?.trim() || "(default)";
   if (!/^[a-z][a-z0-9-]{4,28}[a-z0-9]$/.test(projectId)) {
-    throw new Error("Firestore is misconfigured: set a valid SUSHI_FIRESTORE_PROJECT_ID on the server.");
+    throw new StorageConfigurationError("Firestore is misconfigured: set a valid SUSHI_FIRESTORE_PROJECT_ID on the server.", "firestore");
   }
   if (!/^(\(default\)|[a-zA-Z0-9._-]{1,100})$/.test(databaseId)) {
-    throw new Error("Firestore is misconfigured: the database ID is invalid.");
+    throw new StorageConfigurationError("Firestore is misconfigured: the database ID is invalid.", "firestore");
   }
   const json = process.env.SUSHI_FIRESTORE_CREDENTIALS_JSON?.trim();
   let credentials: { client_email: string; private_key: string } | undefined;
@@ -48,7 +56,7 @@ function firestoreConfig() {
       credentials = { client_email: data.client_email, private_key: data.private_key };
     } catch {
       // Never include the JSON or private key in an error returned to a browser.
-      throw new Error("Firestore is misconfigured: provide valid server-side service-account JSON, or use Application Default Credentials.");
+      throw new StorageConfigurationError("Firestore is misconfigured: provide valid server-side service-account JSON, or use Application Default Credentials.", "firestore");
     }
   }
   return { projectId, databaseId, prefix: storagePrefix(), ...(credentials ? { credentials } : {}) };
@@ -62,27 +70,27 @@ interface RedisConfig {
 
 function redisConfig(): RedisConfig | null {
   const candidates = [
-    [process.env.SUSHI_REDIS_REST_URL, process.env.SUSHI_REDIS_REST_TOKEN],
-    [process.env.UPSTASH_REDIS_REST_URL, process.env.UPSTASH_REDIS_REST_TOKEN],
-    [process.env.KV_REST_API_URL, process.env.KV_REST_API_TOKEN],
-  ];
-  for (const [rawUrl, rawToken] of candidates) {
-    const url = rawUrl?.trim() || "";
-    const token = rawToken?.trim() || "";
+    ["SUSHI_REDIS_REST_URL", "SUSHI_REDIS_REST_TOKEN"],
+    ["UPSTASH_REDIS_REST_URL", "UPSTASH_REDIS_REST_TOKEN"],
+    ["KV_REST_API_URL", "KV_REST_API_TOKEN"],
+  ] as const;
+  for (const [urlName, tokenName] of candidates) {
+    const url = process.env[urlName]?.trim() || "";
+    const token = process.env[tokenName]?.trim() || "";
     if (!url && !token) continue;
     if (!url || !token) {
-      throw new Error("Shared storage is misconfigured: both the Redis REST URL and token are required.");
+      throw new StorageConfigurationError(`Shared storage is misconfigured: set both ${urlName} and ${tokenName}.`, "redis");
     }
     let parsed: URL;
     try {
       parsed = new URL(url);
     } catch {
-      throw new Error("Shared storage has an invalid Redis REST URL.");
+      throw new StorageConfigurationError("Shared storage has an invalid Redis REST URL.", "redis");
     }
     const localHttp = parsed.protocol === "http:" &&
       ["localhost", "127.0.0.1", "[::1]"].includes(parsed.hostname);
     if ((parsed.protocol !== "https:" && !localHttp) || parsed.username || parsed.password || parsed.search || parsed.hash) {
-      throw new Error("Shared storage requires an HTTPS Redis REST URL without embedded credentials.");
+      throw new StorageConfigurationError("Shared storage requires an HTTPS Redis REST URL without embedded credentials.", "redis");
     }
     return { url: url.replace(/\/+$/, ""), token, prefix: storagePrefix() };
   }
@@ -91,15 +99,15 @@ function redisConfig(): RedisConfig | null {
 
 function tursoConfig(): TursoStoreConfig | null {
   const candidates = [
-    [process.env.SUSHI_TURSO_DATABASE_URL, process.env.SUSHI_TURSO_AUTH_TOKEN],
-    [process.env.TURSO_DATABASE_URL, process.env.TURSO_AUTH_TOKEN],
-  ];
-  for (const [rawUrl, rawToken] of candidates) {
-    const url = rawUrl?.trim() || "";
-    const token = rawToken?.trim() || "";
+    ["SUSHI_TURSO_DATABASE_URL", "SUSHI_TURSO_AUTH_TOKEN"],
+    ["TURSO_DATABASE_URL", "TURSO_AUTH_TOKEN"],
+  ] as const;
+  for (const [urlName, tokenName] of candidates) {
+    const url = process.env[urlName]?.trim() || "";
+    const token = process.env[tokenName]?.trim() || "";
     if (!url && !token) continue;
     if (!url || !token) {
-      throw new Error("Shared storage is misconfigured: both the Turso database URL and auth token are required.");
+      throw new StorageConfigurationError(`Shared storage is misconfigured: set both ${urlName} and ${tokenName}.`, "turso");
     }
     const isLibsql = /^libsql:\/\//i.test(url);
     const isWss = /^wss:\/\//i.test(url);
@@ -108,17 +116,17 @@ function tursoConfig(): TursoStoreConfig | null {
     try {
       parsed = new URL(normalizedInput);
     } catch {
-      throw new Error("Shared storage has an invalid Turso database URL.");
+      throw new StorageConfigurationError("Shared storage has an invalid Turso database URL.", "turso");
     }
     if (parsed.username || parsed.password || parsed.hash) {
-      throw new Error("Shared storage requires a Turso database URL without embedded credentials.");
+      throw new StorageConfigurationError("Shared storage requires a Turso database URL without embedded credentials.", "turso");
     }
     let tlsParam: boolean | undefined;
     for (const [key, val] of parsed.searchParams.entries()) {
       if (key === "tls" && (val === "0" || val === "1")) {
         tlsParam = val === "1";
       } else {
-        throw new Error("Shared storage requires a Turso database URL without embedded credentials or unsupported query options.");
+        throw new StorageConfigurationError("Shared storage requires a Turso database URL without embedded credentials or unsupported query options.", "turso");
       }
     }
     const isLoopback = ["localhost", "127.0.0.1", "[::1]"].includes(parsed.hostname);
@@ -126,7 +134,7 @@ function tursoConfig(): TursoStoreConfig | null {
     if (isLibsql) {
       if (tlsParam === false) {
         if (!isLoopback || !parsed.port) {
-          throw new Error("Shared storage requires TLS for non-local Turso database URLs.");
+          throw new StorageConfigurationError("Shared storage requires TLS for non-local Turso database URLs.", "turso");
         }
         scheme = "http:";
       } else {
@@ -134,13 +142,13 @@ function tursoConfig(): TursoStoreConfig | null {
       }
     } else if (parsed.protocol === "https:") {
       if (tlsParam === false) {
-        throw new Error("Shared storage has an invalid TLS setting on an https:// Turso database URL.");
+        throw new StorageConfigurationError("Shared storage has an invalid TLS setting on an https:// Turso database URL.", "turso");
       }
       scheme = "https:";
     } else if (parsed.protocol === "http:" && isLoopback && tlsParam !== true) {
       scheme = "http:";
     } else {
-      throw new Error("Shared storage requires a libsql:// or https:// Turso database URL.");
+      throw new StorageConfigurationError("Shared storage requires a libsql:// or https:// Turso database URL.", "turso");
     }
     const basePath = parsed.pathname.replace(/\/+$/, "");
     return {
@@ -159,25 +167,25 @@ export function getStateStoreKind(): StoreKind {
     return "firestore";
   }
   if (selected === "redis") {
-    if (!redisConfig()) throw new Error("Shared storage is misconfigured: Redis REST URL and token are required.");
+    if (!redisConfig()) throw new StorageConfigurationError("Shared storage is misconfigured: Redis REST URL and token are required.", "redis");
     return "redis";
   }
   if (selected === "turso") {
-    if (!tursoConfig()) throw new Error("Shared storage is misconfigured: Turso database URL and auth token are required.");
+    if (!tursoConfig()) throw new StorageConfigurationError("Shared storage is misconfigured: Turso database URL and auth token are required.", "turso");
     return "turso";
   }
   if (selected === "disk") {
-    if (process.env.VERCEL === "1") throw new Error("Disk storage is ephemeral on Vercel; configure Turso, Firestore, or Redis instead.");
+    if (process.env.VERCEL === "1") throw new StorageConfigurationError("Disk storage is ephemeral on Vercel; configure Turso, Firestore, or Redis instead.");
     return "disk";
   }
-  if (selected !== "auto") throw new Error("SUSHI_STORAGE_BACKEND must be auto, disk, redis, turso, or firestore.");
+  if (selected !== "auto") throw new StorageConfigurationError("SUSHI_STORAGE_BACKEND must be auto, disk, redis, turso, or firestore.");
   if (process.env.SUSHI_FIRESTORE_PROJECT_ID?.trim() || process.env.SUSHI_FIRESTORE_DATABASE_ID?.trim() || process.env.SUSHI_FIRESTORE_CREDENTIALS_JSON?.trim()) {
-    throw new Error("Select SUSHI_STORAGE_BACKEND=firestore to enable the configured Firestore database.");
+    throw new StorageConfigurationError("Select SUSHI_STORAGE_BACKEND=firestore to enable the configured Firestore database.", "firestore");
   }
   const hasRedis = Boolean(redisConfig());
   const hasTurso = Boolean(tursoConfig());
   if (hasRedis && hasTurso) {
-    throw new Error("Multiple shared storage backends (Redis and Turso) are configured; set SUSHI_STORAGE_BACKEND=redis or SUSHI_STORAGE_BACKEND=turso.");
+    throw new StorageConfigurationError("Multiple shared storage backends (Redis and Turso) are configured; set SUSHI_STORAGE_BACKEND=redis or SUSHI_STORAGE_BACKEND=turso.");
   }
   if (hasRedis) return "redis";
   if (hasTurso) return "turso";

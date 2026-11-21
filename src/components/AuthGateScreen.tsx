@@ -416,6 +416,13 @@ export function AuthGateScreen({
 
           <AiDisclaimer variant="card" />
 
+          {authStatus.mode === "vercel" && authStatus.storage && authStatus.storage !== "none" && (
+            <div className="flex items-start gap-2 rounded-xl border border-amber-500/25 bg-amber-500/10 p-3 text-xs leading-5 text-amber-100/90">
+              <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-amber-300" />
+              <p>This storage has no account Sushi can see. If you expected an existing account, stop and reconnect its original database and namespace instead of creating a replacement.</p>
+            </div>
+          )}
+
           {error && (
             <div className="flex items-start gap-2 rounded-xl border border-rose-500/30 bg-rose-500/10 p-3 text-xs text-rose-200">
               <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-rose-400" />

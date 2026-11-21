@@ -14,14 +14,14 @@
 
 It is designed around a **Hybrid VPS + Serverless Architecture**:
 - **Self-Hosted on a VPS (Docker Compose or Node.js)**: Runs a unified HTTP + WebSocket server (`server.ts`) paired with Apache Guacamole's `guacd` daemon for full interactive `xterm.js` PTY SSH terminals, graphical SFTP file management + remote code editing, and live 60fps HTML5 Remote Desktop (RDP) sessions.
-- **Deployed on Vercel (Serverless Node.js)**: Uses environment-based admin sign-in and an encrypted **browser-local vault**, without a database. **SFTP**, **Serverless Streaming SSH**, and **MS-RDPBCGR X.224 / TLS / NLA** probes work natively. Attach a persistent Gateway URL (`wss://...`) for reliable live RDP, team sharing, and WebSocket PTY shells — hosted on a **VPS**, **Railway** ([`.railway/railway.ts`](.railway/railway.ts)), or **Render** ([`render.yaml`](render.yaml)), using [`Dockerfile.gateway`](Dockerfile.gateway).
+- **Deployed on Vercel (Serverless Node.js)**: Uses Google Cloud Firestore or a Redis-compatible REST database for a persistent account and cross-device vault (see setup below). Graphical **SFTP** file browsing/uploads/downloads/editing, **Serverless Streaming SSH** execution, and **MS-RDPBCGR X.224 / TLS / NLA** server probes work natively on Vercel Serverless Functions — and you can optionally link any Gateway URL (`wss://...`) inside the UI to unlock persistent WebSocket PTY shells and live browser RDP streaming — hosted on a **VPS**, on **Railway** ([`.railway/railway.ts`](.railway/railway.ts) deploys the gateway *and* `guacd`), or on **Render** ([`render.yaml`](render.yaml)), all three built from the slim [`Dockerfile.gateway`](Dockerfile.gateway).
 
 ---
 
 ## Features
 
 - **Username, Password & WebAuthn Passkey Protection**
-  - One admin account: interactive setup persists to disk on a VPS, while Vercel uses `SUSHI_AUTH_USERNAME` and `SUSHI_AUTH_PASSWORD` environment variables. A VPS can also use those variables.
+  - One interactive admin account shared across devices: persistent disk on a VPS, or configured Turso/Firestore/Redis storage on a VPS or Vercel. Optional `SUSHI_AUTH_USERNAME` / `SUSHI_AUTH_PASSWORD` environment overrides remain available.
   - **SSH Keychain & Vault Key Whitelist**: Store encrypted `ed25519` / `rsa` / `ecdsa` SSH keys in the Vault Keychain, and optionally enforce a strict **Vault SSH Key Whitelist** across all SSH/SFTP server connections
   - **FIDO2 / WebAuthn Passkeys** (`@simplewebauthn/server` & `@simplewebauthn/browser`) for Touch ID, Face ID, Windows Hello, and YubiKey
 - **SSH Client Import & Export**
@@ -61,51 +61,75 @@ It is designed around a **Hybrid VPS + Serverless Architecture**:
   - Native serverless **MS-RDPBCGR X.224 + TLS certificate inspector** (`/api/rdp/probe`) and one-click `.rdp` profile generator
   - **Open via RDP from anywhere**: a desktop button on every SSH/SFTP host row and host card, plus **Open RDP** in the terminal header and **RDP** in the file manager toolbar — the same host, reached as a desktop on port 3389, no duplicate host needed (see *Open a host's desktop over RDP*).
 - **AES-256-GCM Encrypted Credential Vault**
-  - Browser-side `AES-256-GCM` encryption with a server-derived session key, account password, separate passphrase, or browser device key
-  - Cross-device sync with revision checks on a persistent self-hosted disk; browser-local storage on Vercel; passphrase-encrypted portable JSON backups
+  - Browser-side `AES-256-GCM` encryption with the account password (`PBKDF2-SHA256`, 210,000 iterations), a separate master passphrase, or a device key
+  - Encrypted cross-device host, credential, key and snippet sync with revision checks; optional passphrase-encrypted portable JSON backups
 
 ---
 
-## Accounts, vaults, and backups
+## One account and saved connections on multiple devices
 
-Sushi does not require or connect to a database. **Self-hosted** deployments keep
-`auth.json` and the encrypted `vault.enc.json` on a persistent disk (`DATA_DIR`,
-or the `sushi-data` Docker volume). After creating the admin account, sign in at
-the same URL on another device to see its saved connections. Changes use revision
-checks so concurrent writes do not silently overwrite one another. Protect the
-first-run setup page from untrusted visitors and back up the volume.
+1. Configure persistent storage as described in **Quick Start**. Open Sushi on a
+   trusted network and create the admin account once. Anyone who reaches a new,
+   uninitialized deployment first can claim that account, so protect setup.
+2. Save a connection. On another device, open the **same Sushi URL** and sign in
+   with the same account. Saved SSH/SFTP/RDP profiles, passwords, private keys,
+   whitelist settings and snippets are stored in the encrypted shared vault.
+   Open terminal/RDP sessions and gateway settings are not transferred.
+3. Other tabs in the same browser pick up saved changes promptly. Sushi also
+   checks for shared changes when the page regains focus and periodically while
+   it is visible and no editor is open. **Settings → Refresh saved connections**
+   checks manually. A conflicting save is rejected rather than overwriting another
+   tab or device; keep your unsaved edits, reload the latest vault and reapply them.
 
-**Vercel** has no persistent server disk: set the admin credentials as server-only
-environment variables (see [deployment](#3-deploy-to-vercel--optional-companion-gateway-vps-railway-or-render)).
-Each browser profile and origin keeps its own encrypted vault. Tabs in that profile
-can share changes, but **different devices and private windows do not sync**. Use
-**Settings → Vault & iCloud Drive backup → Download Portable Backup** and restore
-it on each device; restoring replaces that device's vault. Keep the backup and
-its passphrase safe and verify recovery before clearing browser data. A browser
-device-key vault or an old device-key backup requires its original browser key.
+If shared storage is disabled or not configured, only tabs using the same browser
+profile and exact origin share the local vault. Other devices, private browsing,
+and different Sushi hostnames cannot see it. On Vercel, configure Firestore or
+Redis REST storage before expecting cross-device sync; keep the original browser's
+data until migration is complete.
 
-Vault data is encrypted in the browser with AES-256-GCM. New disk-synced vaults
-normally use a session key derived from the server's `authSecret` and delivered
-only to authenticated same-origin sessions; the server can derive that key, so
-this is **not zero-knowledge encryption**. Older vaults may use an account password
-or another passphrase (PBKDF2-SHA256, 210,000 iterations). New browser-only vaults
-use a device key stored in that browser. Use HTTPS, trust the server, protect
-its files and environment secrets, and keep portable backups. Changing or losing
-`SUSHI_AUTH_SECRET` can make a session-key vault unreadable; preserve the old
-secret until a verified portable backup is available.
+New shared vaults use the **account password** in the browser for PBKDF2 and
+AES-256-GCM. It is kept in memory while unlocked, not stored as plaintext in
+browser storage. A reload or Passkey sign-in may still ask for the
+account password to decrypt the vault. Use a long, unique password: anyone with
+an encrypted vault copy can attempt to guess it offline. Sushi sends the account
+password to its server for normal sign-in and password verification, so this is
+**not zero-knowledge encryption**. The server serves the browser code, and a
+compromised server could capture the password. Use HTTPS and trust both your
+server and storage provider. The shared store contains the account password
+hash/session signing secret, public passkeys, and encrypted vault—not
+plaintext saved SSH passwords or private keys.
 
-On a VPS, change an interactively created password under **Account & Passkeys →
-Password**. Environment-managed credentials must be changed in the hosting
-settings and redeployed. On Vercel, passkey certificates are browser-local unless
-you explicitly configure `SUSHI_PASSKEYS_JSON`; enroll or configure them for
-other browsers separately. A browser-local passkey cannot be globally revoked
-from another browser without changing the server signing secret.
+**Existing vaults:** After enabling shared storage, open the **original browser
+first** so its existing account and vault can migrate. Unlock an old master
+passphrase vault if necessary, then enter the current account password when
+prompted to upload its encrypted contents. If a vault already exists in shared
+storage, use **Vault Encryption → Account password sync** when appropriate.
+Verify it on a second device before removing the original browser's data.
+Device-key vaults and older device-key backups cannot be opened on another
+browser: keep the original device key and make a portable backup first.
+If the browser has a different local vault from the shared vault, Sushi asks you
+to download its encrypted copy before opening the shared one; it does not merge
+conflicting vaults automatically. Restoring a backup replaces the current vault.
 
-If disk storage is unavailable or an existing vault cannot be read, Sushi does
-not silently create an empty account or claim a save succeeded. If a crashed VPS
-process left a `data/*.lock` file, stop all Sushi processes and confirm no writer
-is active before removing the **lock file only**; do not delete the `.json` files
-to clear a lock. Self-hosted vault snapshots are limited to 32 MiB.
+**Changing the account password:** Use **Account & Passkeys → Password** while
+the vault is unlocked. Sushi first keeps the vault decryptable with the old
+password, changes the account, then re-encrypts the vault with the new password.
+Keep the old password until the final step succeeds. If the update is interrupted,
+the interface explains how to unlock with the previous password and enable sync
+with the current one. Changing credentials signs out other device sessions; sign
+in again there with the new account credentials. Existing sessions also need to
+sign in once after upgrading to credential-bound sessions. For environment-managed
+passwords changed outside Sushi, sign in with the new password and, if prompted,
+unlock the vault with its previous password. A separate-master-passphrase vault
+keeps its separate passphrase.
+
+If shared storage is unavailable or an existing vault cannot be read, Sushi does
+not silently create an empty account/vault or claim that a save succeeded. On a
+VPS, if a crashed process left a `data/*.lock` file, stop all Sushi processes and
+confirm no writer is active before removing the **lock file only**; never remove
+the `.json` files to clear a lock. Firestore and Vercel vault snapshots are
+limited to 4 MiB; self-hosted disk/Redis snapshots are limited to 32 MiB. Firestore
+splits larger records into sub-1 MiB documents and updates them transactionally.
 
 ## One URL for every host (SSH + SFTP + RDP merged)
 
@@ -123,23 +147,26 @@ each entry a single URL:
   addresses, one button per way in, and a **link** button that copies that machine's
   URL. Search covers name, address, account, folder, tag *and* pasted addresses; the
   `ALL / SSH / SFTP / RDP` tabs filter by how a machine can be opened. It opens from
-  `/hosts`, which redirects into the workspace view (`/?view=hosts`) when the server
-  route has no readable inventory. **`/hosts?format=json`** answers scripts.
-- **`GET /api/hosts`** — when an explicit clear-text inventory is configured, the
-  machine-readable endpoint returns one entry per machine with `id`, `accessUrl`,
-  `protocols`, `counts`, and protocol `links[]`. Otherwise it reports vault metadata,
-  not the contents of the encrypted vault. It requires the normal Sushi session.
+  `/hosts`, which the server answers with a redirect into the workspace view
+  (`/?view=hosts`) because the vault key is only in your browser — the page is never a
+  fabricated empty list. **`/hosts?format=json`** answers scripts.
+- **`GET /api/hosts`** — the machine-readable half: one entry per machine with `id`,
+  `accessUrl`, `protocols`, `counts`, and `links[]` holding `ssh://…`, `sftp://…` and
+  `rdp://…` (each labelled `saved` or `derived`). Protected by the normal Sushi session
+  (`x-sushi-session`), like every other API — there is no second, weaker secret.
 - **One link per machine**: `/hosts?host=<id>` (or `/hosts?host=<id>&protocol=rdp`)
   opens that machine in the workspace, which unlocks the vault and starts the session.
   `?host=` also accepts `user@host` for hand-written links. Links never carry
   credentials.
 
-**Why the server endpoint is not a dump of your vault.** Sushi stores vault data as
-`{iv, ciphertext}` and these endpoints do not decrypt it. The server can derive
-session-mode keys, however, so this is not zero-knowledge encryption. Without a
-clear-text inventory, `/api/hosts` returns an empty placeholder list and counts: it
-cannot determine the actual host count from the encrypted envelope. `/hosts` hands
-the browser to the workspace, where **All hosts** lists the unlocked entries. A
+**Why the single URL is an index, not a dump of your servers.** Sushi's vault is
+end-to-end encrypted: the server stores `{iv, ciphertext}` and has no key, so it cannot
+read host names or passwords, and returning them in clear would mean storing them in
+clear. `/api/hosts` therefore reports the structure honestly — one entry per machine,
+its protocols, ports and access URLs, with `encrypted: true` and names redacted
+(`host #1`) — and `/hosts` hands the browser to the workspace, where **All hosts**
+unlocks the vault and lists the real names, addresses and links. (Earlier the server
+printed an empty host list in that case, which read as “you have no hosts”.) A
 deployment that deliberately keeps a clear-text inventory can set
 `SUSHI_HOSTS_INVENTORY` (inline JSON or a file path, shape
 `{ "hosts": [ { …HostProfile } ] }`); those entries are merged the same way, returned
@@ -219,9 +246,9 @@ done, and remember the shell keeps running until you stop it.
    connection; installing the icon does not make SSH, SFTP, or RDP work offline.
 
 The Home Screen app may have separate login and browser storage from Safari,
-including the local device key used to encrypt a device-key vault. On a self-hosted deployment, sign in to the same Sushi URL to open the
-disk-synced vault. On Vercel, restore a portable backup into the Home Screen app;
-the icon itself does not sync data through iCloud.
+including the local device key used to encrypt a device-key vault. Sign in to
+the same configured Sushi deployment in the Home Screen app to open an
+account-password-synced vault; the icon itself does not sync data through iCloud.
 **Before switching, create and verify a passphrase-protected portable backup in
 the original browser** (see below); do not reset an unreadable vault until you
 have a working backup.
@@ -297,16 +324,13 @@ developer for its export options. Not every SSH client has a portable export.
    Encrypted Sushi Backup**, enter and confirm a backup passphrase, then choose
    **Download Portable Backup**.
    This creates a separate AES-256-GCM / PBKDF2-encrypted `.enc.json` and does
-   **not** change the current vault password. It includes saved hosts, snippets,
-   SSH keys and the key-whitelist setting, but **not** passkeys or workspace
-   history (open tabs, recent hosts and resumable runs). Keep the passphrase separately.
+   **not** change the current vault password. Keep the passphrase separately.
 2. Save or move that file to iCloud Drive using your browser/Files app (or any
    other storage you choose). This is a manual backup, not automatic iCloud sync.
 3. On the new device, select the file using **Import / Export** or **Choose
    Backup to Restore**, enter its passphrase, and confirm replacement of the
-   current vault. The restored contents are re-encrypted using the current vault
-   protection. On Vercel this replaces only that browser's vault; on a self-hosted
-   deployment with disk sync enabled it replaces the shared vault for all synced devices.
+   current vault. The restored contents are re-encrypted using that device's
+   current vault protection.
 
 Old backups exported in **device-key mode** can only be decrypted in the
 original browser with the same device key: the device key was never included in those files. Create a new
@@ -343,7 +367,7 @@ The database is parsed with SQLite compiled to WebAssembly (`sql.js`) and decryp
 | **Docker Compose, no clone** | `curl -fsSLO https://raw.githubusercontent.com/sarakplaystore/sushi/main/docker-compose.prebuilt.yml && docker compose -f docker-compose.prebuilt.yml up -d` | Sushi **+ guacd** from the published image |
 | **Python 3.9+** (no Docker needed) | `python3 install.py` | Cross-platform (Linux, macOS, Windows via WSL). Downloads the source, `npm ci`, builds, starts in the background and health-checks it |
 | **Node.js 22 only** | `git clone https://github.com/sarakplaystore/sushi.git && cd sushi && npm ci && npm run build && npm start` | The manual equivalent |
-| **Vercel** | Import the repo, then import a private `.env` with the deploy helper | See [Deploy to Vercel](#3-deploy-to-vercel--optional-companion-gateway-vps-railway-or-render) |
+| **Vercel** | Import the repo, add Turso/Firestore/Redis | See [Deploy to Vercel](#3-deploy-to-vercel--optional-companion-gateway-vps-railway-or-render) |
 | **Vercel + native PTY** | Vercel for the UI, Railway or Render for [`Dockerfile.gateway`](Dockerfile.gateway) | See [Deploy to Vercel](#3-deploy-to-vercel--optional-companion-gateway-vps-railway-or-render) — no server to maintain |
 
 Useful installer flags: `--port 8080`, `--dir ~/sushi`, `--https your.domain` (adds Caddy with
@@ -359,7 +383,7 @@ automatic HTTPS), `--prebuilt` (skip the build), `--node` (no Docker: Node.js + 
 ### 0. One-click deploys
 
 [![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fsarakplaystore%2Fsushi&repository-name=sushi)
-*(Import private server-side admin credentials before signing in — see §3.)*
+*(Vercel needs a Turso / Firestore / Redis database before the admin account can be created — see §3.)*
 
 [![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/sarakplaystore/sushi)
 *(Deploys the **gateway** from [`render.yaml`](render.yaml) — the native WebSocket PTY companion for a Vercel UI, not the whole app. See §3.)*
@@ -403,7 +427,8 @@ bash scripts/install-vps.sh --node          # no Docker: Node.js + systemd unit
 Keep the `sushi-data` volume (or `DATA_DIR` when running Node directly) persistent
 and backed up: it holds `auth.json` and `vault.enc.json`. Recreating or deleting
 that storage can lose the account and saved connections. `SUSHI_SERVER_VAULT=false`
-disables disk vault sync and keeps the vault only in each browser. No database is required.
+disables shared vault sync. Firestore or Redis REST can optionally replace disk
+for the account and vault; switching stores does not automatically copy data.
 
 `docker-compose.yml` launches both:
 - `sushi` on port `3000` (Web UI + API + `/ws/ssh` + `/ws/rdp`)
@@ -419,81 +444,40 @@ disables disk vault sync and keeps the vault only in each browser. No database i
 
 ### 3. Deploy to Vercel (+ Optional Companion Gateway: VPS, Railway or Render)
 
-1. Import `sarakplaystore/sushi` into Vercel (Next.js, Node.js `22.x`). No
-   database integration is needed. In a local checkout, authenticate the Vercel
-   CLI and link it to **that existing project**:
+1. Provision **Turso (libSQL)**, **[Google Cloud Firestore](#google-cloud-firestore)**,
+   or a **Redis database with an Upstash-compatible REST API**. Sushi does not
+   create a database or enable billing for you. Back up and migrate existing data
+   before changing an existing deployment's backend (see below).
+2. Import `sarakplaystore/sushi` into Vercel (Next.js, Node.js `22.x`):
+   - **Turso (libSQL):** Connect a Turso database from the Vercel Marketplace
+     (which injects `TURSO_DATABASE_URL` and `TURSO_AUTH_TOKEN`), or set
+     `SUSHI_TURSO_DATABASE_URL` + `SUSHI_TURSO_AUTH_TOKEN` as server-side secrets.
+     Sushi automatically provisions the `sushi_state_v1` table over Turso's HTTPS
+     pipeline (`/v2/pipeline`) on first use.
+   - **Firestore:** Use the server-side settings in the next section.
+   - **Redis:** Set one complete pair of **server-side** environment variables:
+     - `SUSHI_REDIS_REST_URL` and `SUSHI_REDIS_REST_TOKEN`, or
+     - `UPSTASH_REDIS_REST_URL` and `UPSTASH_REDIS_REST_TOKEN`, or
+     - `KV_REST_API_URL` and `KV_REST_API_TOKEN` (older Vercel KV integrations).
 
-   ```bash
-   npx --yes vercel@66.5.0 login
-   npx --yes vercel@66.5.0 link
-   ```
-
-   Select the existing GitHub-linked Sushi project when linking. The checkout's
-   Git `origin` must point to the same GitHub repository as the project (use your
-   fork's checkout if you deployed a fork). The helper uses the CLI's existing
-   login (or the standard CI `VERCEL_TOKEN`) and needs permission to manage
-   project environment variables and deployments.
-2. Import a private `.env` and deploy the linked **production Git branch**:
-
-   ```bash
-   npm run deploy:vercel -- --env-file .env
-   ```
-
-   The file must contain `SUSHI_AUTH_USERNAME` and `SUSHI_AUTH_PASSWORD` (or
-   `SUSHI_AUTH_PASSWORD_HASH`, as a 64-character SHA-256 hex digest or
-   `hex-salt:128-character-scrypt-hex` using scrypt N=16384, r=8, p=1).
-   `SUSHI_AUTH_SECRET` is strongly recommended and must be kept stable. Values
-   are read literally, without shell execution or `$` expansion; quote values
-   containing `#` or spaces. Only these admin entries are imported: other `.env`
-   entries are not uploaded. The password, hash and signing secret are stored as
-   write-only Vercel Secrets, for **production only**; preview deployments need
-   their own separate settings. The helper does not upload the file, and rejects
-   credentials inside the checkout unless they are untracked and Git-ignored.
-   Ensure no Git branch or history contains the file. The helper starts a Git-based
-   production deployment, waits for it to be ready, and verifies sign-in when
-   deployment protection allows. It deploys the latest commit on the linked
-   production branch, **not uncommitted local changes**.
-
-   For a **fresh install with no vault to recover**, generate credentials instead:
-
-   ```bash
-   npm run deploy:vercel -- --new
-   ```
-
-   This creates `.env.sushi.local` with a random password and signing secret;
-   open it privately to sign in and keep a secure backup. The helper never prints
-   those values, commits them, or overwrites an existing file or project secret.
-   To reuse the file later, use `--env-file .env.sushi.local`. If a project already
-   has admin credentials, they are left untouched; the helper checks which keys
-   exist but cannot compare write-only values with the file. An incomplete or
-   ambiguous configuration stops the import to avoid changing the vault key.
-   If an import is interrupted, some variables may have been saved: retain the
-   file and inspect the project before retrying. `--import-only` saves the
-   variables without starting a deployment; a subsequent deployment is required.
-
-   **Migration:** use the original effective signing secret or a verified portable
-   backup; do not use `--new` for an existing session-key vault. If the old account
-   used environment credentials without `SUSHI_AUTH_SECRET`, retaining those
-   credentials and leaving the secret unset preserves the derived key. See
-   [migration](#migrating-from-database-storage). Never commit any filled-in
-   `.env` file, use a `NEXT_PUBLIC_` prefix for secrets, or expose it publicly.
-
-   Vercel does not read a local, Git-ignored `.env` during a Git build and does
-   not grant that build permission to create project secrets. The first import
-   requires an authenticated, linked CLI (or an authorized CI job); it cannot be
-   performed automatically by an unauthenticated Git deployment. Once imported,
-   Vercel retains the settings for later production Git deployments. You can also
-   set the same server-only values through Vercel's project settings.
-3. Sign in. The same credentials work on each device, but the **encrypted vault
-   is browser-local** and will not sync between devices. Make a portable encrypted
-   backup and restore it on each browser. Vercel cannot safely offer public
-   interactive account creation without a persistent account store; the old
-   `SUSHI_ALLOW_STATELESS_SETUP` flag no longer enables it.
-4. On Vercel, SFTP, serverless SSH, and RDP probes work natively. Direct live RDP
-   over split HTTP requests depends on those requests reaching the same process;
-   it may disconnect on serverless platforms. Attach a **gateway** — one small
-   always-on process — for reliable live RDP, persistent WebSocket PTY shells
-   (full-screen `vim`/`htop`/`tmux`, terminal resize), and team-shared terminals. All three routes below end
+   A partial credential pair (or configuring both Redis and Turso without setting
+   `SUSHI_STORAGE_BACKEND=redis` or `SUSHI_STORAGE_BACKEND=turso`) fails closed.
+   Never prefix a credential with `NEXT_PUBLIC_` or commit it. Redeploy
+   after changing environment variables. Production and preview normally have
+   different default namespaces. Use an explicit `SUSHI_STORAGE_PREFIX` only
+   for instances that should share the same account; back up the database.
+3. Open the deployed URL and create the account once. Other devices visiting
+   that deployment see sign-in and can open the same encrypted vault. Without
+   persistent storage, first-time interactive setup is blocked instead of
+   silently creating a different browser-local account. Existing env-configured
+   accounts can still sign in, but have no shared vault until storage is set up.
+   For legacy browser-local behavior only, `SUSHI_ALLOW_STATELESS_SETUP=true`
+   explicitly opts back in; it does **not** provide cross-device sync.
+4. On Vercel, SFTP and serverless SSH work natively, and RDP can probe/export a
+   `.rdp` file. A Vercel function can never accept a WebSocket upgrade, so
+   *(optional)* attach a **gateway** — one small always-on process — for
+   persistent WebSocket PTY shells (full-screen `vim`/`htop`/`tmux`, terminal
+   resize), team-shared terminals, and live guacd RDP. All three routes below end
    the same way: one `wss://` URL plus its token, pasted into Sushi's
    **Settings → Gateway** (the panel offers the same snippets behind its
    *VPS / Railway / Render* tabs).
@@ -558,54 +542,90 @@ disables disk vault sync and keeps the vault only in each browser. No database i
    API route 404s on purpose, which is what makes the Vercel frontend keep using its own
    serverless endpoints (for example *Test SSH Auth* → the Vercel `/api/ssh/test`).
 
-## Migrating from database storage
+**Upgrading an existing browser-local Vercel account:** Back up the old vault
+first. Preserve the existing `SUSHI_AUTH_SECRET` and deployment identity, add
+Firestore or Redis configuration, and open the upgraded deployment first in the
+original browser, before another visitor creates an account. Its valid signed
+account profile initializes the empty shared account atomically. Unlock the
+original vault and enable account-password sync as above. Passkeys that existed
+only as local browser certificates may need to be registered again.
 
-**Back up before upgrading.** Earlier Sushi releases could store the account,
-passkeys and encrypted vault in Turso, Firestore or Redis. This release no longer
-connects to those services or migrates their data automatically. A deployment
-with old database configuration fails closed rather than creating a new empty
-account. The services and their contents are **not deleted** by this upgrade.
+### Google Cloud Firestore
 
-1. While the **previous version** and its database are still available, open the
-   original browser, sign in, and use **Settings → Vault & iCloud Drive backup →
-   Download Portable Backup**. Choose a separate passphrase and verify that you
-   can restore the file. Portable backups omit passkeys and workspace history
-   (including open tabs and resumable runs), so record anything needed separately.
-   Keep a secure backup of the old database and its settings until the new
-   deployment has been checked. Export or re-enroll passkeys as needed. Do not
-   clear the original browser data.
-2. For Vercel, import the original admin settings from a private `.env` with the
-   deploy helper above, or configure them in the hosting dashboard. Keep a stable
-   `SUSHI_AUTH_SECRET`. To open a cached vault whose
-   `keySource` is `session` without restoring the backup, this must be the **same
-   effective secret** used by the old deployment (from its old server-side
-   setting or protected account record). Handle it as a secret; never paste it in
-   chat or commit it. If the old secret is unavailable, use a new random secret
-   and restore the portable backup instead. On a VPS, protect the setup page and
-   create a new disk-backed admin account after the configuration change.
-3. Remove legacy database environment variables and any provider integration
-   that injects them: `SUSHI_TURSO_*` / `TURSO_*`, `SUSHI_FIRESTORE_*`,
-   `SUSHI_REDIS_*`, `UPSTASH_REDIS_*` and `KV_REST_API_*`. Remove the old
-   `SUSHI_STORAGE_BACKEND` value or set it to `auto` (`disk` is VPS-only).
-   `SUSHI_STORAGE_PREFIX` and `SUSHI_ALLOW_STATELESS_SETUP` are no longer used.
-   Docker Compose detects old settings via presence-only markers; remove them
-   from the Compose `.env` as well. Restart/redeploy after changing settings.
-4. Sign in and verify the vault. If the old local vault cannot be unlocked, or a
-   previously synced vault is missing from the new server, the **Vault unavailable**
-   screen lets you download the browser's existing copy and restore a portable
-   backup without first opening the vault. On a VPS this also seeds the empty server
-   vault with an encrypted copy; a concurrent server change is never overwritten.
-   Otherwise restore through **Settings → Vault & iCloud Drive backup**. Restoring
-   replaces the browser-local vault on Vercel, or the shared vault when disk sync
-   is enabled on a VPS. Repeat on each Vercel browser, since they no longer sync.
-   Re-enroll or configure passkeys as needed. Keep the old service
-   and backups until you have independently verified the new account and saved
-   connections; disconnecting a service does not necessarily stop its billing.
+Firestore is an optional **live server database**, not an iCloud connection. It
+works with both Vercel and self-hosted Sushi:
 
-The old cross-instance database relay for live RDP has also been removed. Use a
-persistent gateway when serverless requests land on separate instances.
-Termix SQLite **import** still reads files locally in your browser; it is not a
-Sushi storage backend.
+1. Create a Google Cloud project and a **Firestore in Native mode** database;
+   enable the Firestore API and any required billing. Choose its location
+   carefully. Give a server identity permission to read and write Firestore
+   documents, for example the **Cloud Datastore User** (`roles/datastore.user`)
+   IAM role. The server SDK uses IAM and bypasses Firestore security rules.
+2. Set these **server-only** variables in Vercel, your VPS environment, or the
+   Compose `.env`, then redeploy/restart. Never put credentials in browser code,
+   `NEXT_PUBLIC_` variables, the repository, or chat.
+   - `SUSHI_STORAGE_BACKEND=firestore` (required to select Firestore).
+   - `SUSHI_FIRESTORE_PROJECT_ID`: the Google Cloud project ID.
+   - `SUSHI_FIRESTORE_DATABASE_ID`: optional named database ID; blank uses
+     `(default)`.
+   - `SUSHI_FIRESTORE_CREDENTIALS_JSON`: service-account JSON as one secret.
+     Alternatively leave it blank and use Google **Application Default
+     Credentials** (ADC), such as an attached workload identity or an ADC file
+     referenced by `GOOGLE_APPLICATION_CREDENTIALS`. In Docker, a credential
+     file must be mounted at the path **inside** the container.
+3. Use the same project, database and `SUSHI_STORAGE_PREFIX` for every instance
+   that should share one Sushi account. By default the prefix is
+   `sushi:<VERCEL_PROJECT_ID>:<VERCEL_ENV>` (missing parts default to `default`).
+   Set an explicit prefix on all instances when sharing between Vercel and a
+   VPS; keep preview and production separate unless sharing is intentional.
+   Sidebar **Settings** reports the selected backend, not a live health check.
+4. Create the account on a new deployment, or migrate an existing persistent
+   store as described below. The account and ciphertext are stored in Firestore;
+   Firestore transactions reject conflicting changes. The vault remains encrypted
+   with the account password as described above. Firestore outages or invalid
+   credentials do not cause Sushi to initialize an empty replacement account.
+   Normal account checks and vault sync incur Firestore operations; Google Cloud
+   may charge for usage, so review its billing and backup policies.
+
+When `SUSHI_STORAGE_BACKEND` is blank/`auto`, existing Redis-or-disk selection
+is unchanged. Firestore variables require explicitly selecting `firestore`;
+`disk` is not supported on Vercel. `SUSHI_SERVER_VAULT=false` disables vault sync
+but does not move or disable the configured account store.
+
+### Migrate an existing disk or Redis store to Firestore
+
+Switching the backend **does not automatically copy existing data**. Before
+switching, create and verify a portable encrypted backup in the original browser
+and retain a separate backup of the original database/disk and its configuration.
+The optional migration command copies the exact account record (including stored
+passkeys and signing secret) and encrypted vault **together** into an empty
+Firestore namespace; it never deletes the source or overwrites a target. The
+source vault must fit Firestore's 4 MiB limit; both records together must fit
+within 6 MiB for the atomic copy. Browser-only data is not in that server store.
+
+1. Make **all** old and new Sushi deployments inaccessible to writers and wait
+   for in-flight requests to finish. Keep them stopped until migration and the
+   new deployment are verified. The command cannot enforce this for you: writes
+   made to the old store after the copy will not be included.
+2. On a trusted machine with Node.js 22, the source disk volume or Redis REST
+   credentials, and access to Firestore, configure the source settings and the
+   Firestore settings above. Preserve `SUSHI_AUTH_SECRET`, environment-managed
+   authentication, and the original `SUSHI_STORAGE_PREFIX`/Vercel namespace.
+   Use `SUSHI_STORAGE_BACKEND=firestore` for the **destination**. The command
+   reads `.env` and accepts normal environment overrides. For a Docker disk
+   volume, stop Sushi, then use a one-off container on the same volume, e.g.
+   `docker compose run --rm --no-deps sushi npm run migrate:firestore -- ...`.
+3. Dry-run, then copy using the appropriate source (`disk` or `redis`):
+   ```bash
+   npm run migrate:firestore -- --source=redis
+   npm run migrate:firestore -- --source=redis --apply --writers-stopped
+   ```
+   The command checks that the target is empty, writes both records in one
+   transaction, and verifies the copy. If the result cannot be confirmed, keep
+   the source and inspect the destination before retrying; do not reset either.
+4. Start the Firestore deployment and verify sign-in and saved connections on a
+   second device before allowing normal use. Keep the old store and backup until
+   you have verified recovery. If a namespace already contains account/vault
+   data, the migration refuses to overwrite it; resolve it manually first.
 
 ### Open a host's desktop over RDP
 
@@ -629,9 +649,8 @@ the Linux user signed in to `xrdp`). **Credentials** in the RDP session header o
 dialog prefilled for this server: fix the username / domain / port / password there and connect
 ephemeral, or save it — saving creates a separate RDP host and leaves the SSH entry untouched.
 
-For reliable live pixels, use `guacd` (self-hosted `docker compose`) or an attached persistent
-gateway. Serverless HTTP streaming can fail across separate instances; the X.224/TLS/NLA probe
-and native `.rdp` launcher remain available without a gateway.
+Live pixels need `guacd` (self-hosted `docker compose`) or an attached VPS gateway; without one the
+tab still gives you the X.224/TLS/NLA probe and a native `.rdp` launcher.
 
 ### Getting the most out of the RDP desktop
 
@@ -982,7 +1001,7 @@ is powerful and dangerous. The project publishes three documents so expectations
 | Document | What it covers |
 |---|---|
 | [`DISCLAIMER.md`](DISCLAIMER.md) | **AI-assisted development disclosure**, "AS IS" warranty disclaimer, assumption of risk (remote access, destructive actions, credential compromise), **limitation of liability** (indirect/consequential damages, data loss, downtime, regulatory fines), no-support policy, acceptable-use rules, and the fact that there is **no `LICENSE` file yet** (so default copyright applies — add one before redistributing) |
-| [`PRIVACY.md`](PRIVACY.md) | Exactly what is stored and where — VPS account files, encrypted disk or browser vaults, `localStorage` keys, `/tmp/.sushi-*` files on remote hosts, and the server's ability to derive session-mode keys — plus retention, third parties, data-subject rights and breach duties. **There is no telemetry and no maintainer backend** |
+| [`PRIVACY.md`](PRIVACY.md) | Exactly what is stored and where — `auth.json` (username, `scrypt` verifier, public passkeys), `vault.enc.json` (**AES-256-GCM ciphertext the server cannot decrypt**), browser `localStorage` keys, `/tmp/.sushi-*` files on remote hosts — plus retention, third parties (Google Translate only if `SUSHI_TRANSLATE_URL` is unset), data-subject rights and breach duties. **There is no telemetry and no maintainer backend** |
 | [`SECURITY.md`](SECURITY.md) | How to report a vulnerability privately, what is in/out of scope, and the protections you are expected to enable |
 
 **The short version:** no warranty; you are the operator and the data controller; the maintainer

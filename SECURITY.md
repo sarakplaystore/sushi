@@ -56,4 +56,4 @@ switch the share to *signed-in Sushi accounts* so no code exists at all.
 
 HTTPS in front of the app, a strong unique password, passkeys where available, network
 restriction (VPN / IP allowlist), `SUSHI_GATEWAY_TOKEN` when bridging to a Vercel frontend,
-backups of the self-hosted `data/` directory or verified portable vault backups, and prompt patching.
+backups of `data/` or the cloud records, and prompt patching.

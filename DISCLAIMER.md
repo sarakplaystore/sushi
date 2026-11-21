@@ -72,8 +72,8 @@ and you accept the following risks in full:
    overwrite files over SFTP, and control desktops over RDP. There is **no undo** for a
    command you run against a production host. Keep backups and test on non-production
    machines.
-5. **Third-party infrastructure.** On Vercel, on a VPS provider, Docker, or any RDP/SSH
-   target, the availability, security posture and
+5. **Third-party infrastructure.** On Vercel, on a VPS provider, or with Turso, Firestore,
+   Google Cloud, Docker, or any RDP/SSH target, the availability, security posture and
    billing of those services are governed by *their* terms, not this project's.
 6. **No guarantee of interoperability.** Host operating systems, `xrdp`, `guacd`, `sshd`
    versions, corporate proxies, browser passkey support and similar external variables change
@@ -137,8 +137,8 @@ other things — the following. The Project Parties assume you have done them:
   does not store, so you can build your own notice on top of it.
 - **Security**: HTTPS in front of the app, a strong unique admin password, passkeys where
   available, network restrictions (VPN / IP allowlist / firewall), keeping the deployment and
-  its dependencies patched, backups of the `data/` directory or verified portable vault
-  backups, and an incident-response plan.
+  its dependencies patched, backups of the `data/` directory or your cloud store, and an
+  incident-response plan.
 - **Secrets hygiene**: never commit `.env`, `data/*.json`, vault backups or SSH private keys.
   Rotate `SUSHI_GATEWAY_TOKEN`, `SUSHI_AUTH_SECRET`, host keys and passwords if a deployment is
   ever exposed.

@@ -16,9 +16,9 @@
 /data/*.tmp
 !.gitkeep
 
-# Environment files (only the empty template is tracked)
-.env*
-!.env.example
+# Environment files
+.env
+.env*.local
 
 # Logs & OS files
 npm-debug.log*

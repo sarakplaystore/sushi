@@ -64,15 +64,14 @@ import {
   saveGatewaySettings,
 } from "@/lib/client/gateway";
 import {
+  cacheSyncedVault,
   cacheSyncedVaultIfUnchanged,
   fetchRemoteVault,
-  fetchSessionVaultKey,
   getLocalSyncMetadata,
-  readLocalVaultSnapshot,
   sameVaultEnvelope,
   sameOptionalVaultEnvelope,
   saveLocalVaultIfUnchanged,
-  saveRemoteVaultAndCacheIfUnchanged,
+  saveRemoteVault,
   subscribeVaultChanges,
   verifyAccountPassword,
 } from "@/lib/client/vault-sync";
@@ -97,7 +96,6 @@ import { HostProfileModal } from "./HostProfileModal";
 import { GatewaySetupModal } from "./GatewaySetupModal";
 import { VaultSecurityModal, type VaultModalTab } from "./VaultSecurityModal";
 import { AuthGateScreen } from "./AuthGateScreen";
-import { LocalVaultRecovery } from "./LocalVaultRecovery";
 import { AccountPasskeysModal } from "./AccountPasskeysModal";
 import { DonateModal } from "./DonateModal";
 import { AiDisclaimer } from "./AiDisclaimer";
@@ -142,8 +140,8 @@ import {
   writeLocalWorkspaceState,
 } from "@/lib/client/session-resume";
 
-function downloadVaultCopy(content: string, filename: string) {
-  const url = URL.createObjectURL(new Blob([content], { type: "application/json" }));
+function downloadEncryptedVault(envelope: EncryptedVaultEnvelope, filename: string) {
+  const url = URL.createObjectURL(new Blob([JSON.stringify(envelope, null, 2)], { type: "application/json" }));
   const link = document.createElement("a");
   link.href = url;
   link.download = filename;
@@ -151,10 +149,6 @@ function downloadVaultCopy(content: string, filename: string) {
   link.click();
   link.remove();
   window.setTimeout(() => URL.revokeObjectURL(url), 1000);
-}
-
-function downloadEncryptedVault(envelope: EncryptedVaultEnvelope, filename: string) {
-  downloadVaultCopy(JSON.stringify(envelope, null, 2), filename);
 }
 
 export function SushiWorkspace() {
@@ -181,15 +175,11 @@ export function SushiWorkspace() {
   const [accountVaultOutdated, setAccountVaultOutdated] = useState(false);
   const [authMigrationNotice, setAuthMigrationNotice] = useState<string | null>(null);
   const [vaultBootError, setVaultBootError] = useState<string | null>(null);
-  // undefined means browser storage could not be read; null means it was empty.
-  const [vaultRecoverySnapshot, setVaultRecoverySnapshot] = useState<string | null | undefined>(undefined);
-  const [emptyServerRecoveryAllowed, setEmptyServerRecoveryAllowed] = useState(false);
+  const [vaultRecoveryEnvelope, setVaultRecoveryEnvelope] = useState<EncryptedVaultEnvelope | null>(null);
   const [vaultSyncError, setVaultSyncError] = useState<string | null>(null);
   const [vaultConflict, setVaultConflict] = useState<EncryptedVaultEnvelope | null>(null);
   const [conflictBackupDownloaded, setConflictBackupDownloaded] = useState(false);
   const syncRevisionRef = useRef<string | null>(null);
-  // A failed cache CAS may mean a newer browser copy needs explicit review.
-  const sharedCacheNeedsReviewRef = useRef(false);
   // Keys held only in memory while authenticated, never written to localStorage.
   const accountPasswordRef = useRef<string | null>(null);
   const sessionVaultKeyRef = useRef<string | null>(null);
@@ -295,7 +285,7 @@ export function SushiWorkspace() {
 
   /**
    * `/?view=hosts` renders the All-hosts list. The server-rendered `/hosts` route
-   * redirects here when the encrypted vault has not been decoded by the server route,
+   * redirects here when the vault is end-to-end encrypted (it cannot read the list),
    * and any `?host=` / `?protocol=` on a one-machine link is left in place for the
    * normal deep-link path.
    */
@@ -802,15 +792,11 @@ export function SushiWorkspace() {
       if (!sameOptionalVaultEnvelope(loadLocalEnvelope(), localBase)) {
         throw new Error("The browser vault changed in another tab. Reload it before enabling sync; no data was replaced.");
       }
-      const { revision, cached } = await saveRemoteVaultAndCacheIfUnchanged(
-        gw, envelope, baseRevision, localBase
-      );
+      const revision = await saveRemoteVault(gw, envelope, baseRevision);
       syncRevisionRef.current = revision;
-      if (!cached) {
-        sharedCacheNeedsReviewRef.current = true;
-        setVaultSyncError("Vault was saved to the server, but this browser's copy changed or could not be cached. Reload the latest vault to review it.");
+      if (!(await cacheSyncedVaultIfUnchanged(localBase, envelope, revision)) && !cacheSyncedVault(envelope, revision)) {
+        setVaultSyncError("Vault saved to shared storage, but this browser could not cache it locally.");
       } else {
-        sharedCacheNeedsReviewRef.current = false;
         bootLocalEnvelopeRef.current = envelope;
       }
     } else {
@@ -835,13 +821,9 @@ export function SushiWorkspace() {
       setVaultReady(false);
     }
     setVaultBootError(null);
-    setVaultRecoverySnapshot(undefined);
-    setEmptyServerRecoveryAllowed(false);
+    setVaultRecoveryEnvelope(null);
     setVaultConflict(null);
     setVaultSyncError(null);
-    // Do not write the shared vault while a reload is still resolving its cache.
-    sharedCacheNeedsReviewRef.current = true;
-    vaultMutationVersionRef.current++;
     const gw = loadGatewaySettings();
     setGatewaySettings(gw);
 
@@ -863,26 +845,15 @@ export function SushiWorkspace() {
         setRemoteCaps(probe.ok && probe.caps ? probe.caps : null);
       }
       if (sequence !== bootSequenceRef.current) return;
-      const remote = caps.serverVault ? await fetchRemoteVault(gw) : null;
-      if (sequence !== bootSequenceRef.current) return;
-      // Recovery may seed disk only after confirming that the server vault is empty.
-      if (remote && !remote.envelope) setEmptyServerRecoveryAllowed(true);
       const local = loadLocalEnvelope();
       bootLocalEnvelopeRef.current = local;
       const metadata = getLocalSyncMetadata();
-      if (!caps.serverVault && !local && metadata?.revision) {
-        throw new Error("This browser previously synchronized a vault, but its local copy is missing. Restore a portable backup or return to the previous deployment; no data was changed.");
-      }
-      // A previously synchronized vault may be cached here under the old server's
-      // session key. Preserve that key by retaining SUSHI_AUTH_SECRET on upgrade.
-      const localSessionKey = !caps.serverVault && local?.keySource === "session"
-        ? await fetchSessionVaultKey(gw)
-        : null;
+      const remote = caps.serverVault ? await fetchRemoteVault(gw) : null;
       if (sequence !== bootSequenceRef.current) return;
       syncRevisionRef.current = remote?.revision ?? null;
-      const sessionVaultKey = remote?.vaultKey ?? localSessionKey ?? sessionVaultKeyRef.current;
-      if (remote?.vaultKey || localSessionKey) {
-        sessionVaultKeyRef.current = remote?.vaultKey ?? localSessionKey;
+      const sessionVaultKey = remote?.vaultKey ?? sessionVaultKeyRef.current;
+      if (remote?.vaultKey) {
+        sessionVaultKeyRef.current = remote.vaultKey;
       }
 
       let envelope = remote?.envelope ?? local;
@@ -896,12 +867,11 @@ export function SushiWorkspace() {
           return;
         }
       }
-      if (remote && !remote.envelope && metadata?.revision) {
-        throw new Error("The server vault is empty, but this browser previously synchronized a vault. No data was replaced. Restore a portable backup or return to the previous deployment before continuing.");
+      if (remote && !remote.envelope && local && metadata?.revision) {
+        throw new Error("The shared vault is missing, but this browser has a previously synchronized copy. No data was replaced. Restore the shared storage or export a backup before continuing.");
       }
 
       if (!envelope) {
-        sharedCacheNeedsReviewRef.current = false;
         const empty: VaultPlaintext = { version: 1, hosts: [], snippets: DEFAULT_SNIPPETS, sshKeys: [], enforceKeyWhitelist: false };
         applyPlainVault(empty);
         updatePendingEnvelope(null);
@@ -949,11 +919,6 @@ export function SushiWorkspace() {
           }
         }
         if (!plain) {
-          if (!caps.serverVault || (remote && !remote.envelope)) {
-            throw new Error(envelope.keySource === "session"
-              ? "This browser's cached vault needs its original SUSHI_AUTH_SECRET. Restore that secret, or restore a portable backup. No data was changed."
-              : "This browser's vault needs its original password or passphrase. Restore a portable backup, or return to the previous deployment to export one. No data was changed.");
-          }
           // Pre-upgrade password-encrypted vault with no password in memory yet:
           // ask for a one-time password sign-in on AuthGateScreen to auto-migrate.
           await fetch("/api/auth/logout", {
@@ -987,13 +952,13 @@ export function SushiWorkspace() {
           );
         } else {
           if (isRemote && remote?.revision) {
-            const cached = await cacheSyncedVaultIfUnchanged(local, envelope, remote.revision);
+            const cached =
+              (await cacheSyncedVaultIfUnchanged(local, envelope, remote.revision)) ||
+              cacheSyncedVault(envelope, remote.revision);
             if (sequence !== bootSequenceRef.current) return;
             if (!cached) {
-              sharedCacheNeedsReviewRef.current = true;
-              setVaultSyncError("The shared vault opened, but this browser's copy changed or could not be cached. Reload the latest vault to review it.");
+              setVaultSyncError("The shared vault opened, but this browser could not cache it locally.");
             } else {
-              sharedCacheNeedsReviewRef.current = false;
               bootLocalEnvelopeRef.current = envelope;
             }
           }
@@ -1003,17 +968,11 @@ export function SushiWorkspace() {
         }
       } else {
         if (isRemote && remote?.revision) {
-          const cached = await cacheSyncedVaultIfUnchanged(local, envelope, remote.revision);
+          const cached =
+            (await cacheSyncedVaultIfUnchanged(local, envelope, remote.revision)) ||
+            cacheSyncedVault(envelope, remote.revision);
           if (sequence !== bootSequenceRef.current) return;
-          if (cached) {
-            sharedCacheNeedsReviewRef.current = false;
-            bootLocalEnvelopeRef.current = envelope;
-          } else {
-            sharedCacheNeedsReviewRef.current = true;
-            setVaultSyncError("The shared vault opened, but this browser's copy changed or could not be cached. Reload the latest vault to review it.");
-          }
-        } else {
-          sharedCacheNeedsReviewRef.current = false;
+          if (cached) bootLocalEnvelopeRef.current = envelope;
         }
         setVaultMode(envelope.mode);
         setVaultKeySource(
@@ -1032,7 +991,7 @@ export function SushiWorkspace() {
     } catch (error) {
       if (sequence !== bootSequenceRef.current) return;
       setVaultBootError(error instanceof Error ? error.message : "Could not load the vault. No data was changed.");
-      try { setVaultRecoverySnapshot(readLocalVaultSnapshot()); } catch { /* browser storage is unavailable; do not replace anything */ }
+      try { setVaultRecoveryEnvelope(loadLocalEnvelope()); } catch { /* preserve the unreadable local data */ }
       setVaultReady(false);
     }
   }, [applyPlainVault, createSessionVault, updatePendingEnvelope]);
@@ -1072,9 +1031,6 @@ export function SushiWorkspace() {
         workspaceSyncDirtyRef.current = false;
         vaultMutationVersionRef.current++;
         try {
-          if (localCaps?.serverVault && sharedCacheNeedsReviewRef.current) {
-            throw new Error("Reload the latest vault to review this browser's copy before making further changes. Previous changes may already be saved on the server.");
-          }
           if (!options.background && source === "account" && passToUse) {
             await verifyAccountPassword(gatewaySettings, passToUse);
           }
@@ -1089,9 +1045,7 @@ export function SushiWorkspace() {
           };
 
           let baseRevision = syncRevisionRef.current;
-          // A server rebase does not change the browser snapshot we started with.
-          // Keep this separate from the remote revision throughout conflict retries.
-          const baseLocalEnvelope = pendingEnvelopeRef.current;
+          let baseLocalEnvelope = pendingEnvelopeRef.current;
           const canReuseExistingSalt =
             passphraseOverride === undefined &&
             explicitMode === undefined &&
@@ -1104,12 +1058,11 @@ export function SushiWorkspace() {
           envelope.keySource = source;
 
           if (localCaps?.serverVault) {
-            let result: { revision: string; cached: boolean } | null = null;
+            let revision: string | null;
+            revision = null;
             for (let attempt = 0; attempt < 3; attempt++) {
               try {
-                result = await saveRemoteVaultAndCacheIfUnchanged(
-                  gatewaySettings, envelope, baseRevision, baseLocalEnvelope
-                );
+                revision = await saveRemoteVault(gatewaySettings, envelope, baseRevision);
                 break;
               } catch (saveErr) {
                 const msg = saveErr instanceof Error ? saveErr.message : "";
@@ -1133,6 +1086,7 @@ export function SushiWorkspace() {
                       remotePlain
                     );
                     baseRevision = latestRemote.revision;
+                    baseLocalEnvelope = latestRemote.envelope;
                     envelope = await encryptVaultData(desiredPlain, passToUse, {
                       reuseSalt:
                         canReuseExistingSalt && latestRemote.envelope.mode === "passphrase"
@@ -1146,17 +1100,22 @@ export function SushiWorkspace() {
                 throw saveErr;
               }
             }
-            if (!result) {
+            if (!revision) {
               throw new Error("Could not save the encrypted vault.");
             }
-            // The server has already committed this revision. A failed local
-            // cache update must be reported without pretending the save failed.
-            syncRevisionRef.current = result.revision;
-            if (!result.cached) {
-              sharedCacheNeedsReviewRef.current = true;
-              setVaultSyncError(
-                "Vault was saved to the server, but this browser's copy changed or could not be cached. Reload the latest vault to review it."
-              );
+            syncRevisionRef.current = revision;
+            const cachedClean = await cacheSyncedVaultIfUnchanged(
+              baseLocalEnvelope,
+              envelope,
+              revision
+            );
+            const cachedMerged = cachedClean || cacheSyncedVault(envelope, revision);
+            if (!cachedMerged) {
+              if (!options.background) {
+                setVaultSyncError(
+                  "Vault saved to shared storage, but this browser's local copy could not be cached."
+                );
+              }
             } else {
               bootLocalEnvelopeRef.current = envelope;
               setVaultSyncError(null);
@@ -1266,15 +1225,13 @@ export function SushiWorkspace() {
   }, [flushWorkspaceSync]);
 
   const refreshSharedVault = useCallback(async function refreshSharedVault() {
-    if (!localCaps?.serverVault || !syncEligibleRef.current || sharedCacheNeedsReviewRef.current) return;
+    if (!localCaps?.serverVault || !syncEligibleRef.current) return;
     if (syncRefreshInFlightRef.current) { syncRefreshRequestedRef.current = true; return; }
     syncRefreshInFlightRef.current = true;
     const version = vaultMutationVersionRef.current;
     const baseRevision = syncRevisionRef.current;
     try {
-      // Compare against the snapshot this tab actually opened, not an arbitrary
-      // newer local copy that may have appeared before the fetch began.
-      const localBase = pendingEnvelopeRef.current;
+      const localBase = loadLocalEnvelope();
       const remote = await fetchRemoteVault(gatewaySettings);
       if (remote.vaultKey) sessionVaultKeyRef.current = remote.vaultKey;
       if (!syncEligibleRef.current || version !== vaultMutationVersionRef.current || baseRevision !== syncRevisionRef.current) return;
@@ -1283,13 +1240,7 @@ export function SushiWorkspace() {
         if (baseRevision === null) return;
         throw new Error("The shared vault is missing. No local data was changed; check your storage before saving.");
       }
-      if (remote.revision === baseRevision) {
-        if (!sameOptionalVaultEnvelope(loadLocalEnvelope(), localBase)) {
-          sharedCacheNeedsReviewRef.current = true;
-          setVaultSyncError((previous) => previous || "This browser's vault copy changed in another tab. Reload the latest vault to review it before making further changes.");
-        }
-        return;
-      }
+      if (remote.revision === baseRevision) return;
       const pass =
         remote.envelope.mode === "passphrase"
           ? remote.vaultKey ?? activePassphrase ?? sessionVaultKeyRef.current
@@ -1301,18 +1252,14 @@ export function SushiWorkspace() {
         throw new Error("The shared vault changed and needs a different key. Reload the latest vault; local data was not replaced.");
       }
       if (!syncEligibleRef.current || version !== vaultMutationVersionRef.current || baseRevision !== syncRevisionRef.current) return;
-      const cached = await cacheSyncedVaultIfUnchanged(localBase, remote.envelope, remote.revision);
+      const cached =
+        (await cacheSyncedVaultIfUnchanged(localBase, remote.envelope, remote.revision)) ||
+        cacheSyncedVault(remote.envelope, remote.revision);
       if (!syncEligibleRef.current || version !== vaultMutationVersionRef.current || baseRevision !== syncRevisionRef.current) return;
-      if (!cached) {
-        sharedCacheNeedsReviewRef.current = true;
-        setVaultSyncError((previous) => previous || "The shared vault changed, but this browser's copy changed or could not be cached. Reload the latest vault to review it.");
-        return;
-      }
-      sharedCacheNeedsReviewRef.current = false;
       setAccountVaultOutdated(false);
-      setVaultSyncError(null);
+      setVaultSyncError(cached ? null : "The shared vault updated, but this browser's local copy changed or could not be cached.");
       syncRevisionRef.current = remote.revision;
-      bootLocalEnvelopeRef.current = remote.envelope;
+      if (cached) bootLocalEnvelopeRef.current = remote.envelope;
       updatePendingEnvelope(remote.envelope);
       setVaultMode(remote.envelope.mode);
       setVaultKeySource(
@@ -2167,7 +2114,6 @@ export function SushiWorkspace() {
         <div className="w-full max-w-md space-y-4 rounded-2xl border border-rose-500/30 bg-[#0f131b] p-6 text-sm text-slate-200">
           <h1 className="font-semibold text-white">Account status unavailable</h1>
           <p>{authError || "Could not check the account. Setup is disabled until storage is available."}</p>
-          <a href="https://github.com/sarakplaystore/sushi#migrating-from-database-storage" target="_blank" rel="noreferrer" className="inline-block text-xs text-sky-300 underline underline-offset-2">Storage migration guide</a>
           <button type="button" onClick={async () => {
             setAuthChecking(true);
             const status = await refreshAuthStatus();
@@ -2202,18 +2148,15 @@ export function SushiWorkspace() {
 
   if (vaultBootError) {
     return (
-      <div role="alert" className="flex h-full w-full overflow-y-auto bg-[#090b10] p-4">
-        <div className="m-auto w-full max-w-md space-y-4 rounded-2xl border border-rose-500/30 bg-[#0f131b] p-6 text-sm text-slate-200">
+      <div role="alert" className="flex h-full w-full items-center justify-center bg-[#090b10] p-4">
+        <div className="w-full max-w-md space-y-4 rounded-2xl border border-rose-500/30 bg-[#0f131b] p-6 text-sm text-slate-200">
           <h1 className="font-semibold text-white">Vault unavailable</h1>
           <p>{vaultBootError}</p>
-          {typeof vaultRecoverySnapshot === "string" && (
+          {vaultRecoveryEnvelope && (
             <div className="space-y-2 text-xs text-slate-400">
-              <p>Keep this browser's data. You can download the existing copy, even if it is damaged. A device-key copy only opens in its original browser.</p>
-              <button type="button" onClick={() => downloadVaultCopy(vaultRecoverySnapshot, "sushi-local-vault-recovery.enc.json")} className="rounded-xl border border-white/15 px-3 py-2 font-semibold text-slate-200">Download local encrypted copy</button>
+              <p>Keep this browser's data. You can also download its encrypted copy for recovery{vaultRecoveryEnvelope.mode === "device" ? "; a device-key copy only opens in this original browser" : ""}.</p>
+              <button type="button" onClick={() => downloadEncryptedVault(vaultRecoveryEnvelope, "sushi-local-vault-recovery.enc.json")} className="rounded-xl border border-white/15 px-3 py-2 font-semibold text-slate-200">Download local encrypted copy</button>
             </div>
-          )}
-          {localCaps && (!localCaps.serverVault || emptyServerRecoveryAllowed) && vaultRecoverySnapshot !== undefined && (
-            <LocalVaultRecovery expected={vaultRecoverySnapshot} willSyncToServer={localCaps.serverVault} onRestored={() => void bootAuthenticatedWorkspace()} />
           )}
           <div className="flex gap-3">
             <button type="button" onClick={() => void bootAuthenticatedWorkspace()} className="rounded-xl bg-[#ff6b57] px-4 py-2 text-xs font-semibold text-white">Retry</button>
@@ -2422,17 +2365,45 @@ export function SushiWorkspace() {
                   <div className="mb-1.5 rounded-xl border border-white/8 bg-[#0d121b] px-2.5 py-2">
                     <div className="flex items-center justify-between gap-2 text-[11px] font-medium text-slate-200">
                       <span className="flex items-center gap-1.5">
-                        <Cloud className="h-3.5 w-3.5 text-sky-400" /> Vault storage
+                        <Cloud className="h-3.5 w-3.5 text-sky-400" />
+                        {localCaps?.storageBackend === "turso"
+                          ? "Turso (libSQL)"
+                          : localCaps?.storageBackend === "redis"
+                            ? "Redis REST"
+                            : localCaps?.storageBackend === "firestore"
+                              ? "Google Cloud Firestore"
+                              : "Cloud Vault Sync"}
                       </span>
-                      <span className={localCaps?.serverVault ? "text-emerald-400" : "text-amber-300"}>
-                        {localCaps?.serverVault ? "Server disk" : "This browser only"}
+                      <span className={
+                        localCaps?.storageBackend === "turso" ||
+                        localCaps?.storageBackend === "redis" ||
+                        localCaps?.storageBackend === "firestore"
+                          ? "text-emerald-400"
+                          : "text-slate-400"
+                      }>
+                        {localCaps?.storageBackend === "turso" ||
+                        localCaps?.storageBackend === "redis" ||
+                        localCaps?.storageBackend === "firestore"
+                          ? "Configured"
+                          : "Not active"}
                       </span>
                     </div>
                     <p className="mt-1 text-[10px] leading-relaxed text-slate-400">
-                      {localCaps?.serverVault
-                        ? "Encrypted vaults sync through this server’s persistent disk. Back up its data directory."
-                        : "Vaults do not sync across devices. Download a portable encrypted backup before clearing browser data."}
+                      {localCaps?.storageBackend === "turso" ||
+                      localCaps?.storageBackend === "redis" ||
+                      localCaps?.storageBackend === "firestore"
+                        ? localCaps.serverVault
+                          ? "Encrypted vault sync is enabled for this deployment."
+                          : "Shared storage is configured, but vault sync is disabled."
+                        : localCaps?.serverVault
+                          ? `Current vault storage: ${localCaps.storageBackend === "disk" ? "server disk" : "shared storage"}. Configure Turso, Firestore, or Redis for cloud sync.`
+                          : "Vault sync is disabled. Configure Turso, Firestore, or Redis in your hosting environment."}
                     </p>
+                    {localCaps?.storageBackend !== "turso" &&
+                      localCaps?.storageBackend !== "redis" &&
+                      localCaps?.storageBackend !== "firestore" && (
+                        <a href="https://github.com/sarakplaystore/sushi#3-deploy-to-vercel--optional-companion-vps-gateway" target="_blank" rel="noreferrer" className="mt-1 inline-block text-[10px] font-medium text-sky-300 underline decoration-sky-300/40 underline-offset-2 hover:text-sky-200">Cloud storage setup guide</a>
+                      )}
                   </div>
                   <button ref={settingsFirstActionRef} type="button" onClick={() => {
                     setSettingsOpen(false);
@@ -2978,7 +2949,7 @@ export function SushiWorkspace() {
               )}
               {localCaps && !localCaps.serverVault && (
                 <div role="status" className="rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-xs text-amber-100">
-                  Your vault is stored only in this browser; it will not sync to other devices. Download a portable encrypted backup before clearing browser data. {localCaps.mode !== "vercel" && "Enable SUSHI_SERVER_VAULT on a server with persistent disk to sync across devices."}
+                  Shared vault storage is disabled or not configured. Saved connections can appear in other tabs of this browser, but not on other devices. {localCaps.mode === "vercel" ? "Connect Turso, Firestore, or persistent Redis REST storage to this Vercel project to enable cross-device sync. Keep this browser's data until migration is complete." : "Enable persistent shared vault storage to sync other devices."}
                 </div>
               )}
 
@@ -3506,7 +3477,6 @@ export function SushiWorkspace() {
                     isActive={isActive}
                     guacdAvailable={effectiveRdpGuacd}
                     websocketAvailable={effectiveWsSsh}
-                    serverless={localCaps?.mode === "vercel"}
                     rdpCleanPathAvailable={effectiveRdpCleanPath}
                     gatewaySettings={gatewaySettings}
                     onEditCredentials={() => editRdpConnection(tab)}
@@ -3604,7 +3574,7 @@ export function SushiWorkspace() {
           }, passphrase)
         }
         onImportEnvelope={async (env, pass) => {
-          const plain = await decryptVaultEnvelope(env, pass, { requireVaultData: true });
+          const plain = await decryptVaultEnvelope(env, pass);
           const nextKeys = plain.sshKeys || [];
           const nextEnforce = Boolean(plain.enforceKeyWhitelist);
           const saved = await persistVault(

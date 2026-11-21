@@ -1374,10 +1374,6 @@ export function VaultSecurityModal({
                   iCloud Drive or another location you control. This is manual, not
                   automatic iCloud sync; Sushi cannot read Apple device backups.
                 </p>
-                <p className="text-[11px] leading-relaxed text-slate-400">
-                  Backups include hosts, snippets, SSH keys, and the key-whitelist setting,
-                  but not passkeys or workspace history (open tabs, recent hosts, and resumable runs).
-                </p>
                 <div className="grid gap-2 sm:grid-cols-2">
                   <label className="sr-only" htmlFor="backup-passphrase">Backup passphrase</label>
                   <input
@@ -1447,10 +1443,7 @@ export function VaultSecurityModal({
                         type="button"
                         disabled={restoringBackup}
                         onClick={async () => {
-                          const destination = serverVaultEnabled
-                            ? "the shared server vault (affecting all synced devices)"
-                            : "this browser's vault";
-                          if (!window.confirm(`Replace ${destination} with this backup? Existing hosts, keys, and snippets will be overwritten.`)) return;
+                          if (!window.confirm("Replace the current vault with this backup? Existing hosts, keys, and snippets will be overwritten.")) return;
                           setRestoringBackup(true);
                           try {
                             await onImportEnvelope(pendingImport, importPass);

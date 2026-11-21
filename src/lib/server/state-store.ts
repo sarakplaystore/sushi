@@ -1,55 +1,243 @@
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
+import {
+  compareAndSwapTursoAuthWithVaultGuard,
+  compareAndSwapTursoRecord,
+  readTursoRecord,
+  type TursoStoreConfig,
+} from "./turso-store";
 
-/** The self-hosted account and encrypted vault are ordinary files, not a database.
- * Vercel has an ephemeral filesystem and therefore has no server-side store.
+/** Small durable store for the single admin account and encrypted vault.
+ * Vercel's filesystem is ephemeral; Turso, Redis, or Firestore is required there.
  */
 type RecordName = "auth" | "vault";
-export type StoreKind = "disk" | "none";
+export type StoreKind = "disk" | "redis" | "turso" | "firestore" | "none";
 
-// These are detected only to prevent an upgraded deployment from silently
-// starting with an empty account/vault. Their values are never read or used to
-// connect to a database. Remove them after backing up and migrating the old data.
-const LEGACY_DATABASE_ENV = [
-  "SUSHI_TURSO_DATABASE_URL", "SUSHI_TURSO_AUTH_TOKEN",
-  "TURSO_DATABASE_URL", "TURSO_AUTH_TOKEN",
-  "SUSHI_FIRESTORE_PROJECT_ID", "SUSHI_FIRESTORE_DATABASE_ID", "SUSHI_FIRESTORE_CREDENTIALS_JSON",
-  "SUSHI_REDIS_REST_URL", "SUSHI_REDIS_REST_TOKEN",
-  "UPSTASH_REDIS_REST_URL", "UPSTASH_REDIS_REST_TOKEN",
-  "KV_REST_API_URL", "KV_REST_API_TOKEN",
-  // Compose forwards presence-only markers, not the old credential values.
-  "SUSHI_LEGACY_TURSO_CONFIGURED", "SUSHI_LEGACY_FIRESTORE_CONFIGURED", "SUSHI_LEGACY_REDIS_CONFIGURED",
-] as const;
+function storagePrefix(): string {
+  const fallback = [
+    "sushi",
+    process.env.VERCEL_PROJECT_ID?.trim() || "default",
+    process.env.VERCEL_ENV?.trim() || "default",
+  ].join(":");
+  const prefix = process.env.SUSHI_STORAGE_PREFIX?.trim() || fallback;
+  if (!/^[a-zA-Z0-9:_-]{1,160}$/.test(prefix)) {
+    throw new Error("SUSHI_STORAGE_PREFIX must contain only letters, numbers, colons, underscores, or hyphens.");
+  }
+  return prefix;
+}
+
+function firestoreConfig() {
+  const projectId = process.env.SUSHI_FIRESTORE_PROJECT_ID?.trim() || "";
+  const databaseId = process.env.SUSHI_FIRESTORE_DATABASE_ID?.trim() || "(default)";
+  if (!/^[a-z][a-z0-9-]{4,28}[a-z0-9]$/.test(projectId)) {
+    throw new Error("Firestore is misconfigured: set a valid SUSHI_FIRESTORE_PROJECT_ID on the server.");
+  }
+  if (!/^(\(default\)|[a-zA-Z0-9._-]{1,100})$/.test(databaseId)) {
+    throw new Error("Firestore is misconfigured: the database ID is invalid.");
+  }
+  const json = process.env.SUSHI_FIRESTORE_CREDENTIALS_JSON?.trim();
+  let credentials: { client_email: string; private_key: string } | undefined;
+  if (json) {
+    try {
+      const parsed: unknown = JSON.parse(json);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error();
+      const data = parsed as Record<string, unknown>;
+      if (data.type !== "service_account" || typeof data.client_email !== "string" || !data.client_email.trim() ||
+          typeof data.private_key !== "string" || !data.private_key.trim()) throw new Error();
+      credentials = { client_email: data.client_email, private_key: data.private_key };
+    } catch {
+      // Never include the JSON or private key in an error returned to a browser.
+      throw new Error("Firestore is misconfigured: provide valid server-side service-account JSON, or use Application Default Credentials.");
+    }
+  }
+  return { projectId, databaseId, prefix: storagePrefix(), ...(credentials ? { credentials } : {}) };
+}
+
+interface RedisConfig {
+  url: string;
+  token: string;
+  prefix: string;
+}
+
+function redisConfig(): RedisConfig | null {
+  const candidates = [
+    [process.env.SUSHI_REDIS_REST_URL, process.env.SUSHI_REDIS_REST_TOKEN],
+    [process.env.UPSTASH_REDIS_REST_URL, process.env.UPSTASH_REDIS_REST_TOKEN],
+    [process.env.KV_REST_API_URL, process.env.KV_REST_API_TOKEN],
+  ];
+  for (const [rawUrl, rawToken] of candidates) {
+    const url = rawUrl?.trim() || "";
+    const token = rawToken?.trim() || "";
+    if (!url && !token) continue;
+    if (!url || !token) {
+      throw new Error("Shared storage is misconfigured: both the Redis REST URL and token are required.");
+    }
+    let parsed: URL;
+    try {
+      parsed = new URL(url);
+    } catch {
+      throw new Error("Shared storage has an invalid Redis REST URL.");
+    }
+    const localHttp = parsed.protocol === "http:" &&
+      ["localhost", "127.0.0.1", "[::1]"].includes(parsed.hostname);
+    if ((parsed.protocol !== "https:" && !localHttp) || parsed.username || parsed.password || parsed.search || parsed.hash) {
+      throw new Error("Shared storage requires an HTTPS Redis REST URL without embedded credentials.");
+    }
+    return { url: url.replace(/\/+$/, ""), token, prefix: storagePrefix() };
+  }
+  return null;
+}
+
+function tursoConfig(): TursoStoreConfig | null {
+  const candidates = [
+    [process.env.SUSHI_TURSO_DATABASE_URL, process.env.SUSHI_TURSO_AUTH_TOKEN],
+    [process.env.TURSO_DATABASE_URL, process.env.TURSO_AUTH_TOKEN],
+  ];
+  for (const [rawUrl, rawToken] of candidates) {
+    const url = rawUrl?.trim() || "";
+    const token = rawToken?.trim() || "";
+    if (!url && !token) continue;
+    if (!url || !token) {
+      throw new Error("Shared storage is misconfigured: both the Turso database URL and auth token are required.");
+    }
+    const isLibsql = /^libsql:\/\//i.test(url);
+    const isWss = /^wss:\/\//i.test(url);
+    const normalizedInput = isLibsql || isWss ? url.replace(/^(libsql|wss):\/\//i, "https://") : url;
+    let parsed: URL;
+    try {
+      parsed = new URL(normalizedInput);
+    } catch {
+      throw new Error("Shared storage has an invalid Turso database URL.");
+    }
+    if (parsed.username || parsed.password || parsed.hash) {
+      throw new Error("Shared storage requires a Turso database URL without embedded credentials.");
+    }
+    let tlsParam: boolean | undefined;
+    for (const [key, val] of parsed.searchParams.entries()) {
+      if (key === "tls" && (val === "0" || val === "1")) {
+        tlsParam = val === "1";
+      } else {
+        throw new Error("Shared storage requires a Turso database URL without embedded credentials or unsupported query options.");
+      }
+    }
+    const isLoopback = ["localhost", "127.0.0.1", "[::1]"].includes(parsed.hostname);
+    let scheme: "http:" | "https:";
+    if (isLibsql) {
+      if (tlsParam === false) {
+        if (!isLoopback || !parsed.port) {
+          throw new Error("Shared storage requires TLS for non-local Turso database URLs.");
+        }
+        scheme = "http:";
+      } else {
+        scheme = "https:";
+      }
+    } else if (parsed.protocol === "https:") {
+      if (tlsParam === false) {
+        throw new Error("Shared storage has an invalid TLS setting on an https:// Turso database URL.");
+      }
+      scheme = "https:";
+    } else if (parsed.protocol === "http:" && isLoopback && tlsParam !== true) {
+      scheme = "http:";
+    } else {
+      throw new Error("Shared storage requires a libsql:// or https:// Turso database URL.");
+    }
+    const basePath = parsed.pathname.replace(/\/+$/, "");
+    return {
+      httpUrl: `${scheme}//${parsed.host}${basePath}`,
+      token,
+      prefix: storagePrefix(),
+    };
+  }
+  return null;
+}
 
 export function getStateStoreKind(): StoreKind {
   const selected = process.env.SUSHI_STORAGE_BACKEND?.trim().toLowerCase() || "auto";
-  if (["redis", "turso", "firestore"].includes(selected) ||
-      LEGACY_DATABASE_ENV.some((name) => Boolean(process.env[name]?.trim()))) {
-    throw new Error(
-      "Legacy database configuration detected. Sushi no longer connects to database storage. " +
-      "Back up your account and vault using the previous version, then remove the old database " +
-      "environment variables and redeploy. See the migration guide in the README."
-    );
+  if (selected === "firestore") {
+    firestoreConfig();
+    return "firestore";
   }
-  if (selected !== "auto" && selected !== "disk") {
-    throw new Error("SUSHI_STORAGE_BACKEND must be auto or disk.");
+  if (selected === "redis") {
+    if (!redisConfig()) throw new Error("Shared storage is misconfigured: Redis REST URL and token are required.");
+    return "redis";
   }
-  if (selected === "disk" && process.env.VERCEL === "1") {
-    throw new Error("Server disk is ephemeral on Vercel. Remove SUSHI_STORAGE_BACKEND=disk and configure environment-based login.");
+  if (selected === "turso") {
+    if (!tursoConfig()) throw new Error("Shared storage is misconfigured: Turso database URL and auth token are required.");
+    return "turso";
   }
+  if (selected === "disk") {
+    if (process.env.VERCEL === "1") throw new Error("Disk storage is ephemeral on Vercel; configure Turso, Firestore, or Redis instead.");
+    return "disk";
+  }
+  if (selected !== "auto") throw new Error("SUSHI_STORAGE_BACKEND must be auto, disk, redis, turso, or firestore.");
+  if (process.env.SUSHI_FIRESTORE_PROJECT_ID?.trim() || process.env.SUSHI_FIRESTORE_DATABASE_ID?.trim() || process.env.SUSHI_FIRESTORE_CREDENTIALS_JSON?.trim()) {
+    throw new Error("Select SUSHI_STORAGE_BACKEND=firestore to enable the configured Firestore database.");
+  }
+  const hasRedis = Boolean(redisConfig());
+  const hasTurso = Boolean(tursoConfig());
+  if (hasRedis && hasTurso) {
+    throw new Error("Multiple shared storage backends (Redis and Turso) are configured; set SUSHI_STORAGE_BACKEND=redis or SUSHI_STORAGE_BACKEND=turso.");
+  }
+  if (hasRedis) return "redis";
+  if (hasTurso) return "turso";
   return process.env.VERCEL === "1" ? "none" : "disk";
 }
 
+async function firestoreStore() {
+  // Load the Google SDK only when this backend is selected.
+  const { getFirestoreStateStore } = await import("./firestore-store");
+  return getFirestoreStateStore(firestoreConfig());
+}
+
 export function hasPersistentStateStore(): boolean {
-  return getStateStoreKind() === "disk";
+  return getStateStoreKind() !== "none";
+}
+
+/** Used by the offline migration command; never overwrites a target namespace. */
+export async function initializeEmptyFirestore(auth: string | null, vault: string | null): Promise<boolean> {
+  if (getStateStoreKind() !== "firestore") throw new Error("Select Firestore storage before migrating.");
+  return (await firestoreStore()).initializeEmpty(auth, vault);
 }
 
 function recordPath(name: RecordName): string {
   const directory = process.env.DATA_DIR?.trim() || path.join(process.cwd(), "data");
-  // Runtime data lives outside the deployed bundle; do not trace local account
-  // files into serverless output.
+  // Runtime data lives outside the deployed bundle; do not trace the whole
+  // project (or accidentally include local account data) into serverless output.
   return path.join(/*turbopackIgnore: true*/ directory, name === "auth" ? "auth.json" : "vault.enc.json");
+}
+
+function redisKey(config: RedisConfig, name: RecordName): string {
+  // A shared hash tag also keeps both keys in the same Redis Cluster slot,
+  // allowing a password change to guard the vault revision atomically.
+  return `{${config.prefix}}:${name}:v1`;
+}
+
+async function command(config: RedisConfig, args: (string | number)[]): Promise<unknown> {
+  let response: Response;
+  try {
+    response = await fetch(config.url, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${config.token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(args),
+      cache: "no-store",
+      signal: AbortSignal.timeout(8000),
+    });
+  } catch {
+    throw new Error("Shared storage is unavailable. Try again before creating or changing an account.");
+  }
+  if (!response.ok) throw new Error("Shared storage is unavailable or rejected its credentials.");
+  let body: { result?: unknown; error?: unknown };
+  try {
+    body = await response.json() as { result?: unknown; error?: unknown };
+  } catch {
+    throw new Error("Shared storage returned an invalid response.");
+  }
+  if (body.error || !("result" in body)) throw new Error("Shared storage could not complete the request.");
+  return body.result;
 }
 
 async function readDiskFile(name: RecordName): Promise<string | null> {
@@ -62,11 +250,21 @@ async function readDiskFile(name: RecordName): Promise<string | null> {
 }
 
 export async function readStateRecord(name: RecordName): Promise<string | null> {
-  return getStateStoreKind() === "disk" ? readDiskFile(name) : null;
+  const kind = getStateStoreKind();
+  if (kind === "firestore") return (await firestoreStore()).read(name);
+  if (kind === "turso") return readTursoRecord(tursoConfig()!, name);
+  if (kind === "redis") {
+    const config = redisConfig()!;
+    const result = await command(config, ["GET", redisKey(config, name)]);
+    if (result === null) return null;
+    if (typeof result !== "string") throw new Error("Shared storage returned invalid Sushi data.");
+    return result;
+  }
+  return kind === "disk" ? readDiskFile(name) : null;
 }
 
-// Lock files coordinate separate Node processes on the same persistent disk.
-// Never automatically remove a stale lock: failing closed is safer than
+// A lock file coordinates separate Node processes on the same persistent disk.
+// A stale lock is not automatically removed: failing closed is safer than
 // deleting an active writer's lock and overwriting another device's changes.
 async function withDiskLock<T>(name: RecordName, action: () => Promise<T>): Promise<T> {
   const filename = recordPath(name);
@@ -108,7 +306,32 @@ export async function compareAndSwapAuthWithVaultGuard(
   nextAuth: string,
   expectedVault: string | null
 ): Promise<boolean> {
-  if (getStateStoreKind() !== "disk") throw new Error("Persistent storage is not configured.");
+  const kind = getStateStoreKind();
+  if (kind === "firestore") {
+    return (await firestoreStore()).compareAndSwapAuthWithVaultGuard(expectedAuth, nextAuth, expectedVault);
+  }
+  if (kind === "turso") {
+    return compareAndSwapTursoAuthWithVaultGuard(tursoConfig()!, expectedAuth, nextAuth, expectedVault);
+  }
+  if (kind === "redis") {
+    const config = redisConfig()!;
+    const script = `
+      local auth = redis.call('GET', KEYS[1])
+      local vault = redis.call('GET', KEYS[2])
+      if (ARGV[1] == 'missing' and auth) or (ARGV[1] == 'present' and auth ~= ARGV[2]) then return 0 end
+      if (ARGV[3] == 'missing' and vault) or (ARGV[3] == 'present' and vault ~= ARGV[4]) then return 0 end
+      redis.call('SET', KEYS[1], ARGV[5])
+      return 1
+    `;
+    const result = await command(config, [
+      "EVAL", script, 2, redisKey(config, "auth"), redisKey(config, "vault"),
+      expectedAuth === null ? "missing" : "present", expectedAuth ?? "",
+      expectedVault === null ? "missing" : "present", expectedVault ?? "", nextAuth,
+    ]);
+    if (result !== 0 && result !== 1) throw new Error("Shared storage returned an invalid write result.");
+    return result === 1;
+  }
+  if (kind !== "disk") throw new Error("Persistent storage is not configured.");
   // All multi-record mutations acquire auth before vault. Ordinary vault writes
   // take only the vault lock, so the guard and the account write are atomic.
   return withDiskLock("auth", () => withDiskLock("vault", async () => {
@@ -126,7 +349,29 @@ export async function compareAndSwapStateRecord(
   expected: string | null,
   next: string
 ): Promise<boolean> {
-  if (getStateStoreKind() !== "disk") throw new Error("Persistent storage is not configured.");
+  const kind = getStateStoreKind();
+  if (kind === "firestore") return (await firestoreStore()).compareAndSwap(name, expected, next);
+  if (kind === "turso") return compareAndSwapTursoRecord(tursoConfig()!, name, expected, next);
+  if (kind === "redis") {
+    const config = redisConfig()!;
+    const script = `
+      local current = redis.call('GET', KEYS[1])
+      if ARGV[1] == 'missing' then
+        if current then return 0 end
+      elseif not current or current ~= ARGV[2] then
+        return 0
+      end
+      redis.call('SET', KEYS[1], ARGV[3])
+      return 1
+    `;
+    const result = await command(config, [
+      "EVAL", script, 1, redisKey(config, name),
+      expected === null ? "missing" : "present", expected ?? "", next,
+    ]);
+    if (result !== 0 && result !== 1) throw new Error("Shared storage returned an invalid write result.");
+    return result === 1;
+  }
+  if (kind !== "disk") throw new Error("Persistent storage is not configured.");
   return withDiskLock(name, async () => {
     const current = await readDiskFile(name);
     if (current !== expected) return false;

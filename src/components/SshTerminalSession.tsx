@@ -38,16 +38,7 @@ import {
   type GatewaySettings,
   buildWebSocketUrl,
   getAuthHeaders,
-  resolveGatewayHttpBase,
 } from "@/lib/client/gateway";
-import {
-  GATEWAY_WAKE_TIMEOUT_MS,
-  type GatewayHandshakeFailure,
-  classifyGatewayClose,
-  countdownSecondsLeft,
-  decideGatewayRetry,
-  wakeGateway,
-} from "@/lib/client/gateway-retry";
 import {
   type SharedSessionView,
   loadShareDisplayName,
@@ -1681,11 +1672,6 @@ export function SshTerminalSession({
     setStreamingStdinBlocked(false);
     let resizeObserver: ResizeObserver | null = null;
     let pingInterval: ReturnType<typeof setInterval> | null = null;
-    /**
-     * Cancels the gateway warm-up retry and its countdown. The timers live inside
-     * the `shouldUseWs` branch, so the cleanup reaches them through this.
-     */
-    let stopGatewayTimers: (() => void) | null = null;
 
     async function initSession() {
       if (!containerRef.current) return;
@@ -2014,326 +2000,178 @@ export function SshTerminalSession({
 
       if (shouldUseWs) {
         const wsUrl = buildWebSocketUrl("/ws/ssh", gatewaySettings);
-        const usingRemoteGateway = Boolean(gatewaySettings.gatewayUrl.trim());
-        const utf8Decoder = new TextDecoder("utf-8");
+        term.writeln(
+          `\x1b[90mConnecting via WebSocket PTY to ${profile.username}@${profile.host}:${profile.port}...\x1b[0m`
+        );
 
         let openedReady = false;
         let fellBack = false;
         let gotServerMessage = false;
         let lastServerError = "";
-        /** Attempt currently in flight; the retry timer owns the next one. */
-        let attempt = 1;
-        let retryTimer: ReturnType<typeof setTimeout> | null = null;
-        let countdownTimer: ReturnType<typeof setInterval> | null = null;
-        /** The socket being connected, so a retry can drop the previous one. */
-        let ws: WebSocket | null = null;
+        const usingRemoteGateway = Boolean(gatewaySettings.gatewayUrl.trim());
+        const utf8Decoder = new TextDecoder("utf-8");
+        const ws = new WebSocket(wsUrl);
+        wsRef.current = ws;
 
-        const clearCountdown = () => {
-          if (countdownTimer) {
-            clearInterval(countdownTimer);
-            countdownTimer = null;
+        ws.onopen = () => {
+          ws.send(
+            JSON.stringify({
+              type: "auth",
+              sessionToken: getStoredSessionToken() || undefined,
+              gatewayToken: gatewaySettings.gatewayToken || undefined,
+              cols: term.cols || 100,
+              rows: term.rows || 30,
+              credentials: {
+                host: profile.host,
+                port: profile.port,
+                username: profile.username,
+                authMethod: profile.authMethod,
+                password: profile.password,
+                privateKey: profile.privateKey,
+                passphrase: profile.passphrase,
+              },
+            })
+          );
+
+          pingInterval = setInterval(() => {
+            if (ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify({ type: "ping" }));
+            }
+          }, 20000);
+        };
+
+        ws.onmessage = (event) => {
+          try {
+            const msg = JSON.parse(event.data);
+            if (msg.type !== "pong") gotServerMessage = true;
+            if (msg.type === "ready") {
+              openedReady = true;
+              setStatus("connected");
+              if (msg.fingerprint) setFingerprint(msg.fingerprint);
+              onConnectedRef.current?.();
+              term.focus();
+              // "Start sharing" pressed while this shell was still connecting.
+              const pendingShare = pendingShareRef.current;
+              if (pendingShare) {
+                pendingShareRef.current = null;
+                ws.send(
+                  JSON.stringify({
+                    type: "share",
+                    action: "start",
+                    write: pendingShare.write,
+                    passcode: pendingShare.access === "passcode" ? "auto" : "none",
+                    name: loadShareDisplayName() || undefined,
+                  })
+                );
+              }
+              if (initialPath && initialPath !== "~") {
+                ws.send(
+                  JSON.stringify({
+                    type: "input",
+                    data: `cd ${JSON.stringify(initialPath)}\r`,
+                  })
+                );
+              }
+            } else if (msg.type === "data" && typeof msg.data === "string") {
+              const text = utf8Decoder.decode(decodeBase64Bytes(msg.data), {
+                stream: true,
+              });
+              term.write(text);
+            } else if (msg.type === "share") {
+              if (msg.action === "started" || msg.action === "rotated") {
+                setSharedInfo((msg.share as SharedSessionView) ?? null);
+                setSharePasscode(typeof msg.passcode === "string" ? msg.passcode : null);
+                setShareBusy(false);
+              } else if (msg.action === "stopped") {
+                setSharedInfo(null);
+                setSharePasscode(null);
+                setShareBusy(false);
+              }
+            } else if (msg.type === "participants") {
+              setSharedInfo((prev) =>
+                prev
+                  ? {
+                      ...prev,
+                      participants: Array.isArray(msg.participants)
+                        ? msg.participants
+                        : [],
+                    }
+                  : prev
+              );
+            } else if (msg.type === "activity" && typeof msg.by === "string") {
+              setShareActivity({ by: msg.by, at: Date.now() });
+              if (shareActivityTimer.current) clearTimeout(shareActivityTimer.current);
+              shareActivityTimer.current = setTimeout(
+                () => setShareActivity(null),
+                4000
+              );
+            } else if (msg.type === "error") {
+              lastServerError = String(msg.message || "");
+              // A remote gateway that refuses our tokens closes with 1008 next;
+              // onclose falls back to serverless SSH instead of showing a dead end.
+              if (!(usingRemoteGateway && !openedReady)) {
+                if (!openedReady) {
+                  // The PTY never opened: one sentence and the retry card, exactly
+                  // like the serverless transport.
+                  failConnectRef.current(lastServerError);
+                } else {
+                  setStatus("error");
+                  term.writeln(`\r\n\x1b[31mSSH Error: ${msg.message}\x1b[0m`);
+                }
+              }
+            } else if (msg.type === "exit") {
+              setStatus("disconnected");
+              term.writeln("\r\n\x1b[33mRemote SSH session ended.\x1b[0m");
+            }
+          } catch {
+            // ignore
           }
         };
 
-        const stopRetryTimers = () => {
-          clearCountdown();
-          if (retryTimer) {
-            clearTimeout(retryTimer);
-            retryTimer = null;
+        ws.onerror = () => {
+          if (!openedReady && !disposed && !fellBack) {
+            fellBack = true;
+            ws.close();
+            switchToServerlessShell(
+              usingRemoteGateway
+                ? "Could not reach the VPS gateway WebSocket — falling back to Serverless HTTP Streaming SSH."
+                : "WebSocket endpoint unavailable on this host — falling back to Serverless HTTP Streaming SSH."
+            );
           }
         };
-        stopGatewayTimers = stopRetryTimers;
 
-        /**
-         * Ends the attempt to reach the gateway. A failure a retry cannot fix is
-         * shown as the real error it is; only an unreachable gateway downgrades the
-         * session, and only after every attempt is spent.
-         */
-        const giveUp = (decision: { action: "fail" | "fallback"; reason: string }) => {
-          if (fellBack || disposed) return;
-          fellBack = true;
-          stopRetryTimers();
-          if (decision.action === "fail") {
-            failConnectRef.current(decision.reason);
+        ws.onclose = (event) => {
+          if (disposed) return;
+          if (openedReady) {
+            setStatus("disconnected");
+            // This socket is gone, so this tab no longer hosts that share. The
+            // shell itself keeps running for whoever is still attached.
+            setSharedInfo(null);
+            setSharePasscode(null);
             return;
           }
-          switchToServerlessShell(
-            `${decision.reason} Falling back to Serverless HTTP Streaming SSH.`
-          );
-        };
-
-        /**
-         * Opens one handshake. Re-entry is the retry path: the previous socket is
-         * dropped before a new one is created, and the countdown line is rewritten
-         * in place so the scrollback does not fill with one line per second.
-         */
-        const connect = () => {
-          if (disposed || fellBack || openedReady) return;
-
-          // One socket per attempt. Handlers bind to this one, so a retry
-          // cannot end up driving a socket that is already dead.
-          const socket = new WebSocket(wsUrl);
-          ws = socket;
-          wsRef.current = socket;
-
-          socket.onopen = () => {
-            socket.send(
-              JSON.stringify({
-                type: "auth",
-                sessionToken: getStoredSessionToken() || undefined,
-                gatewayToken: gatewaySettings.gatewayToken || undefined,
-                cols: term.cols || 100,
-                rows: term.rows || 30,
-                credentials: {
-                  host: profile.host,
-                  port: profile.port,
-                  username: profile.username,
-                  authMethod: profile.authMethod,
-                  password: profile.password,
-                  privateKey: profile.privateKey,
-                  passphrase: profile.passphrase,
-                },
-              })
+          if (fellBack) return;
+          if (usingRemoteGateway && (event.code === 1008 || !gotServerMessage)) {
+            // Gateway rejected the session (e.g. missing / wrong SUSHI_GATEWAY_TOKEN)
+            fellBack = true;
+            switchToServerlessShell(
+              `VPS gateway refused the session${
+                lastServerError ? `: ${lastServerError}` : ""
+              } — falling back to Serverless HTTP Streaming SSH.`
             );
-
-            pingInterval = setInterval(() => {
-              if (socket.readyState === WebSocket.OPEN) {
-                socket.send(JSON.stringify({ type: "ping" }));
-              }
-            }, 20000);
-          };
-
-          socket.onmessage = (event) => {
-            try {
-              const msg = JSON.parse(event.data);
-              if (msg.type !== "pong") gotServerMessage = true;
-              if (msg.type === "ready") {
-                openedReady = true;
-                setStatus("connected");
-                if (msg.fingerprint) setFingerprint(msg.fingerprint);
-                onConnectedRef.current?.();
-                term.focus();
-                // "Start sharing" pressed while this shell was still connecting.
-                const pendingShare = pendingShareRef.current;
-                if (pendingShare) {
-                  pendingShareRef.current = null;
-                  socket.send(
-                    JSON.stringify({
-                      type: "share",
-                      action: "start",
-                      write: pendingShare.write,
-                      passcode: pendingShare.access === "passcode" ? "auto" : "none",
-                      name: loadShareDisplayName() || undefined,
-                    })
-                  );
-                }
-                if (initialPath && initialPath !== "~") {
-                  socket.send(
-                    JSON.stringify({
-                      type: "input",
-                      data: `cd ${JSON.stringify(initialPath)}\r`,
-                    })
-                  );
-                }
-              } else if (msg.type === "data" && typeof msg.data === "string") {
-                const text = utf8Decoder.decode(decodeBase64Bytes(msg.data), {
-                  stream: true,
-                });
-                term.write(text);
-              } else if (msg.type === "share") {
-                if (msg.action === "started" || msg.action === "rotated") {
-                  setSharedInfo((msg.share as SharedSessionView) ?? null);
-                  setSharePasscode(typeof msg.passcode === "string" ? msg.passcode : null);
-                  setShareBusy(false);
-                } else if (msg.action === "stopped") {
-                  setSharedInfo(null);
-                  setSharePasscode(null);
-                  setShareBusy(false);
-                }
-              } else if (msg.type === "participants") {
-                setSharedInfo((prev) =>
-                  prev
-                    ? {
-                        ...prev,
-                        participants: Array.isArray(msg.participants)
-                          ? msg.participants
-                          : [],
-                      }
-                    : prev
-                );
-              } else if (msg.type === "activity" && typeof msg.by === "string") {
-                setShareActivity({ by: msg.by, at: Date.now() });
-                if (shareActivityTimer.current) clearTimeout(shareActivityTimer.current);
-                shareActivityTimer.current = setTimeout(
-                  () => setShareActivity(null),
-                  4000
-                );
-              } else if (msg.type === "error") {
-                lastServerError = String(msg.message || "");
-                // A remote gateway that refuses our tokens closes with 1008 next;
-                // onclose falls back to serverless SSH instead of showing a dead end.
-                if (!(usingRemoteGateway && !openedReady)) {
-                  if (!openedReady) {
-                    // The PTY never opened: one sentence and the retry card, exactly
-                    // like the serverless transport.
-                    failConnectRef.current(lastServerError);
-                  } else {
-                    setStatus("error");
-                    term.writeln(`\r\n\x1b[31mSSH Error: ${msg.message}\x1b[0m`);
-                  }
-                }
-              } else if (msg.type === "exit") {
-                setStatus("disconnected");
-                term.writeln("\r\n\x1b[33mRemote SSH session ended.\x1b[0m");
-              }
-            } catch {
-              // ignore
-            }
-          };
-
-          socket.onerror = () => {
-            // A socket that never opened fires onclose right after this, and that is
-            // where the retry decision lives — acting here too would double up. Once
-            // the PTY was open, an error is a live-session problem, not a handshake one.
-            if (openedReady || disposed || fellBack) return;
-            if (ws && socket.readyState === WebSocket.OPEN) {
-              try {
-                socket.close();
-              } catch {
-                // already closing
-              }
-            }
-          };
-
-          ws.onclose = (event) => {
-            if (disposed) return;
-            if (openedReady) {
-              setStatus("disconnected");
-              // This socket is gone, so this tab no longer hosts that share. The
-              // shell itself keeps running for whoever is still attached.
-              setSharedInfo(null);
-              setSharePasscode(null);
-              return;
-            }
-            if (fellBack) return;
-
-            const failure: GatewayHandshakeFailure = {
-              kind: classifyGatewayClose({
-                code: event.code,
-                gotServerMessage,
-                serverError: lastServerError,
-              }),
-              code: event.code,
-              message: lastServerError || undefined,
-              // Named separately from `message` so the "never answered" sentence
-              // can say which gateway it was talking about.
-              url: resolveGatewayHttpBase(gatewaySettings.gatewayUrl) || undefined,
-            };
-
-            // No remote gateway means this was the app's own same-origin /ws/ssh, so
-            // there is nothing to wake and nothing to retry: it is either there or it
-            // is not, and the serverless shell is the honest answer.
-            if (!usingRemoteGateway) {
-              fellBack = true;
-              switchToServerlessShell(
-                failure.kind === "refused" && failure.message
-                  ? `${failure.message} Falling back to Serverless HTTP Streaming SSH.`
-                  : "WebSocket closed before the SSH session started — falling back to Serverless HTTP Streaming SSH."
-              );
-              return;
-            }
-
-            const decision = decideGatewayRetry({ failure, attempt });
-            if (decision.action !== "retry") {
-              giveUp(decision);
-              return;
-            }
-
-            // Asleep or still booting: say so where the user can see it, count down,
-            // and try the handshake again instead of downgrading the whole session.
-            stopRetryTimers();
-            setStatus("connecting");
-            term.writeln(
-              `\x1b[90mGateway did not answer the handshake${
-                event.code ? ` (close ${event.code})` : ""
-              } — it may be starting up. Retrying in ${countdownSecondsLeft(
-                decision.delayMs,
-                0
-              )} s (attempt ${decision.attempt} of ${decision.of})…\x1b[0m`
-            );
-            const startedAt = Date.now();
-            countdownTimer = setInterval(() => {
-              if (disposed || fellBack) {
-                clearCountdown();
-                return;
-              }
-              const left = countdownSecondsLeft(decision.delayMs, Date.now() - startedAt);
-              // Rewrite the countdown in place rather than adding a line per tick.
-              term.write(`\x1b[2K\r\x1b[90mGateway retry in ${left} s (attempt ${decision.attempt} of ${decision.of})…\x1b[0m`);
-            }, 250);
-            retryTimer = setTimeout(() => {
-              retryTimer = null;
-              clearCountdown();
-              term.write("\r\n");
-              if (disposed || fellBack || openedReady) return;
-              // Drop the dead socket before opening the next one.
-              try {
-                ws?.close();
-              } catch {
-                // already closed
-              }
-              attempt = decision.attempt;
-              connect();
-            }, decision.delayMs);
-          };
-        };
-
-        /**
-         * Warm the gateway up before the first handshake. On a plan that suspends
-         * idle services an ordinary HTTP request boots the instance, so the
-         * handshake that follows does not have to be the thing that wakes it — and
-         * does not fail while it is still starting. A failed warm-up is not fatal:
-         * the handshake retries cover a slower boot.
-         */
-        void (async () => {
-          if (usingRemoteGateway && !disposed && !fellBack) {
-            term.write("\x1b[90mWaking the gateway…\x1b[0m");
-            const woke = await wakeGateway(gatewaySettings, GATEWAY_WAKE_TIMEOUT_MS, {
-              // A cold instance takes tens of seconds to boot. Without a running
-              // commentary "Waking the gateway…" just looks like a hang, so the
-              // line is rewritten in place as each ask comes back empty.
-              onProbe: ({ probe, waitedMs }) => {
-                if (disposed || fellBack) return;
-                term.write(
-                  `\x1b[2K\r\x1b[90mWaking the gateway… ${(waitedMs / 1000).toFixed(
-                    0
-                  )} s, ${probe} check${probe === 1 ? "" : "s"}\x1b[0m`
-                );
-              },
-            });
-            // End the in-place line either way, so what follows starts cleanly.
-            term.write("\x1b[2K\r");
-            if (disposed || fellBack) return;
-            if (woke.awake) {
-              term.writeln(
-                `\x1b[90mGateway is awake${
-                  woke.probes > 1 ? ` after ${woke.probes} checks` : ""
-                }.\x1b[0m`
-              );
-            } else {
-              term.writeln(
-                `\x1b[90mGateway did not answer the warm-up (${
-                  woke.error || "no answer"
-                }); trying the handshake anyway.\x1b[0m`
-              );
-            }
+            return;
           }
-          if (disposed || fellBack) return;
-          term.writeln(
-            `\x1b[90mConnecting via WebSocket PTY to ${profile.username}@${profile.host}:${profile.port}...\x1b[0m`
-          );
-          connect();
-        })();
+          if (usingRemoteGateway && lastServerError) {
+            failConnectRef.current(lastServerError);
+            return;
+          }
+          if (!gotServerMessage) {
+            fellBack = true;
+            switchToServerlessShell(
+              "WebSocket closed before the SSH session started — falling back to Serverless HTTP Streaming SSH."
+            );
+          }
+        };
       } else {
         switchToServerlessShell();
       }
@@ -2399,7 +2237,6 @@ export function SshTerminalSession({
     return () => {
       disposed = true;
       if (pingInterval) clearInterval(pingInterval);
-      stopGatewayTimers?.();
       resizeObserver?.disconnect();
       abortExecRef.current?.abort();
       wsRef.current?.close();

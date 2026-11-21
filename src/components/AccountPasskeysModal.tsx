@@ -473,8 +473,8 @@ export function AccountPasskeysModal({
                   <div className="rounded-xl border border-white/8 bg-[#121722] p-3 text-[11px] text-slate-400">
                     <div className="flex items-center justify-between gap-2">
                       <span>
-                        To use these passkeys on other browsers, configure{" "}
-                        <code className="text-slate-200">SUSHI_PASSKEYS_JSON</code> and redeploy:
+                        Cross-browser Vercel sync:{" "}
+                        <code className="text-slate-200">SUSHI_PASSKEYS_JSON</code>
                       </span>
                       <button
                         type="button"

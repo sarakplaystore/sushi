@@ -189,7 +189,7 @@ export interface SystemCapabilities {
   /** Team-shared SSH PTY sessions are possible (needs a persistent gateway). */
   sharedSsh?: boolean;
   serverVault: boolean;
-  storageBackend?: "disk" | "none";
+  storageBackend?: "disk" | "redis" | "turso" | "firestore" | "none";
   requiresGatewayToken: boolean;
   guacdHost?: string;
   nodeVersion: string;

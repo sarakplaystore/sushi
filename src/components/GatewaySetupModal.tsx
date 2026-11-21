@@ -450,10 +450,10 @@ export function GatewaySetupModal({
               </div>
               <p className="mt-2 text-xs leading-relaxed text-slate-400">
                 On <strong className="text-slate-200">Vercel</strong>, SFTP file management,
-                streaming SSH commands, and RDP probes run natively on Node serverless
-                functions. Live RDP over serverless HTTP may fail when requests reach different
-                instances. Attach a <strong className="text-slate-200">gateway URL</strong>{" "}
-                for reliable live RDP and persistent WebSocket PTY shells (full-screen{" "}
+                streaming SSH commands, and live HTML5 RDP desktops run natively on Node
+                serverless functions — no VPS needed for SSH, SFTP, or RDP. Vercel cannot accept a
+                WebSocket upgrade, so attach a <strong className="text-slate-200">gateway URL</strong>{" "}
+                below when you also want persistent WebSocket PTY shells (full-screen{" "}
                 <code className="text-slate-300">vim</code>/<code className="text-slate-300">tmux</code>{" "}
                 with resize) and team-shared terminals. Any host that keeps one process alive
                 works: a <strong className="text-slate-200">VPS</strong>,{" "}

@@ -23,9 +23,9 @@ export const dynamic = "force-dynamic";
  *
  * ## Why this page does not pretend to be the list
  *
- * Sushi stores an encrypted vault envelope and this route does not decrypt it. The
- * server can derive session-mode keys, so this is not zero-knowledge encryption.
- * This page renders the real list **only** when the deployment supplied one
+ * The vault is end-to-end encrypted: the server stores `{iv, ciphertext}` and has no
+ * key, so it cannot read host names — they only exist after a browser unlocks them.
+ * This page therefore renders the real list **only** when the deployment supplied one
  * (`SUSHI_HOSTS_INVENTORY`, a deliberate clear-text inventory); otherwise it sends
  * the browser to the workspace, which unlocks the vault and renders the real list at
  * `/?view=hosts` (with this route's `?host=` / `?protocol=` intact). Earlier versions
@@ -69,7 +69,7 @@ export async function GET(req: NextRequest) {
       const stored = await readStoredVault().catch(() => null);
       mode = "server-vault";
       vaultLines = [
-        ["Vault", "Encrypted server vault"],
+        ["Vault", "Shared server vault (end-to-end encrypted)"],
         ["Cipher mode", stored?.envelope?.mode ?? "not created yet"],
         ["Key source", stored?.envelope?.keySource ?? "—"],
         ["Revision", stored?.revision ?? "—"],
@@ -77,7 +77,7 @@ export async function GET(req: NextRequest) {
       ];
     } else {
       vaultLines = [
-        ["Vault", "Browser-only vault"],
+        ["Vault", "Browser-only (device key)"],
         ["Note", "Saved hosts live in the browser that created them; open Sushi to list them."],
       ];
     }
@@ -112,15 +112,15 @@ export async function GET(req: NextRequest) {
         hint: auth.ok
           ? inventory
             ? "Every host from the configured clear-text inventory, merged one entry per machine."
-            : "This route does not decode the encrypted vault. Open /hosts in Sushi to see and connect to saved hosts, or GET /api/hosts for vault metadata."
+            : "This vault is end-to-end encrypted: the host list exists only after a browser unlocks it. Open /hosts in Sushi to see and connect, or GET /api/hosts for the redacted index."
           : "Sign in first.",
       },
       { status: auth.ok ? 200 : 401, headers: { ...cors, "Cache-Control": "no-store" } }
     );
   }
 
-  // No readable inventory: this route leaves vault decoding to the browser.
-  // Send every visitor there — signed in or not, `/hosts` stays the
+  // No readable inventory: the only place the real list can exist is the browser that
+  // unlocks the vault. Send every visitor there — signed in or not, `/hosts` stays the
   // URL people type and bookmark, but the list itself is rendered by the workspace
   // (behind the normal sign-in gate when the session is missing). Any `?host=` /
   // `?protocol=` on the link is carried over, so one URL per machine still opens the

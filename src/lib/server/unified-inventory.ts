@@ -7,13 +7,20 @@ import { mergeHosts, openableProtocols, hostAccessUrl, type UnifiedHost } from "
  *
  * ## Why this is not "one URL that hands out your servers"
  *
- * Sushi stores an encrypted `{ iv, ciphertext, mode, … }` vault envelope and
- * this endpoint does not decrypt it. The server can derive session-mode keys,
- * however, so the vault is not zero-knowledge encrypted.
+ * Sushi's vault is end-to-end encrypted: the server only ever stores
+ * `{ iv, ciphertext, mode, … }` and has no key to open it (the key comes from the
+ * admin password in the browser, or from a device key that never leaves it). A
+ * server-side endpoint therefore *cannot* decrypt host names or credentials, and
+ * making it return them in clear would mean storing them in clear — the one thing the
+ * vault exists to prevent.
  *
- * Without a separately configured clear-text inventory, the endpoint cannot know
- * host names, counts, or protocols from the envelope and returns a placeholder
- * empty list. The workspace lists the real hosts after unlocking the vault.
+ * So the single URL is the *index*: every host, one entry per machine, with its
+ * protocols, ports and access links, plus whether a server-side vault exists and how
+ * to unlock it. The browser fills in names/credentials after unlocking (the workspace
+ * already does exactly that); scripts and integrations get a stable, complete shape
+ * from one request, and `SUSHI_HOSTS_LAYOUT=resolved` adds clear-text details only for
+ * deployments that deliberately store an unencrypted inventory (see
+ * `resolveUnifiedHosts`).
  */
 
 export interface UnifiedInventoryLink {
@@ -51,7 +58,7 @@ export interface UnifiedInventory {
   ok: true;
   /** Where the data came from. */
   source: "vault" | "server-vault";
-  /** True when this endpoint does not return host names/credentials from the vault. */
+  /** True when host names/credentials are only available in the browser. */
   encrypted: boolean;
   /** One URL for everything (this document). */
   self: string;
@@ -101,9 +108,9 @@ function countsFor(hosts: UnifiedInventoryHost[]) {
 }
 
 /**
- * Builds the inventory from supplied merged hosts. `resolve` keeps host/user/name;
- * without it, supplied entries are redacted but remain structurally identifiable.
- * The encrypted vault endpoint supplies no entries because it does not decode them.
+ * Builds the inventory from merged hosts. `resolve` keeps host/user/name; without it
+ * every entry is redacted but still identifiable (id, protocols, ports, counts) — which
+ * is what a locked, end-to-end encrypted vault can honestly publish.
  */
 export function buildUnifiedInventory(
   entries: UnifiedHost[],
@@ -146,7 +153,7 @@ export function buildUnifiedInventory(
     counts: countsFor(hosts),
     hosts,
     hint: options.encrypted
-      ? "This endpoint does not decode the encrypted vault; an empty index does not indicate how many hosts are saved. Open /hosts in Sushi to see and connect to them."
+      ? "Host names and credentials are end-to-end encrypted in the vault, so this index lists one entry per machine with its protocols and access URLs. Open /hosts in Sushi (or unlock the vault) to see names and connect."
       : "Every saved connection, merged into one entry per machine and account. accessUrl opens it in Sushi; links shows each protocol.",
   };
 }

@@ -7,6 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import tls from "node:tls";
 import zlib from "node:zlib";
+import initSqlJs from "sql.js";
 import { NextRequest } from "next/server";
 
 import {
@@ -19,7 +20,6 @@ import {
   parseRdpDestination,
   RDCLEANPATH_VERSION_1,
   RdpFrameDecoder,
-  registerRdpHttpTunnel,
 } from "../src/lib/server/rdcleanpath";
 import { buildRdpParams } from "../src/lib/server/rdp-params";
 import { createGatewayWebSockets } from "../src/lib/server/ws-gateway";
@@ -455,6 +455,7 @@ async function main() {
 
   // Start HTTP + WebSocket server exposing BOTH /ws/rdp-cleanpath AND /api/rdp/stream + /api/rdp/input
   let simulateVercelBufferedRequestBodies = false;
+  let simulateIsolatedInputLambda = false;
   const wsDispatcher = createGatewayWebSockets();
   const runWithOptionalIsolatedLambda = async <T>(
     isolate: boolean,
@@ -481,12 +482,19 @@ async function main() {
 
       if (req.url?.startsWith("/api/rdp/stream")) {
         let nextReq: NextRequest;
+        let isInputAction = false;
         if (simulateVercelBufferedRequestBodies) {
           // Exact Vercel Serverless / AWS Lambda behavior: request body is buffered
           // completely until END_STREAM before invoking the route handler.
           const chunks: Buffer[] = [];
           for await (const c of req) chunks.push(Buffer.from(c));
           const rawBuf = Buffer.concat(chunks);
+          if (headers.get("content-type")?.includes("application/json")) {
+            try {
+              const parsed = JSON.parse(rawBuf.toString("utf8")) as { action?: string };
+              isInputAction = parsed?.action === "input";
+            } catch {}
+          }
           nextReq = new NextRequest(reqUrl, {
             method: req.method || "POST",
             headers,
@@ -515,7 +523,10 @@ async function main() {
             duplex: "half",
           });
         }
-        const nextRes = await postRdpStream(nextReq);
+        const nextRes = await runWithOptionalIsolatedLambda(
+          simulateIsolatedInputLambda && isInputAction,
+          () => postRdpStream(nextReq)
+        );
         res.writeHead(nextRes.status, Object.fromEntries(nextRes.headers.entries()));
         res.flushHeaders();
         if (nextRes.body) {
@@ -744,35 +755,131 @@ async function main() {
       __setStreamingRequestBodySupport(null);
     }
 
-    // 5d. Isolated serverless instances must not claim undelivered input succeeded.
+    // 5d. Multi-Lambda Isolated Vercel + Turso Cross-Instance Relay (`libsql://127.0.0.1:<port>?tls=0`)
     {
-      const previousVercel = process.env.VERCEL;
+      const SQL = await initSqlJs();
+      const relayDb = new SQL.Database();
+      let tursoPipelineCalls = 0;
+
+      const tursoServer = http.createServer(async (req, res) => {
+        if (req.method !== "POST" || req.url !== "/v2/pipeline") {
+          res.writeHead(404).end();
+          return;
+        }
+        assert.equal(req.headers.authorization, "Bearer rdp-turso-test-token");
+        tursoPipelineCalls += 1;
+        const chunks: Buffer[] = [];
+        for await (const c of req) chunks.push(Buffer.from(c));
+        const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as {
+          requests: Array<{
+            type: string;
+            stmt?: { sql: string; args?: Array<{ type: string; value?: string }> };
+          }>;
+        };
+        const results: unknown[] = [];
+        for (const r of body.requests) {
+          if (r.type !== "execute" || !r.stmt) {
+            results.push({ type: "ok", response: { type: "close" } });
+            continue;
+          }
+          const bindArgs = (r.stmt.args || []).map((a) =>
+            a.type === "null"
+              ? null
+              : a.type === "integer"
+                ? Number(a.value)
+                : String(a.value ?? "")
+          );
+          const stmt = relayDb.prepare(r.stmt.sql);
+          stmt.bind(bindArgs);
+          const rows: Array<Array<{ type: string; value?: string }>> = [];
+          while (stmt.step()) {
+            const raw = stmt.get();
+            rows.push(
+              raw.map((cell) =>
+                cell === null
+                  ? { type: "null" }
+                  : typeof cell === "number"
+                    ? { type: "integer", value: String(cell) }
+                    : { type: "text", value: String(cell) }
+              )
+            );
+          }
+          stmt.free();
+          // Exact live Turso Hrana v2 wire behavior: `rows` is always returned
+          // as `[]` even for DDL (`CREATE TABLE IF NOT EXISTS`) / DML!
+          results.push({
+            type: "ok",
+            response: {
+              type: "execute",
+              result: {
+                cols: [],
+                rows,
+                affected_row_count: relayDb.getRowsModified(),
+              },
+            },
+          });
+        }
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ results }));
+      });
+
+      await new Promise<void>((resolve) =>
+        tursoServer.listen(0, "127.0.0.1", () => resolve())
+      );
+      const tursoPort = (tursoServer.address() as net.AddressInfo).port;
+
+      const prevVercel = process.env.VERCEL;
+      const prevTursoUrl = process.env.TURSO_DATABASE_URL;
+      const prevTursoToken = process.env.TURSO_AUTH_TOKEN;
       process.env.VERCEL = "1";
-      const frames: string[] = [];
-      const sessionId = "rdpsess_isolation_test_12345";
-      const tunnel = registerRdpHttpTunnel({
-        sessionId,
-        username: "gateway",
-        writeFrames: (batch) => frames.push(...batch.map((value) => value.toString())),
-        close: () => {},
-      });
-      const inputRequest = () => new NextRequest(`http://localhost/api/rdp/stream`, {
-        method: "POST",
-        headers: { "content-type": "application/json", "x-sushi-token": "rdp-e2e-gateway-secret" },
-        body: JSON.stringify({ action: "input", sessionId, seq: 0, frames: [Buffer.from("hello").toString("base64")] }),
-      });
+      process.env.TURSO_DATABASE_URL = `libsql://127.0.0.1:${tursoPort}?tls=0`;
+      process.env.TURSO_AUTH_TOKEN = "rdp-turso-test-token";
+      simulateVercelBufferedRequestBodies = true;
+      simulateIsolatedInputLambda = true;
+
       try {
-        const isolated = await runWithOptionalIsolatedLambda(true, () => postRdpStream(inputRequest()));
-        assert.equal(isolated.status, 410);
-        assert.match((await isolated.json()).error, /persistent gateway/i);
-        assert.deepEqual(frames, []);
-        const sameProcess = await postRdpStream(inputRequest());
-        assert.equal(sameProcess.status, 200);
-        assert.deepEqual(frames, ["hello"]);
+        const nextTlsData = rdpServer.waitForNextTlsPayload();
+
+        const proxyUrl = buildServerlessRdpProxyUrl({
+          httpBase: `http://127.0.0.1:${httpPort}`,
+          gatewaySettings: {
+            gatewayUrl: `http://127.0.0.1:${httpPort}`,
+            gatewayToken: "rdp-e2e-gateway-secret",
+          },
+          ignoreCert: true,
+        });
+
+        const builder = new SessionBuilder();
+        builder.username("multi-lambda-user");
+        builder.password("TursoRelayPass!");
+        builder.destination(`127.0.0.1:${rdpServer.port}`);
+        builder.proxyAddress(proxyUrl);
+        configureCommonBuilder(builder, 1280, 720);
+        builder.extension(new Extension("enable_credssp", true));
+
+        const connectPromise = builder.connect().catch((e) => e);
+        const tlsPayload = await nextTlsData;
+        await connectPromise;
+
+        assert.ok(
+          tlsPayload.includes(Buffer.from("NTLMSSP\0", "ascii")),
+          "Real IronRDP WASM relayed CredSSP NTLMSSP across isolated Vercel Lambdas via Turso SQLite!"
+        );
+        assert.ok(
+          tursoPipelineCalls >= 2,
+          `Turso cross-instance relay executed ${tursoPipelineCalls} /v2/pipeline batches`
+        );
       } finally {
-        tunnel.dispose();
-        if (previousVercel === undefined) delete process.env.VERCEL;
-        else process.env.VERCEL = previousVercel;
+        simulateVercelBufferedRequestBodies = false;
+        simulateIsolatedInputLambda = false;
+        if (prevVercel === undefined) delete process.env.VERCEL;
+        else process.env.VERCEL = prevVercel;
+        if (prevTursoUrl === undefined) delete process.env.TURSO_DATABASE_URL;
+        else process.env.TURSO_DATABASE_URL = prevTursoUrl;
+        if (prevTursoToken === undefined) delete process.env.TURSO_AUTH_TOKEN;
+        else process.env.TURSO_AUTH_TOKEN = prevTursoToken;
+        await new Promise<void>((resolve) => tursoServer.close(() => resolve()));
+        relayDb.close();
       }
     }
 

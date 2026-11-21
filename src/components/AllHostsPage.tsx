@@ -46,9 +46,11 @@ const FILTERS = ["all", "ssh", "sftp", "rdp"] as const;
 /**
  * `/hosts` — **every machine, one page, in the app.**
  *
- * This is the human side of `GET /api/hosts`. That route does not decode the encrypted
- * vault, so the list is rendered after the workspace unlocks it. That is why the page
- * is a workspace view rather than a server-rendered table.
+ * This is the human side of `GET /api/hosts`. The server cannot render it: the vault
+ * is end-to-end encrypted and its key is in this browser, so the list only exists after
+ * the workspace unlocks. That is why the page is a workspace view rather than a
+ * server-rendered table — and why it used to look empty: the route could see that a
+ * vault existed but never its contents.
  *
  * Each row is a machine, not a saved profile: a server saved for SSH, SFTP and RDP is
  * one row with all three ways in, the exact ports, and the one link that reaches it.

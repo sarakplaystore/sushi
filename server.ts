@@ -18,6 +18,17 @@ const hostname = process.env.HOST || "0.0.0.0";
 const port = Number(process.env.PORT || 3000);
 
 async function bootstrap() {
+  // The opt-in Railway template guard catches a missing or unevaluated secret()
+  // expression before this gateway can accept connections. It checks format,
+  // not randomness, and does not affect existing gateways or other token formats.
+  if (gatewayOnly && process.env.SUSHI_GATEWAY_TOKEN_REQUIRE_HEX_48 === "true" &&
+      !/^[0-9a-f]{48}$/.test(process.env.SUSHI_GATEWAY_TOKEN ?? "")) {
+    throw new Error(
+      "SUSHI_GATEWAY_TOKEN must be a generated 48-character lowercase hex value. " +
+      "Check the Railway template secret generator and redeploy."
+    );
+  }
+
   const gateway = createGatewayWebSockets();
 
   if (gatewayOnly) {

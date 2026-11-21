@@ -24,6 +24,7 @@ import {
 } from "@/lib/client/gateway";
 import { copyTextToClipboard } from "@/lib/client/clipboard";
 import { DEFAULT_GATEWAY_ALLOWED_ORIGIN } from "@/lib/gateway-defaults.mjs";
+import railwayTemplateVariables from "../../.railway/gateway-template-variables.json";
 
 interface GatewaySetupModalProps {
   isOpen: boolean;
@@ -56,6 +57,25 @@ node scripts/provision-gateway.mjs local
 docker compose -f docker-compose.gateway.yml up -d --build
 # Put an HTTPS reverse proxy in front of 127.0.0.1:3000.
 # Read the token privately from .env.gateway.local and enter it below.`;
+
+const RAILWAY_TEMPLATE_SNIPPET = `# One-time setup in Railway's template composer, NOT an existing service:
+# 1. Workspace → Templates → New Template. Add "guacd" from the Docker image
+#    guacamole/guacd:1.5.5, with no public networking or TCP proxy. Its start command:
+#    /opt/guacamole/sbin/guacd -b :: -L info -f
+# 2. Add "sushi-gateway" from github.com/sarakplaystore/sushi; use a branch
+#    containing the template format guard. In its Variables → Raw Editor → JSON,
+#    paste the template variables below. Do not import the full-app .env.example.
+# 3. Enable HTTP public networking on the gateway, target port 3000, and set
+#    health check /api/system/capabilities. Apply and Create Template.
+# 4. Deploy TWO NEW test projects from the template URL. Verify each has a distinct
+#    48-character hex token and it survives restart; test SSH before relying on it.
+# The template does not exist until created in Railway.
+# It will not fill the separately hosted Sushi UI; copy the token privately into it.
+# If rotating a template token, use 48 lowercase hex characters and update all clients.`;
+
+// This is public template configuration, not an actual token. Keep the panel's
+// copyable JSON identical to the file used by the template setup guide.
+const RAILWAY_TEMPLATE_VARIABLES = JSON.stringify(railwayTemplateVariables, null, 2);
 
 const RAILWAY_SNIPPET = `# New, dedicated project; run from a Sushi checkout with Node 22 + Railway CLI 5.47.2+.
 npm i -g @railway/cli
@@ -120,15 +140,17 @@ const DEPLOY_TARGETS = [
     label: "Railway",
     short: "Railway",
     blurb:
-      "Apply .railway/railway.ts to deploy sushi-gateway + guacd on Railway's private network — native PTY and guacd RDP with no server to maintain.",
+      "Create a reusable Railway template once for new gateway + guacd deployments with a generated token, or use the CLI for an existing gateway. The template must first be created in Railway.",
     link: {
-      label: "railway.com/new",
-      href: "https://railway.com/new",
-      title: "Open Railway and create the project that .railway/railway.ts describes",
+      label: "Open Railway templates",
+      href: "https://railway.com/workspace/templates",
+      title: "Open your Railway workspace's template composer",
     },
     blocks: [
+      { id: "railway-template", title: "Railway template setup (one time)", code: RAILWAY_TEMPLATE_SNIPPET },
+      { id: "railway-template-vars", title: "Template variables (JSON)", code: RAILWAY_TEMPLATE_VARIABLES },
       { id: "railway-cli", title: "Railway CLI (two services from .railway/railway.ts)", code: RAILWAY_SNIPPET },
-      { id: "railway-dash", title: "Railway dashboard (no CLI)", code: RAILWAY_DASHBOARD_SNIPPET },
+      { id: "railway-dash", title: "Railway dashboard (no CLI, no template)", code: RAILWAY_DASHBOARD_SNIPPET },
     ],
   },
   {
@@ -162,7 +184,7 @@ const POST_DEPLOY_GUIDES: Record<DeployTargetId, PostDeployGuide> = {
     dashboard: { label: "Open Railway dashboard", href: "https://railway.com/dashboard" },
     service: <>Open your project and the right environment, then select the <strong>sushi-gateway</strong> service (or whatever you named it), not guacd. Wait for its deployment to be active.</>,
     address: <>Open <strong>Settings → Networking → Public Networking</strong>. Copy the public domain, or choose <strong>Generate Domain</strong> if there isn’t one. If asked for a target port, choose the gateway’s <code>PORT</code> (the Dockerfile defaults to 3000).</>,
-    settings: <>Under the gateway service’s <strong>Variables</strong>, find <code>SUSHI_GATEWAY_TOKEN</code>. The setup command adds missing values; it keeps existing ones. If your origin differs from the default or an existing override, set <code>ALLOWED_ORIGIN</code> to the Sushi origin shown below. Deploy changes and wait for the service to be active.</>,
+    settings: <>Under the gateway service’s <strong>Variables</strong>, find <code>SUSHI_GATEWAY_TOKEN</code>. A new deployment from a template you configure can generate it; the CLI setup command adds missing values and keeps existing ones. If your origin differs from the default or an existing override, set <code>ALLOWED_ORIGIN</code> to the Sushi origin shown below. Deploy changes and wait for the service to be active.</>,
     example: "https://your-gateway.up.railway.app",
   },
   render: {
@@ -279,11 +301,23 @@ export function GatewaySetupModal({
     caps?: SystemCapabilities;
     warning?: boolean;
   } | null>(null);
-  const [copiedId, setCopiedId] = useState<string | null>(null);
+  const [copyResult, setCopyResult] = useState<{ id: string; ok: boolean } | null>(null);
+  const copyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const copyRequestRef = useRef(0);
+  const mountedRef = useRef(false);
   const [deployTarget, setDeployTarget] = useState<DeployTargetId>("railway");
   const [appOrigin, setAppOrigin] = useState("");
   const [originCopyState, setOriginCopyState] = useState<"idle" | "copied" | "failed">("idle");
   const [keepAwake, setKeepAwake] = useState(false);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      copyRequestRef.current += 1;
+      if (copyTimerRef.current !== null) clearTimeout(copyTimerRef.current);
+    };
+  }, []);
 
   useEffect(() => {
     // Never carry a revealed token into another visit or changed saved settings.
@@ -375,10 +409,16 @@ export function GatewaySetupModal({
     }
   })();
 
-  const copyText = (id: string, value: string) => {
-    void copyTextToClipboard(value);
-    setCopiedId(id);
-    setTimeout(() => setCopiedId(null), 1800);
+  const copyText = async (id: string, value: string) => {
+    const request = ++copyRequestRef.current;
+    const ok = await copyTextToClipboard(value);
+    if (!mountedRef.current || request !== copyRequestRef.current) return;
+    setCopyResult({ id, ok });
+    if (copyTimerRef.current !== null) clearTimeout(copyTimerRef.current);
+    copyTimerRef.current = setTimeout(() => {
+      setCopyResult(null);
+      copyTimerRef.current = null;
+    }, 1800);
   };
 
   const copyAppOrigin = async () => {
@@ -904,15 +944,19 @@ export function GatewaySetupModal({
                       <span className="text-[11px] font-medium text-slate-300">{block.title}</span>
                       <button
                         type="button"
-                        onClick={() => copyText(block.id, block.code)}
+                        aria-label={copyResult?.id === block.id
+                          ? `${copyResult.ok ? "Copied" : "Could not copy"} ${block.title}`
+                          : `Copy ${block.title}`}
+                        title={copyResult?.id === block.id && !copyResult.ok ? "Select the text below to copy it manually" : undefined}
+                        onClick={() => void copyText(block.id, block.code)}
                         className="flex shrink-0 items-center gap-1 text-xs text-slate-400 hover:text-white"
                       >
-                        {copiedId === block.id ? (
+                        {copyResult?.id === block.id && copyResult.ok ? (
                           <Check className="h-3.5 w-3.5 text-emerald-400" />
                         ) : (
                           <Copy className="h-3.5 w-3.5" />
                         )}
-                        {copiedId === block.id ? "Copied" : "Copy"}
+                        {copyResult?.id === block.id ? (copyResult.ok ? "Copied" : "Could not copy") : "Copy"}
                       </button>
                     </div>
                     <pre className="font-mono-code overflow-x-auto rounded-xl border border-white/8 bg-[#090b10] p-3.5 text-[11px] leading-relaxed text-slate-300">

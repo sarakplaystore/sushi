@@ -516,7 +516,7 @@ and the [Firestore migration instructions](#migrate-an-existing-disk-or-redis-st
    | Gateway host | What you run | Native PTY | Live RDP | Files |
    | --- | --- | --- | --- | --- |
    | **VPS** (Docker/Node) | Provision a local file, then `docker compose -f docker-compose.gateway.yml up -d --build` | ✅ | ✅ via `guacd` | [`docker-compose.gateway.yml`](docker-compose.gateway.yml), [`Dockerfile.gateway`](Dockerfile.gateway) |
-   | **[Railway](https://railway.com/new)** | Setup helper → `sushi-gateway` + `guacd` on one private network | ✅ | ✅ via `guacd` | [`.railway/railway.ts`](.railway/railway.ts), [`Dockerfile.gateway`](Dockerfile.gateway) |
+   | **[Railway](https://railway.com/new)** | Create a template once for new projects, or use the setup helper → `sushi-gateway` + `guacd` on one private network | ✅ | ✅ via `guacd` | [Template setup](.railway/TEMPLATE.md), [`.railway/railway.ts`](.railway/railway.ts), [`Dockerfile.gateway`](Dockerfile.gateway) |
    | **[Render](https://render.com/deploy?repo=https://github.com/sarakplaystore/sushi)** | New + → Blueprint → this repo | ✅ | In-browser IronRDP WASM by default; the blueprint does not deploy `guacd` | [`render.yaml`](render.yaml), [`Dockerfile.gateway`](Dockerfile.gateway) |
 
    **Default origin and overrides:** An up-to-date `GATEWAY_ONLY=true` process uses
@@ -532,7 +532,17 @@ and the [Firestore migration instructions](#migrate-an-existing-disk-or-redis-st
    are **not authentication**. Continue to protect the token, require HTTPS/WSS and restrict
    network access where possible.
 
-   **Railway** (`railway.json` is deprecated and stops being read on 2026‑12‑01, so Sushi
+   **Railway template for future new deployments:** Follow the [one-time template setup](.railway/TEMPLATE.md)
+   in your Railway workspace. The template composer uses the copyable
+   [gateway variables JSON](.railway/gateway-template-variables.json), including Railway's
+   `${{secret(48, "abcdef0123456789")}}` template function. When deployed from the saved
+   template, it is intended to generate a distinct 48-character hex token without manually
+   generating or setting it. Verify this with fresh test deployments before relying on it.
+   A repository file does **not** create the template or a deploy link; this route does not
+   modify an existing gateway. The separate Sushi browser still needs the generated token and
+   URL entered privately. Do not paste the template JSON into a live service.
+
+   **Railway CLI** (`railway.json` is deprecated and stops being read on 2026‑12‑01, so Sushi
    ships Railway's Infrastructure-as-Code file instead). For a **new, dedicated project**,
    from a Sushi checkout with Node 22 and Railway CLI **5.47.2 or newer**:
 

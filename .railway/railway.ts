@@ -9,7 +9,12 @@
  *
  * Railway replaced `railway.json` / `railway.toml` (Config as Code) with this
  * file; Config as Code stops being read on 2026-12-01 and new services cannot
- * use it at all, so this is the only Railway config Sushi ships.
+ * use it at all, so this is Sushi's Railway IaC configuration.
+ *
+ * Alternatively, .railway/TEMPLATE.md describes creating a Railway template
+ * once for future new deployments with generated tokens. Its variable JSON is
+ * for the template composer only, not an existing live service; it does not
+ * register a template or change anything on Railway by itself.
  *
  * Apply it to a new, dedicated Railway project (the SDK is needed only to
  * evaluate this file, so it is installed with --no-save).

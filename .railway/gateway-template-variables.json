@@ -1,0 +1,42 @@
+{
+  "RAILWAY_DOCKERFILE_PATH": {
+    "value": "Dockerfile.gateway",
+    "description": "Build the lightweight companion gateway rather than the full Sushi application."
+  },
+  "GATEWAY_ONLY": {
+    "value": "true",
+    "description": "Serve the persistent WebSocket gateway, not the Sushi frontend."
+  },
+  "NODE_ENV": {
+    "value": "production",
+    "description": "Run the gateway in production mode."
+  },
+  "HOST": {
+    "value": "0.0.0.0",
+    "description": "Listen on the container network interface for Railway's HTTP proxy."
+  },
+  "PORT": {
+    "value": "3000",
+    "description": "Gateway listen and public-networking target port."
+  },
+  "GUACD_HOST": {
+    "value": "${{guacd.RAILWAY_PRIVATE_DOMAIN}}",
+    "description": "Private hostname of the guacd service in this template; do not expose guacd publicly."
+  },
+  "GUACD_PORT": {
+    "value": "4822",
+    "description": "Private guacd protocol port for live RDP."
+  },
+  "ALLOWED_ORIGIN": {
+    "value": "https://sushi-lyart-three.vercel.app",
+    "description": "Exact HTTPS origin of your Sushi frontend, without a path or trailing slash. Change for a different frontend."
+  },
+  "SUSHI_GATEWAY_TOKEN": {
+    "value": "${{secret(48, \"abcdef0123456789\")}}",
+    "description": "Railway generates a 48-character hex token for each new template deployment. Copy it privately into Sushi Gateway settings; do not seal it until you have saved a secure copy."
+  },
+  "SUSHI_GATEWAY_TOKEN_REQUIRE_HEX_48": {
+    "value": "true",
+    "description": "On updated gateway code, refuse startup if the template token is missing or not 48 lowercase hex characters. This checks format, not randomness."
+  }
+}

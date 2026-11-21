@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { generateKeyPairSync } from "node:crypto";
+import { generateKeyPairSync, randomBytes } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import http from "node:http";
 import net from "node:net";
@@ -34,7 +34,7 @@ type RunningGateway = { port: number; child: ChildProcess; logs: () => string; s
 async function startGateway(overrides: Record<string, string | undefined>, envFile?: string): Promise<RunningGateway> {
   const port = await freePort();
   const env = { ...process.env };
-  for (const key of ["ALLOWED_ORIGIN", "SUSHI_GATEWAY_TOKEN", "SUSHI_AUTH_USERNAME", "SUSHI_AUTH_PASSWORD", "VERCEL"]) delete env[key];
+  for (const key of ["ALLOWED_ORIGIN", "SUSHI_GATEWAY_TOKEN", "SUSHI_GATEWAY_TOKEN_REQUIRE_HEX_48", "SUSHI_AUTH_USERNAME", "SUSHI_AUTH_PASSWORD", "VERCEL"]) delete env[key];
   Object.assign(env, {
     NODE_ENV: "production", GATEWAY_ONLY: "true", HOST: "127.0.0.1", PORT: String(port),
     GUACD_HOST: "127.0.0.1", GUACD_PORT: "1", BLOCK_PRIVATE_NETWORKS: "false", ...overrides,
@@ -71,6 +71,21 @@ async function startGateway(overrides: Record<string, string | undefined>, envFi
       child.kill("SIGTERM");
     }),
   };
+}
+
+function expectTemplateGuardToReject(token?: string): void {
+  const env: NodeJS.ProcessEnv = { ...process.env, NODE_ENV: "production", GATEWAY_ONLY: "true", HOST: "127.0.0.1", PORT: "0",
+    SUSHI_GATEWAY_TOKEN_REQUIRE_HEX_48: "true" };
+  delete env.SUSHI_GATEWAY_TOKEN;
+  if (token !== undefined) env.SUSHI_GATEWAY_TOKEN = token;
+  const result = spawnSync(process.execPath, ["--import", "tsx", "server.ts"], {
+    cwd: root, env, encoding: "utf8", timeout: 8000,
+  });
+  const output = `${result.stdout ?? ""}${result.stderr ?? ""}`;
+  assert.equal(result.status, 1, "the template guard must fail startup, not wait or listen");
+  assert.match(output, /SUSHI_GATEWAY_TOKEN must be a generated 48-character lowercase hex value/);
+  assert.doesNotMatch(output, /gateway listening/);
+  if (token) assert(!output.includes(token), "a rejected token or template expression is never logged");
 }
 
 async function upgradeStatus(port: number, pathname: string, origin?: string): Promise<number> {
@@ -148,8 +163,17 @@ async function main() {
   assert.match(token, /^[0-9a-f]{48}$/);
   assert(!`${setup.stdout}${setup.stderr}`.includes(token));
 
+  // Template mode is opt-in: never accept the public expression as a password,
+  // nor listen at all if Railway has not supplied the expected token format.
+  for (const invalid of [undefined, "", '${{secret(48, "abcdef0123456789")}}',
+    "f".repeat(47), "f".repeat(49), "g".repeat(48), "A".repeat(48)]) {
+    expectTemplateGuardToReject(invalid);
+  }
+
   // No ALLOWED_ORIGIN at all: the actual gateway process supplies the default.
-  let gateway = await startGateway({ SUSHI_GATEWAY_TOKEN: token });
+  // The local helper's random hex token stands in for a platform-generated one;
+  // this tests the gateway, not Railway's generation behavior.
+  let gateway = await startGateway({ SUSHI_GATEWAY_TOKEN: token, SUSHI_GATEWAY_TOKEN_REQUIRE_HEX_48: "true" });
   try {
     const allowed = await fetch(`http://127.0.0.1:${gateway.port}/api/system/capabilities`, {
       headers: { Origin: DEFAULT_GATEWAY_ALLOWED_ORIGIN },
@@ -173,8 +197,30 @@ async function main() {
     await gateway.stop();
   }
 
-  // Render's generated value is base64, so +, / and = must survive both the
-  // SSH first message and the URL-encoded RDP WebSocket authentication path.
+  // A restart with the same environment must keep accepting the same token.
+  // A different new deployment must not accept the first deployment's token.
+  gateway = await startGateway({ SUSHI_GATEWAY_TOKEN: token, SUSHI_GATEWAY_TOKEN_REQUIRE_HEX_48: "true" });
+  try {
+    const correct = await sshAuth(gateway.port, DEFAULT_GATEWAY_ALLOWED_ORIGIN, token);
+    assert.match(String(correct.message), /Missing SSH host or username/);
+    assert(!gateway.logs().includes(token));
+  } finally {
+    await gateway.stop();
+  }
+  const otherToken = randomBytes(24).toString("hex");
+  assert.notEqual(otherToken, token);
+  gateway = await startGateway({ SUSHI_GATEWAY_TOKEN: otherToken, SUSHI_GATEWAY_TOKEN_REQUIRE_HEX_48: "true" });
+  try {
+    assert.match(String((await sshAuth(gateway.port, DEFAULT_GATEWAY_ALLOWED_ORIGIN, token)).message), /Gateway token rejected/);
+    assert.match(String((await sshAuth(gateway.port, DEFAULT_GATEWAY_ALLOWED_ORIGIN, otherToken)).message), /Missing SSH host or username/);
+    assert(!gateway.logs().includes(otherToken));
+  } finally {
+    await gateway.stop();
+  }
+
+  // Existing gateways do not opt into the template-only guard. Render's
+  // generated base64 values, including +, / and =, remain supported by both
+  // the SSH first message and URL-encoded RDP WebSocket authentication.
   const renderStyleToken = "test+base64/token==";
   gateway = await startGateway({ SUSHI_GATEWAY_TOKEN: renderStyleToken });
   try {
@@ -209,7 +255,7 @@ async function main() {
   const sshPort = (ssh.address() as net.AddressInfo).port;
   let fileGateway: RunningGateway | undefined;
   try {
-    fileGateway = await startGateway({}, envFile);
+    fileGateway = await startGateway({ SUSHI_GATEWAY_TOKEN_REQUIRE_HEX_48: "true" }, envFile);
     assert.equal(await upgradeStatus(fileGateway.port, "/ws/ssh", DEFAULT_GATEWAY_ALLOWED_ORIGIN), 403,
       "the persisted origin overrides the default");
     assert.equal(await upgradeStatus(fileGateway.port, "/ws/ssh", "https://other-ui.example"), 101);

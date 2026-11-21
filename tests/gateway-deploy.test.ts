@@ -143,7 +143,7 @@ assert.equal(
 );
 assert.ok(
   !render.services!.some((s) => s.image === "guacamole/guacd:1.5.5" || s.name === "guacd"),
-  "no unreachable guacd sidecar: Render gives services no private hostname to each other"
+  "the default Render blueprint does not provision a guacd service"
 );
 assert.match(
   read("render.yaml"),
@@ -246,7 +246,7 @@ assert.match(envExample, /^ALLOWED_ORIGIN=/m, ".env.example still documents ALLO
 // panel links to those places; these assertions keep those links pointing at the
 // same hosts the README and the deploy manifests name, so a doc reorganisation
 // on Railway's or Render's side shows up here instead of as a dead link in the UI.
-const RAILWAY_DASHBOARD = "https://railway.com/new";
+const RAILWAY_DASHBOARD = "https://railway.com/dashboard";
 const RAILWAY_VARIABLES_DOCS = "https://docs.railway.com/variables";
 const RENDER_DASHBOARD = "https://dashboard.render.com";
 const RENDER_ENV_DOCS = "https://render.com/docs/configure-environment-variables";
@@ -349,10 +349,10 @@ assert.ok(
   modal.includes("gatewayCapabilities?: SystemCapabilities | null"),
   "the modal accepts the attached gateway's capabilities"
 );
-assert.match(
-  modal,
-  /const attachedCaps =\s*probeStatus\?\.ok && probeStatus\.caps \? probeStatus\.caps : gatewayCapabilities \?\? null;/,
-  "a live probe wins over the boot-time read, so Test Gateway Endpoint updates the matrix at once"
+assert.ok(
+  modal.includes("probeStatus.ok ? probeStatus.caps ?? null : null") &&
+    modal.includes("!hasProbedGateway && matchesSavedSettings ? gatewayCapabilities ?? null : null"),
+  "the latest probe wins, and stale saved capabilities are not reused after failure or edits"
 );
 assert.match(
   modal,
@@ -360,8 +360,8 @@ assert.match(
   "the PTY row is decided by the gateway's capabilities first"
 );
 assert.ok(
-  modal.includes("Active via attached gateway"),
-  "an attached, working gateway is reported as active rather than 'optional'"
+  modal.includes("Gateway advertises PTY"),
+  "the matrix reports advertised PTY capabilities without claiming the WebSocket or token was verified"
 );
 assert.ok(
   modal.includes("Gateway not verified yet") &&

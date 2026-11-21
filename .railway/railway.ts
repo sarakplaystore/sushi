@@ -66,8 +66,8 @@ export default defineRailway(() => {
       // secret never has to live in this file.
       //   SUSHI_GATEWAY_TOKEN → paste into Sushi → Gateway settings
       //   ALLOWED_ORIGIN      → this Vercel app's exact origin, no trailing slash
-      // Both live under sushi-gateway → Variables (https://railway.com/new, and
-      // https://docs.railway.com/variables for how Railway variables work).
+      // Both live under sushi-gateway → Variables (https://railway.com/dashboard,
+      // and https://docs.railway.com/variables for how Railway variables work).
       SUSHI_GATEWAY_TOKEN: preserve(),
       ALLOWED_ORIGIN: preserve(),
     },

@@ -3065,6 +3065,7 @@ export function SushiWorkspace() {
                     <button
                       type="button"
                       onClick={() => setGatewayModalOpen(true)}
+                      title="Open PTY gateway settings"
                       className="inline-flex items-center gap-1.5 rounded-xl border border-white/12 bg-white/5 px-3.5 py-2 text-xs font-medium text-slate-200 transition hover:bg-white/10"
                     >
                       {localCaps?.mode === "vercel" ? (
@@ -3073,7 +3074,7 @@ export function SushiWorkspace() {
                         <Server className="h-3.5 w-3.5 text-emerald-400" />
                       )}
                       {gatewaySettings.gatewayUrl
-                        ? "Gateway Linked"
+                        ? "Gateway configured"
                         : localCaps?.mode === "vercel"
                           ? "Vercel Serverless Mode"
                           : "VPS Self-Hosted Mode"}

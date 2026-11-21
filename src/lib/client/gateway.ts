@@ -93,13 +93,38 @@ export async function fetchGatewayCapabilities(
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
+    // This endpoint is public. Do not send account, gateway or cookie credentials
+    // to an address that may have been entered incorrectly.
     const res = await fetch(`${resolveGatewayHttpBase(raw)}/api/system/capabilities`, {
-      headers: getAuthHeaders(settings),
+      credentials: "omit",
       cache: "no-store",
       signal: controller.signal,
     });
     if (!res.ok) return { ok: false, error: `Gateway returned HTTP ${res.status}` };
-    return { ok: true, caps: (await res.json()) as SystemCapabilities };
+    let payload: unknown;
+    try {
+      payload = await res.json();
+    } catch (error) {
+      if (controller.signal.aborted) throw error;
+      return { ok: false, error: "This address did not return Sushi gateway capabilities. Check the public gateway URL." };
+    }
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+      return { ok: false, error: "This address did not return Sushi gateway capabilities. Check the public gateway URL." };
+    }
+    const caps = payload as Partial<SystemCapabilities>;
+    if (!caps.mode || !["gateway", "vps", "vercel"].includes(caps.mode) ||
+        typeof caps.websocketSsh !== "boolean" ||
+        (caps.rdpGuacd !== undefined && typeof caps.rdpGuacd !== "boolean") ||
+        (caps.requiresGatewayToken !== undefined && typeof caps.requiresGatewayToken !== "boolean") ||
+        (caps.nodeVersion !== undefined && typeof caps.nodeVersion !== "string")) {
+      return { ok: false, error: "This address did not return Sushi gateway capabilities. Check the public gateway URL." };
+    }
+    // Older gateways may omit informational fields. Preserve compatibility while
+    // still rejecting unrelated JSON before the UI tries to display it.
+    return {
+      ok: true,
+      caps: { ...caps, rdpGuacd: caps.rdpGuacd ?? false, nodeVersion: caps.nodeVersion || "unknown" } as SystemCapabilities,
+    };
   } catch (err) {
     if (controller.signal.aborted) {
       return {

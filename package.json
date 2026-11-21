@@ -13,7 +13,7 @@
     "start": "NODE_ENV=production tsx server.ts",
     "gateway": "NODE_ENV=production GATEWAY_ONLY=true tsx server.ts",
     "typecheck": "tsc --noEmit",
-    "test": "npm run test:home-screen && npm run test:mobile-home && npm run test:imports && npm run test:os-commands && npm run test:resume && npm run test:cross-device && npm run test:hosts && npm run test:storage-setup && npm run test:sync && npm run test:turso && npm run test:firestore && npm run test:autounlock-stop && npm run test:donate && npm run test:disclaimer && npm run test:installers && npm run test:gateway-deploy && npm run test:line-editor && npm run test:sftp-elevation && npm run test:sftp-selection && npm run test:rdp && npm run test:shared-ssh && tsx tests/e2e-protocols.test.ts",
+    "test": "npm run test:home-screen && npm run test:mobile-home && npm run test:imports && npm run test:os-commands && npm run test:resume && npm run test:cross-device && npm run test:hosts && npm run test:storage-setup && npm run test:sync && npm run test:turso && npm run test:firestore && npm run test:autounlock-stop && npm run test:donate && npm run test:disclaimer && npm run test:installers && npm run test:gateway-deploy && npm run test:gateway-guide && npm run test:line-editor && npm run test:sftp-elevation && npm run test:sftp-selection && npm run test:rdp && npm run test:shared-ssh && tsx tests/e2e-protocols.test.ts",
     "test:rdp": "tsx tests/rdp-live-e2e.test.ts",
     "test:shared-ssh": "tsx tests/shared-ssh.test.ts",
     "test:autounlock-stop": "tsx tests/vault-autounlock-and-stop-bg.test.ts",
@@ -33,6 +33,7 @@
     "test:disclaimer": "tsx tests/disclaimer.test.ts",
     "test:installers": "tsx tests/installers.test.ts",
     "test:gateway-deploy": "tsx tests/gateway-deploy.test.ts",
+    "test:gateway-guide": "tsx tests/gateway-guide.test.tsx",
     "test:line-editor": "tsx tests/line-editor.test.ts",
     "test:sftp-elevation": "tsx tests/sftp-elevation.test.ts",
     "test:sftp-selection": "tsx tests/sftp-selection.test.ts"

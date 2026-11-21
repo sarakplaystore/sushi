@@ -517,7 +517,7 @@ and the [Firestore migration instructions](#migrate-an-existing-disk-or-redis-st
    | --- | --- | --- | --- | --- |
    | **VPS** (Docker/Node) | `docker compose up -d` or `npm run gateway` | ✅ | ✅ via `guacd` | [`Dockerfile`](Dockerfile), [`docker-compose.yml`](docker-compose.yml) |
    | **[Railway](https://railway.com/new)** | `railway config apply` → `sushi-gateway` + `guacd` on one private network | ✅ | ✅ via `guacd` | [`.railway/railway.ts`](.railway/railway.ts), [`Dockerfile.gateway`](Dockerfile.gateway) |
-   | **[Render](https://render.com/deploy?repo=https://github.com/sarakplaystore/sushi)** | New + → Blueprint → this repo | ✅ | In-browser IronRDP WASM (Render services get no private hostname for a `guacd` sidecar) | [`render.yaml`](render.yaml), [`Dockerfile.gateway`](Dockerfile.gateway) |
+   | **[Render](https://render.com/deploy?repo=https://github.com/sarakplaystore/sushi)** | New + → Blueprint → this repo | ✅ | In-browser IronRDP WASM by default; the blueprint does not deploy `guacd` | [`render.yaml`](render.yaml), [`Dockerfile.gateway`](Dockerfile.gateway) |
 
    **Railway** (`railway.json` is deprecated and stops being read on 2026‑12‑01, so Sushi
    ships Railway's Infrastructure-as-Code file instead):
@@ -527,15 +527,17 @@ and the [Firestore migration instructions](#migrate-an-existing-disk-or-redis-st
    railway login && railway init          # or: railway link
    npm i --no-save railway                # SDK, only to evaluate .railway/railway.ts
    railway config plan && railway config apply
+   # New gateway only: keep any existing token unless you intend to rotate it.
    railway variable set SUSHI_GATEWAY_TOKEN="$(openssl rand -hex 24)" --service sushi-gateway
    railway variable set ALLOWED_ORIGIN="https://your-app.vercel.app" --service sushi-gateway
    ```
 
-   Then give `sushi-gateway` a public domain (**Settings → Networking → Generate Domain**) and
-   paste that `https://…up.railway.app` URL plus the token into Sushi's gateway panel. Both values
-   live under **sushi-gateway → Variables** in the [Railway dashboard](https://railway.com/new)
-   ([how Railway variables work](https://docs.railway.com/variables)); the same panel in Sushi links
-   there next to its `SUSHI_GATEWAY_TOKEN` field.
+   After deployment, open the gateway service in the [Railway dashboard](https://railway.com/dashboard)
+   and find its public domain under **Settings → Networking → Public Networking**. If necessary,
+   select **Generate Domain**, using the service's `PORT` as the target port (the Docker image
+   defaults to 3000). The gateway token and `ALLOWED_ORIGIN` live under the service's **Variables**
+   ([how Railway variables work](https://docs.railway.com/variables)). Apply staged changes and wait
+   for the deployment to become active.
 
    Without the CLI: [*New Project → GitHub Repo → this repository*](https://railway.com/new), set
    **Settings → Build Configuration → Dockerfile Path** to `Dockerfile.gateway`, add a second
@@ -543,11 +545,11 @@ and the [Firestore migration instructions](#migrate-an-existing-disk-or-redis-st
    `RAILWAY_PRIVATE_DOMAIN`, set the two variables above, then **Generate Domain**.
 
    **Render**: *New + → Blueprint → this repository* (or the [Deploy to Render button](https://render.com/deploy?repo=https://github.com/sarakplaystore/sushi)
-   above). `render.yaml` builds `Dockerfile.gateway` and **generates `SUSHI_GATEWAY_TOKEN` for
-   you** — read the generated value under **sushi-gateway → Environment** in the
-   [Render dashboard](https://dashboard.render.com), where you also set `ALLOWED_ORIGIN` to your
-   Vercel origin ([Environment Variables and Secrets](https://render.com/docs/configure-environment-variables)).
-   Copy the service URL and that token into Sushi.
+   above). `render.yaml` builds `Dockerfile.gateway` and generates `SUSHI_GATEWAY_TOKEN`. Once live,
+   copy the `https://…onrender.com` URL at the top of the gateway's page in the
+   [Render dashboard](https://dashboard.render.com). Find the token and set `ALLOWED_ORIGIN` under
+   **sushi-gateway → Environment**; save and deploy any changes
+   ([Environment Variables and Secrets](https://render.com/docs/configure-environment-variables)).
 
    **VPS**:
 
@@ -560,12 +562,24 @@ and the [Firestore migration instructions](#migrate-an-existing-disk-or-redis-st
    in Sushi's **Settings → Gateway**. A gateway token authorizes protocol access;
    it is not an admin sign-in and cannot read or change the shared vault.
 
+   **Connect an already-deployed gateway:** In Sushi, open **Settings → Gateway** and choose
+   Railway, Render, or VPS under **Find your PTY gateway**. The guide shows where to find the
+   public service URL and matching token, and lets you copy this Sushi page's exact origin for
+   the gateway's `ALLOWED_ORIGIN`. Paste the base `https://` URL and token into the gateway fields;
+   do not append `/ws/ssh` or use a private/`guacd` address. Click **Test Gateway Endpoint**,
+   save, and open an SSH session. The test checks public HTTP capabilities only, without sending
+   credentials—it does not validate the token or prove that a WebSocket session works. Only use a
+   trusted gateway; Sushi saves the token in this browser's local storage. If a token is sealed or
+   hidden, use a previously saved copy; if you no longer have it, generate and deploy a new strong
+   token and update every gateway client. Never share it in chat or commit it.
+
    > **Idle sleep.** A managed host that suspends idle services (Render's free instance plan,
    > an unscaled Railway service) cannot answer a WebSocket handshake while asleep, and the
-   > first shell then waits for a cold start or fails. Use an always-on plan, keep Sushi's
-   > **Keep this gateway awake** toggle on in the gateway panel (pings `/health` every
-   > 4 minutes while that tab is open), or run the gateway on a VPS. A sleep also drops every
-   > session the gateway was holding — no keepalive can bring those back.
+   > first shell then waits for a cold start or fails. To wake it, open its public URL in another
+   > tab, wait for a response, and retry the test in Sushi. Use an always-on plan or a VPS for
+   > sessions that must remain up. The optional **Keep this gateway awake** toggle attempts a
+   > `/health` ping every 4 minutes only while the gateway settings panel is open; browsers or
+   > hosts can still suspend it, and a dropped session cannot be restored.
 
    The gateway image is deliberately slim: it contains no Next.js build and no web assets,
    only `server.ts` with `GATEWAY_ONLY=true`, so it starts in about a second and answers

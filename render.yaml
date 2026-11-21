@@ -7,21 +7,17 @@
 #   (or use the "Deploy to Render" button in the README)
 #
 # Render reads this file and creates the `sushi-gateway` web service from
-# Dockerfile.gateway. SUSHI_GATEWAY_TOKEN is generated for you; copy it and
-# ALLOWED_ORIGIN from the service's Environment tab into Sushi → Hybrid VPS &
-# Vercel Deployment Settings, together with the service URL
-# (https://sushi-gateway.onrender.com).
+# Dockerfile.gateway. SUSHI_GATEWAY_TOKEN is generated for you; copy it from
+# the service's Environment tab and enter it in Sushi → Settings → Gateway,
+# together with the public service URL (https://your-gateway.onrender.com).
+# Set ALLOWED_ORIGIN on the gateway to the exact origin of the Sushi web UI.
 #
 # Two Render-specific notes:
-#   * A free instance sleeps after ~15 minutes idle and a sleeping service cannot
-#     accept the WebSocket handshake, so use a paid plan for a gateway that must
-#     always answer (or keep the tab's "Keep this gateway awake" toggle on).
-#   * Render gives services no private hostname to each other, so the
-#     guacamole/guacd sidecar that .railway/railway.ts deploys cannot be
-#     addressed from a Render web service. The SSH PTY is unaffected; live HTML5
-#     RDP then runs through the browser's IronRDP WebAssembly client instead of
-#     guacd. Use Railway (or one VPS with docker compose) when you want
-#     guacd-backed RDP streaming next to the PTY.
+#   * A free instance may sleep after ~15 minutes idle. The optional keep-awake
+#     toggle only attempts pings while Sushi's gateway settings panel is open.
+#   * This blueprint does not deploy guacd. SSH PTY still works, and RDP can use
+#     the browser's IronRDP WebAssembly client. A separately hosted guacd may be
+#     connected over an appropriate private network; review your provider's plan.
 services:
   - type: web
     name: sushi-gateway

@@ -5,9 +5,12 @@
 # It serves /ws/ssh (native interactive PTY), /ws/rdp and /ws/rdp-cleanpath, plus
 # GET /health and GET /api/system/capabilities for platform health checks.
 #
-# Used by .railway/railway.ts and render.yaml. Locally:
-#   docker build -f Dockerfile.gateway -t sushi-gateway .
-#   docker run --rm -p 3000:3000 -e SUSHI_GATEWAY_TOKEN=dev -e ALLOWED_ORIGIN='*' sushi-gateway
+# Used by .railway/railway.ts and render.yaml. Locally, provision a persistent
+# private token first; it is never generated inside this disposable container:
+#   node scripts/provision-gateway.mjs local
+#   docker compose -f docker-compose.gateway.yml up -d --build
+# The gateway supplies its default ALLOWED_ORIGIN only when it is absent; an
+# explicitly configured origin always takes precedence.
 FROM node:22-alpine AS deps
 WORKDIR /app
 COPY package.json package-lock.json* ./

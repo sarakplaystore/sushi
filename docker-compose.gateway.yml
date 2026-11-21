@@ -1,0 +1,30 @@
+# Companion gateway for a separately hosted Sushi frontend (not the full app).
+# First create the private environment file:
+#   node scripts/provision-gateway.mjs local
+#   docker compose -f docker-compose.gateway.yml up -d --build
+# Put an HTTPS reverse proxy in front of 127.0.0.1:3000; do not expose guacd.
+services:
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile.gateway
+    restart: unless-stopped
+    env_file:
+      - .env.gateway.local
+    environment:
+      GATEWAY_ONLY: "true"
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: "3000"
+      GUACD_HOST: guacd
+      GUACD_PORT: "4822"
+    ports:
+      - "127.0.0.1:${SUSHI_GATEWAY_PORT:-3000}:3000"
+    depends_on:
+      - guacd
+
+  guacd:
+    image: guacamole/guacd:1.5.5
+    restart: unless-stopped
+    environment:
+      GUACD_LOG_LEVEL: info

@@ -3,9 +3,17 @@ import next from "next";
 import { createGatewayWebSockets } from "./src/lib/server/ws-gateway";
 import { checkGuacdAvailable, getGuacdConfig } from "./src/lib/server/guacd-bridge";
 import { getCorsHeaders } from "./src/lib/server/security";
+import { DEFAULT_GATEWAY_ALLOWED_ORIGIN } from "./src/lib/gateway-defaults.mjs";
 
 const dev = process.env.NODE_ENV !== "production";
 const gatewayOnly = process.env.GATEWAY_ONLY === "true";
+// Apply the default only when the variable is absent, never over an existing
+// provider override (including an intentionally empty value or `*`). Keeping it
+// here, rather than as a managed Blueprint literal, preserves Render overrides
+// on later syncs and also covers Node and other Docker hosts.
+if (gatewayOnly && process.env.ALLOWED_ORIGIN === undefined) {
+  process.env.ALLOWED_ORIGIN = DEFAULT_GATEWAY_ALLOWED_ORIGIN;
+}
 const hostname = process.env.HOST || "0.0.0.0";
 const port = Number(process.env.PORT || 3000);
 

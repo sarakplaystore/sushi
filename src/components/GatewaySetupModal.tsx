@@ -21,6 +21,7 @@ import {
   resolveGatewayHttpBase,
 } from "@/lib/client/gateway";
 import { copyTextToClipboard } from "@/lib/client/clipboard";
+import { DEFAULT_GATEWAY_ALLOWED_ORIGIN } from "@/lib/gateway-defaults.mjs";
 
 interface GatewaySetupModalProps {
   isOpen: boolean;
@@ -47,38 +48,50 @@ cd sushi
 cp .env.example .env
 docker compose up -d --build`;
 
-const GATEWAY_ONLY_SNIPPET = `# Run lightweight WebSocket SSH/RDP bridge on VPS for a Vercel frontend
-docker compose up -d guacd
-SUSHI_GATEWAY_TOKEN="your-secret-token" ALLOWED_ORIGIN="https://your-app.vercel.app" npm run gateway`;
+const GATEWAY_ONLY_SNIPPET = `# Companion gateway + guacd on a VPS, from a Sushi checkout (Node 22 + Docker).
+# For a new file and another frontend, append --origin https://your-app.vercel.app
+node scripts/provision-gateway.mjs local
+docker compose -f docker-compose.gateway.yml up -d --build
+# Put an HTTPS reverse proxy in front of 127.0.0.1:3000.
+# Read the token privately from .env.gateway.local and enter it below.`;
 
-const RAILWAY_SNIPPET = `# Railway: native PTY + guacd RDP as a companion for a Vercel UI.
-# .railway/railway.ts creates both services (Dockerfile.gateway + guacamole/guacd)
-# and wires GUACD_HOST to guacd's private DNS name for you.
+const RAILWAY_SNIPPET = `# New, dedicated project; run from a Sushi checkout with Node 22 + Railway CLI 5.47.2+.
 npm i -g @railway/cli
 railway login && railway init
-npm i --no-save railway          # SDK, only needed to evaluate .railway/railway.ts
-railway config plan              # preview
-railway config apply             # create sushi-gateway + guacd
-# New gateway only: keep an existing token unless you intend to rotate it.
-railway variable set SUSHI_GATEWAY_TOKEN="$(openssl rand -hex 24)" --service sushi-gateway
-railway variable set ALLOWED_ORIGIN="https://your-app.vercel.app" --service sushi-gateway
-# sushi-gateway → Settings → Networking → Generate Domain → paste that URL below`;
+railway status                     # verify the project and environment
+npm i --no-save railway@3.17.0     # SDK for .railway/railway.ts
+# --apply manages the entire environment and may delete unlisted resources or
+# variables. Review the plan and cancel unintended changes.
+env -u _ railway config plan       # preview both services
+# For a different initial frontend, append --origin https://your-app.vercel.app
+node scripts/provision-gateway.mjs railway --apply
+# For an existing gateway, railway link then run the helper WITHOUT --apply.
+# --apply with --environment NAME requires Railway CLI 5.64.0+.
+# Existing tokens/origins (including sealed values) are preserved. Run on a
+# trusted machine; the helper reads unsealed variables locally. Avoid concurrent
+# edits: Railway variable writes are not atomic create-if-absent.
+# Copy the token privately from sushi-gateway → Variables.
+# Settings → Networking → Generate Domain → paste that URL below`;
 
 const RAILWAY_DASHBOARD_SNIPPET = `# Railway without the CLI: New Project → GitHub Repo → this repository.
 # 1. sushi-gateway: Settings → Build Configuration → Dockerfile Path
 #      = Dockerfile.gateway   (the root Dockerfile builds the whole app instead)
 # 2. + New → Docker Image → guacamole/guacd:1.5.5   (name it "guacd")
-# 3. sushi-gateway → Variables: GUACD_HOST = guacd's RAILWAY_PRIVATE_DOMAIN,
-#      SUSHI_GATEWAY_TOKEN = openssl rand -hex 24, ALLOWED_ORIGIN = your Vercel URL
+# 3. Variables: GUACD_HOST = guacd's RAILWAY_PRIVATE_DOMAIN.
+#    Generate a token locally with openssl rand -hex 24; paste its output (not
+#    the command) as SUSHI_GATEWAY_TOKEN. The dashboard does not auto-generate it.
+#    ALLOWED_ORIGIN defaults to ${DEFAULT_GATEWAY_ALLOWED_ORIGIN} if absent;
+#    add it to Variables only if your Sushi frontend uses a different origin.
 # 4. Settings → Networking → Generate Domain → paste it below`;
 
-const RENDER_SNIPPET = `# Render: native PTY gateway as a companion for a Vercel UI.
-# Dashboard → New + → Blueprint → this repository: render.yaml builds
-# Dockerfile.gateway and generates SUSHI_GATEWAY_TOKEN for you.
-# Then set ALLOWED_ORIGIN = https://your-app.vercel.app and copy both that token
-# and the service URL (https://sushi-gateway.onrender.com) into Sushi below.
-# A free Render instance may sleep when idle. The optional keep-awake toggle
-# only attempts pings while this settings panel is open; it is not a guarantee.`;
+const RENDER_SNIPPET = `# Render: Dashboard → New + → Blueprint → this repository.
+# render.yaml builds Dockerfile.gateway and generates a persistent 256-bit base64
+# SUSHI_GATEWAY_TOKEN if absent. An existing value is kept, even if blank; if
+# blank, set a strong token explicitly. Copy it privately from Environment.
+# If ALLOWED_ORIGIN is absent, the gateway defaults to ${DEFAULT_GATEWAY_ALLOWED_ORIGIN};
+# add an Environment variable to override it for another frontend. Existing values stay.
+# Copy the public service URL and matching token into Sushi below.
+# A free Render instance may sleep; the panel's keep-awake pings are not a guarantee.`;
 
 /**
  * Places the WebSocket PTY gateway can run. Each one produces the same
@@ -147,21 +160,21 @@ const POST_DEPLOY_GUIDES: Record<DeployTargetId, PostDeployGuide> = {
     dashboard: { label: "Open Railway dashboard", href: "https://railway.com/dashboard" },
     service: <>Open your project and the right environment, then select the <strong>sushi-gateway</strong> service (or whatever you named it), not guacd. Wait for its deployment to be active.</>,
     address: <>Open <strong>Settings → Networking → Public Networking</strong>. Copy the public domain, or choose <strong>Generate Domain</strong> if there isn’t one. If asked for a target port, choose the gateway’s <code>PORT</code> (the Dockerfile defaults to 3000).</>,
-    settings: <>Under the gateway service’s <strong>Variables</strong>, find <code>SUSHI_GATEWAY_TOKEN</code> and set <code>ALLOWED_ORIGIN</code> to the Sushi origin shown below. Deploy any staged changes and wait for the service to be active.</>,
+    settings: <>Under the gateway service’s <strong>Variables</strong>, find <code>SUSHI_GATEWAY_TOKEN</code>. The setup command adds missing values; it keeps existing ones. If your origin differs from the default or an existing override, set <code>ALLOWED_ORIGIN</code> to the Sushi origin shown below. Deploy changes and wait for the service to be active.</>,
     example: "https://your-gateway.up.railway.app",
   },
   render: {
     dashboard: { label: "Open Render dashboard", href: "https://dashboard.render.com" },
     service: <>Open your <strong>sushi-gateway</strong> web service (or whatever you named it) in the Render dashboard and wait for its deployment to be live.</>,
     address: <>Copy the public <strong>onrender.com</strong> URL shown at the top of the service page, or use your public custom domain.</>,
-    settings: <>Open <strong>Environment</strong> and find <code>SUSHI_GATEWAY_TOKEN</code> (generated by the Sushi Blueprint). Set <code>ALLOWED_ORIGIN</code> to the Sushi origin shown below; save and deploy any changes, then wait for the service to be live.</>,
+    settings: <>Open <strong>Environment</strong> and find <code>SUSHI_GATEWAY_TOKEN</code> (generated for a new Sushi Blueprint deployment). If your origin differs from the default or an existing override, add or update <code>ALLOWED_ORIGIN</code> to the Sushi origin shown below; save and deploy any changes.</>,
     example: "https://your-gateway.onrender.com",
   },
   vps: {
     dashboard: null,
     service: <>Run the Sushi gateway on your server and put an HTTPS reverse proxy in front of it.</>,
     address: <>Use the public HTTPS address of that proxy. It must forward WebSocket requests to the gateway’s listening port.</>,
-    settings: <>Find <code>SUSHI_GATEWAY_TOKEN</code> in the gateway’s environment or <code>.env</code>. Set <code>ALLOWED_ORIGIN</code> to the Sushi origin shown below and restart the gateway if settings changed.</>,
+    settings: <>Find <code>SUSHI_GATEWAY_TOKEN</code> in the gateway’s environment or private <code>.env.gateway.local</code>. Check <code>ALLOWED_ORIGIN</code> matches the Sushi origin shown below and restart the gateway if settings changed.</>,
     example: "https://gateway.example.com",
   },
 };
@@ -202,7 +215,7 @@ export const GATEWAY_TOKEN_LINKS: Record<
   { where: string; links: ExternalDocLink[] }
 > = {
   vps: {
-    where: "the gateway's .env (or the environment of `npm run gateway`)",
+    where: "the gateway's private .env.gateway.local or service environment",
     links: [
       {
         label: ".env.example",
@@ -558,6 +571,12 @@ export function GatewaySetupModal({
                 </span>
               </div>
               <p>
+                Up-to-date companion gateways default to <code className="break-all text-slate-200">{DEFAULT_GATEWAY_ALLOWED_ORIGIN}</code> only
+                when <code>ALLOWED_ORIGIN</code> is absent. Existing overrides are kept; older
+                gateways may need the variable set explicitly. If this page uses another origin,
+                set it to the origin shown above.
+              </p>
+              <p>
                 Use the existing <code>SUSHI_GATEWAY_TOKEN</code>. If it is sealed or hidden, use
                 your saved copy. If you no longer have it, generate a strong new token, set and
                 deploy it on the gateway, then update all gateway clients. Sushi saves the token
@@ -881,9 +900,9 @@ export function GatewaySetupModal({
             ))}
 
               <p className="text-[11px] leading-relaxed text-slate-500">
-                Set <code className="text-slate-400">ALLOWED_ORIGIN</code> on the gateway and
-                enter its public URL and matching <code className="text-slate-400">SUSHI_GATEWAY_TOKEN</code> in
-                the fields above. {activeTokenLinks.length > 0 && (
+                Check the gateway’s <code className="text-slate-400">ALLOWED_ORIGIN</code> matches
+                this Sushi origin, then enter its public URL and matching{" "}
+                <code className="text-slate-400">SUSHI_GATEWAY_TOKEN</code> above. {activeTokenLinks.length > 0 && (
                   <>
                     On {activeTarget.short} that secret lives in{" "}
                     <a

@@ -1,7 +1,7 @@
 # Security Policy
 
 **Project:** Sushi — self-hosted & Vercel-ready web SSH / SFTP / RDP workspace
-**Last updated:** 17 November 2026
+**Last updated:** 20 November 2026
 
 ## Reporting a vulnerability
 
@@ -57,3 +57,16 @@ switch the share to *signed-in Sushi accounts* so no code exists at all.
 HTTPS in front of the app, a strong unique password, passkeys where available, network
 restriction (VPN / IP allowlist), `SUSHI_GATEWAY_TOKEN` when bridging to a Vercel frontend,
 backups of `data/` or the cloud records, and prompt patching.
+
+Provision a unique gateway token once in the provider's secret store or with
+`node scripts/provision-gateway.mjs local`; keep the private `.env.gateway.local` file
+and any token backups safe. Never commit them, print them to build logs, or share them
+in chat. Set `ALLOWED_ORIGIN` to the frontend's exact origin: a gateway-only process
+uses `https://sushi-lyart-three.vercel.app` when the variable is absent, while an
+explicit empty value or `*` permits all origins. The gateway checks browser WebSocket
+origins in gateway-only mode, but clients without an `Origin` can connect and a
+non-browser client can forge that header, so this check is not a replacement for a
+strong token and network restrictions. Some RDP WebSocket URLs carry tokens in query
+parameters; configure reverse proxies and observability tools not to record query
+strings or other credentials. If a token leaks or must be rotated, update it on the
+service and in every Sushi gateway client.

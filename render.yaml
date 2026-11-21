@@ -10,7 +10,9 @@
 # Dockerfile.gateway. SUSHI_GATEWAY_TOKEN is generated for you; copy it from
 # the service's Environment tab and enter it in Sushi → Settings → Gateway,
 # together with the public service URL (https://your-gateway.onrender.com).
-# Set ALLOWED_ORIGIN on the gateway to the exact origin of the Sushi web UI.
+# A gateway-only process defaults ALLOWED_ORIGIN to
+# https://sushi-lyart-three.vercel.app when no variable is set. If your Sushi
+# frontend has another origin, add ALLOWED_ORIGIN in the Environment tab.
 #
 # Two Render-specific notes:
 #   * A free instance may sleep after ~15 minutes idle. The optional keep-awake
@@ -28,19 +30,18 @@ services:
     dockerContext: .
     healthCheckPath: /api/system/capabilities
     envVars:
-      # The secret the Vercel UI presents when it opens /ws/ssh. Render creates
-      # it once; read it in the service's Environment tab. Generate your own
-      # instead with: openssl rand -hex 24
+      # Render generates a 256-bit base64 secret once (stronger than 24-byte
+      # hex), preserving any existing value, even if blank. Set a strong value
+      # explicitly if blank; otherwise copy it privately from Environment.
       #   dashboard → sushi-gateway → Environment
       #     https://dashboard.render.com
       #   how env vars and generated secrets work
       #     https://render.com/docs/configure-environment-variables
       - key: SUSHI_GATEWAY_TOKEN
         generateValue: true
-      # The exact origin of your Vercel deployment (no trailing slash), e.g.
-      # https://your-app.vercel.app
-      - key: ALLOWED_ORIGIN
-        sync: false
+      # ALLOWED_ORIGIN is deliberately not a Blueprint-managed literal or a
+      # creation-time prompt. server.ts supplies the default when it is absent;
+      # a service variable overrides it and survives future Blueprint syncs.
       - key: GATEWAY_ONLY
         value: "true"
       - key: NODE_ENV

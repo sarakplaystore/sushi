@@ -142,6 +142,22 @@ export function createGatewayWebSockets(): GatewayUpgradeDispatcher {
       );
     },
     handleUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer) {
+      // CORS does not apply to WebSockets. For a companion gateway, also check
+      // a browser's Origin before upgrading any SSH/RDP socket. Missing Origin
+      // remains valid for non-browser clients; this is defense in depth, not
+      // authentication, since a non-browser client can forge the header.
+      // Full self-hosted Sushi retains its existing same-origin/session behavior.
+      const allowedOrigin = process.env.ALLOWED_ORIGIN?.trim();
+      const requestOrigin = req.headers.origin;
+      if (
+        process.env.GATEWAY_ONLY === "true" &&
+        allowedOrigin && allowedOrigin !== "*" &&
+        requestOrigin !== undefined && requestOrigin !== allowedOrigin
+      ) {
+        socket.end("HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+        return;
+      }
+
       const reqUrl = new URL(req.url || "/", "http://localhost");
       if (reqUrl.pathname === "/ws/ssh") {
         sshWss.handleUpgrade(req, socket, head, (ws) => {

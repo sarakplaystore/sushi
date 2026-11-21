@@ -388,9 +388,9 @@ automatic HTTPS), `--prebuilt` (skip the build), `--node` (no Docker: Node.js + 
 [![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/sarakplaystore/sushi)
 *(Deploys the **gateway** from [`render.yaml`](render.yaml) — the native WebSocket PTY companion for a Vercel UI, not the whole app. See §3.)*
 
-**Railway** has no repo-based one-click button: run `railway config apply` against
-[`.railway/railway.ts`](.railway/railway.ts), which creates the `sushi-gateway` **and** `guacd`
-services in one step (see §3 for both the CLI and dashboard routes).
+**Railway** has no repo-based one-click button: the provisioning helper applies
+[`.railway/railway.ts`](.railway/railway.ts) to create `sushi-gateway` **and** `guacd`,
+then adds missing gateway variables (see §3 for the CLI and dashboard routes).
 
 ```bash
 # Docker, one line, everything included (Sushi + guacd)
@@ -515,52 +515,124 @@ and the [Firestore migration instructions](#migrate-an-existing-disk-or-redis-st
 
    | Gateway host | What you run | Native PTY | Live RDP | Files |
    | --- | --- | --- | --- | --- |
-   | **VPS** (Docker/Node) | `docker compose up -d` or `npm run gateway` | ✅ | ✅ via `guacd` | [`Dockerfile`](Dockerfile), [`docker-compose.yml`](docker-compose.yml) |
-   | **[Railway](https://railway.com/new)** | `railway config apply` → `sushi-gateway` + `guacd` on one private network | ✅ | ✅ via `guacd` | [`.railway/railway.ts`](.railway/railway.ts), [`Dockerfile.gateway`](Dockerfile.gateway) |
+   | **VPS** (Docker/Node) | Provision a local file, then `docker compose -f docker-compose.gateway.yml up -d --build` | ✅ | ✅ via `guacd` | [`docker-compose.gateway.yml`](docker-compose.gateway.yml), [`Dockerfile.gateway`](Dockerfile.gateway) |
+   | **[Railway](https://railway.com/new)** | Setup helper → `sushi-gateway` + `guacd` on one private network | ✅ | ✅ via `guacd` | [`.railway/railway.ts`](.railway/railway.ts), [`Dockerfile.gateway`](Dockerfile.gateway) |
    | **[Render](https://render.com/deploy?repo=https://github.com/sarakplaystore/sushi)** | New + → Blueprint → this repo | ✅ | In-browser IronRDP WASM by default; the blueprint does not deploy `guacd` | [`render.yaml`](render.yaml), [`Dockerfile.gateway`](Dockerfile.gateway) |
 
+   **Default origin and overrides:** An up-to-date `GATEWAY_ONLY=true` process uses
+   `https://sushi-lyart-three.vercel.app` for `ALLOWED_ORIGIN` **only if the variable is absent**.
+   Redeploy the latest gateway code to use this default; older gateways may need it set explicitly.
+   Set it to your own frontend's exact origin (scheme, host and optional port, no path or trailing
+   slash) when different. Existing settings—including empty strings and `*`—are preserved; both
+   empty and `*` allow all origins. The default does not change the full self-hosted app's CORS
+   behavior. The gateway checks the configured origin for browser WebSocket upgrades as well as
+   HTTP CORS. On an existing gateway, an origin mismatch that previously worked for WebSockets
+   will now be rejected; update the override if needed. Requests without an `Origin` remain
+   possible for non-browser clients, and origins can be forged outside a browser: origin checks
+   are **not authentication**. Continue to protect the token, require HTTPS/WSS and restrict
+   network access where possible.
+
    **Railway** (`railway.json` is deprecated and stops being read on 2026‑12‑01, so Sushi
-   ships Railway's Infrastructure-as-Code file instead):
+   ships Railway's Infrastructure-as-Code file instead). For a **new, dedicated project**,
+   from a Sushi checkout with Node 22 and Railway CLI **5.47.2 or newer**:
+
+   **Before applying:** This IaC manages the **entire selected environment**, not just the
+   gateway. It can remove services or variables absent from the file. Use a dedicated project,
+   review the plan carefully, and cancel if it contains unintended changes. The two gateway
+   keys use `preserve()`, but that does not protect unrelated resources or variables.
 
    ```bash
    npm i -g @railway/cli
-   railway login && railway init          # or: railway link
-   npm i --no-save railway                # SDK, only to evaluate .railway/railway.ts
-   railway config plan && railway config apply
-   # New gateway only: keep any existing token unless you intend to rotate it.
-   railway variable set SUSHI_GATEWAY_TOKEN="$(openssl rand -hex 24)" --service sushi-gateway
-   railway variable set ALLOWED_ORIGIN="https://your-app.vercel.app" --service sushi-gateway
+   railway login && railway init          # create a dedicated project
+   railway status                         # verify the linked project and environment
+   npm i --no-save railway@3.17.0         # SDK, only to evaluate .railway/railway.ts
+   env -u _ railway config plan           # preview (avoids SDK _ handling)
+   # For a new gateway with another frontend, append --origin https://your-app.vercel.app
+   node scripts/provision-gateway.mjs railway --apply
    ```
+
+   The helper runs `railway config apply` with Railway's normal confirmation, then adds a
+   24-byte random hex token and the default origin **only where each key is absent**. It reads
+   variable names without printing values, and passes new values to `railway variable set --stdin`.
+   Railway's list response contains unsealed values, which the helper captures in local memory;
+   run it only on a trusted machine. A sealed (`null`) key counts as existing. IaC `preserve()`
+   alone does not generate secrets.
+
+   For an **existing gateway**, use `railway link`, verify `railway status`, then run
+   `node scripts/provision-gateway.mjs railway` **without `--apply`** to avoid changing other
+   resources. Add `--environment NAME` / `--service NAME` to select the existing target. Combining
+   `--apply` with `--environment` requires Railway CLI 5.64.0 or newer; alternatively link the
+   environment first. `--apply` manages the IaC's `sushi-gateway` service; it cannot target a
+   different service name. The helper does not overwrite an existing value even when `--origin`
+   is supplied—change an existing origin deliberately in the dashboard. If an existing token
+   is blank, the helper stops rather than replacing it; set a strong token explicitly or remove
+   the blank key and retry. Do not run simultaneous edits/provisioners: Railway's variable upsert
+   is not atomic "create if absent". A failed update may have an uncertain outcome; inspect the
+   dashboard before retrying.
 
    After deployment, open the gateway service in the [Railway dashboard](https://railway.com/dashboard)
    and find its public domain under **Settings → Networking → Public Networking**. If necessary,
    select **Generate Domain**, using the service's `PORT` as the target port (the Docker image
-   defaults to 3000). The gateway token and `ALLOWED_ORIGIN` live under the service's **Variables**
-   ([how Railway variables work](https://docs.railway.com/variables)). Apply staged changes and wait
-   for the deployment to become active.
+   defaults to 3000). Copy the token privately from the service's **Variables**
+   ([how Railway variables work](https://docs.railway.com/variables)); apply staged changes if
+   prompted and wait for the deployment to become active. Sealed values cannot be read back:
+   keep a secure copy before sealing, or deliberately rotate the token and update every client.
 
    Without the CLI: [*New Project → GitHub Repo → this repository*](https://railway.com/new), set
    **Settings → Build Configuration → Dockerfile Path** to `Dockerfile.gateway`, add a second
-   service from the Docker image `guacamole/guacd:1.5.5`, point `GUACD_HOST` at that service's
-   `RAILWAY_PRIVATE_DOMAIN`, set the two variables above, then **Generate Domain**.
+   service from the Docker image `guacamole/guacd:1.5.5`, and point `GUACD_HOST` at that service's
+   `RAILWAY_PRIVATE_DOMAIN`. For a new gateway, generate a token locally with
+   `openssl rand -hex 24` and paste the **output**, not the command, into the gateway's
+   `SUSHI_GATEWAY_TOKEN` variable. This dashboard-only route is manual. Add `ALLOWED_ORIGIN`
+   if you need to override the default, then **Generate Domain** and deploy the changes.
 
    **Render**: *New + → Blueprint → this repository* (or the [Deploy to Render button](https://render.com/deploy?repo=https://github.com/sarakplaystore/sushi)
-   above). `render.yaml` builds `Dockerfile.gateway` and generates `SUSHI_GATEWAY_TOKEN`. Once live,
-   copy the `https://…onrender.com` URL at the top of the gateway's page in the
-   [Render dashboard](https://dashboard.render.com). Find the token and set `ALLOWED_ORIGIN` under
-   **sushi-gateway → Environment**; save and deploy any changes
-   ([Environment Variables and Secrets](https://render.com/docs/configure-environment-variables)).
+   above). `render.yaml` builds `Dockerfile.gateway`; Render creates and retains a **256-bit base64**
+   `SUSHI_GATEWAY_TOKEN` (not 24-byte hex, but stronger) unless one already exists. If an existing
+   token is blank, set a strong value explicitly; Render does not replace it. Copy the token privately
+   from **sushi-gateway → Environment** in the [Render dashboard](https://dashboard.render.com),
+   along with the public `https://…onrender.com` URL. The default origin is supplied at gateway
+   startup and may not appear in the Environment tab. Add `ALLOWED_ORIGIN` there if you need a
+   different origin; existing overrides are kept because the Blueprint does not manage that key.
+   Save and deploy any changes ([Environment Variables and Secrets](https://render.com/docs/configure-environment-variables)).
 
-   **VPS**:
+   **VPS / Docker companion** (from the checkout, with Node 22 and Docker Compose):
 
    ```bash
-   docker compose up -d guacd
-   SUSHI_GATEWAY_TOKEN="your-secret" ALLOWED_ORIGIN="https://your-app.vercel.app" npm run gateway
+   # For a new file and another frontend, append --origin https://your-app.vercel.app
+   node scripts/provision-gateway.mjs local
+   docker compose -f docker-compose.gateway.yml up -d --build
    ```
 
-   Put Caddy/Nginx HTTPS in front of the VPS and enter its URL and matching token
-   in Sushi's **Settings → Gateway**. A gateway token authorizes protocol access;
-   it is not an admin sign-in and cannot read or change the shared vault.
+   The helper creates `.env.gateway.local` with owner-only permissions and a 24-byte random hex
+   token. Rerunning it fills only missing keys and never replaces existing ones; edit an existing
+   origin deliberately, or set a strong token yourself if its entry is blank. To avoid Node and
+   Docker Compose interpreting an existing file differently, the helper refuses ambiguous dotenv
+   syntax without changing the file (for example, single-quote a literal `$` instead of using
+   interpolation). This file is gitignored and excluded from Docker builds. Keep and back it up
+   securely: it must survive rebuilds, redeployments and all replicas. Read the token privately
+   from the file and enter it in Sushi. The Compose gateway binds to `127.0.0.1:3000`; set
+   `SUSHI_GATEWAY_PORT` for another host port, and put an HTTPS/WSS reverse proxy in front of it.
+   `guacd` stays on the private Compose network.
+
+   For Node without Docker, install dependencies and start the gateway directly; configure a
+   reachable private guacd separately if needed:
+
+   ```bash
+   npm ci
+   HOST=127.0.0.1 NODE_ENV=production GATEWAY_ONLY=true \
+     node --env-file=.env.gateway.local --import tsx server.ts
+   ```
+
+   Shell environment values take precedence over Node's env file. Do not combine `--env-file`
+   with `node --run gateway`: some Node versions do not pass the file's values to the subprocess.
+
+   **Other providers:** Use their persistent secret manager or the local helper to generate a
+   token once, then import `SUSHI_GATEWAY_TOKEN` and, if needed, `ALLOWED_ORIGIN` into the gateway
+   service. A dashboard/import step may be manual on platforms without a supported secret
+   generator. Never generate a token on each container start or store its only copy on ephemeral
+   disk. A gateway token authorizes protocol access; it is not an admin sign-in and cannot read or
+   change the shared vault.
 
    **Connect an already-deployed gateway:** In Sushi, open **Settings → Gateway** and choose
    Railway, Render, or VPS under **Find your PTY gateway**. The guide shows where to find the
@@ -571,7 +643,9 @@ and the [Firestore migration instructions](#migrate-an-existing-disk-or-redis-st
    credentials—it does not validate the token or prove that a WebSocket session works. Only use a
    trusted gateway; Sushi saves the token in this browser's local storage. If a token is sealed or
    hidden, use a previously saved copy; if you no longer have it, generate and deploy a new strong
-   token and update every gateway client. Never share it in chat or commit it.
+   token and update every gateway client. Never share it in chat or commit it. Some RDP WebSocket
+   URLs contain tokens in query parameters: configure proxies and monitoring not to log query
+   strings or credentials.
 
    > **Idle sleep.** A managed host that suspends idle services (Render's free instance plan,
    > an unscaled Railway service) cannot answer a WebSocket handshake while asleep, and the

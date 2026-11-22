@@ -41,7 +41,7 @@ It is designed around a **Hybrid VPS + Serverless Architecture**:
   - **Who is in here**: a live roster with names and join times, and a `… is typing` hint so two people do not drive at once; **New code** invalidates the old one instantly
   - **Let teammates type** is the default; switch it off for a read-only share when someone should only watch
   - **Scrollback replay** for late joiners (256 KB ring buffer), terminal size follows the smallest attached screen, and **Stop sharing** disconnects guests while your own terminal keeps running
-- Commands survive a closed tab (No timeout + resume prompt) and recently connected hosts are remembered
+- Serverless commands can survive a closed tab with **No timeout**; compatible persistent gateways can also keep a private WebSocket PTY for reattachment. Recently connected hosts are remembered.
 - One merged entry per machine in the sidebar and launchpad, plus **All hosts** (`/hosts`) — one table of every machine with its SSH/SFTP/RDP ports and one link each — and `GET /api/hosts` for scripts
   - **Translate selected text**: highlight any text in the terminal and hit the **Translate** button — the translation appears in a panel above the terminal (Chinese by default, 14 target languages, remembered per browser). Translates through Sushi's own `/api/translate` (see *Translating text* below)
 - **SFTP File Manager (`/api/sftp/*`)**
@@ -181,9 +181,54 @@ confirmation naming the protocols that go with it, instead of leaving orphaned
 profiles behind. Saves still go through the normal encrypted-vault path — no new
 storage, no new sync path.
 
+## Keep a private WebSocket terminal running
+
+On a VPS/Docker install or a Vercel frontend with an attached **persistent, compatible
+WebSocket gateway**, Sushi can keep the *same private SSH PTY* when you close a
+browser tab or a Sushi workspace tab. The terminal starts with **Keep running** on by
+default. Wait for **Keep running on** and the saved-for-reattachment message before
+closing the tab; if the gateway cannot register the shell or the browser cannot save
+its identifier, Sushi warns instead of claiming the terminal is protected. The toggle
+can also be enabled while a command is already running on a compatible gateway.
+
+- Reopen Sushi in the **same browser** and sign in again. An open workspace tab is
+  restored and reattaches to its original shell. If you closed the workspace tab with
+  **×**, find it under **Launchpad → Saved WebSocket terminals → Resume terminal**
+  (also available on the phone home screen). Recent output is replayed and typing goes
+  to the existing PTY; no command or initial `cd` is run again.
+- **End terminal** closes the SSH session and disconnects any shared participants;
+  foreground commands are normally interrupted, while independently detached processes
+  may continue. Turning **Keep running** off means a private shell closes when its last
+  tab disconnects; an active team share still follows the share lifecycle. **Forget**
+  removes the browser's saved entry but **does not stop** the shell: return to it and
+  choose **End terminal** if you want to stop it.
+- The saved identifier, host/user and gateway address are local to this browser, not
+  synced to another device or placed in a link. No SSH password, key, passphrase or
+  gateway token is saved with them. The identifier is distinct from any share link and
+  is not sufficient to join: the gateway key or local Sushi admin authentication is
+  required. Keeping a PTY private does **not** enable team sharing.
+- If its gateway setting has changed, is unavailable or no longer has that terminal,
+  Sushi offers a retry instead of silently opening another shell. Explicitly forgetting
+  it is required before connecting a new shell. A quick-connect host may require its
+  SSH credentials again for that new shell. Older gateways do not confirm this feature;
+  update both the frontend and gateway before relying on it.
+
+The gateway keeps PTYs **in its own process**, not on disk. Its restart, redeployment,
+sleep, an SSH disconnection or a remote reboot can end them. A detached PTY is reaped
+when nobody is attached and there has been no output or activity for
+`SUSHI_SHARE_IDLE_TTL_MS` (12 hours by default); replay is bounded, not a full log.
+A command such as `apt upgrade` can still wait for a package-manager lock or an
+interactive confirmation, so keeping the terminal open does not guarantee unattended
+completion. Do not delete apt's lock file to force an upgrade.
+
+**Existing sessions on an older gateway are not retroactively protected.** Updating or
+restarting that gateway itself drops its existing PTYs, so let important commands finish
+or use the already-available sharing feature without restarting it first. This WebSocket
+feature is separate from **No timeout** for serverless HTTP commands below.
+
 ## Team sharing — one SSH session, several people
 
-A normal Sushi terminal is private: one tab, one shell, and the shell dies with the tab.
+A normal Sushi terminal is private, including when **Keep running** retains it.
 **Share** (in the terminal header) turns that shell into a shared one:
 
 1. Open a host's terminal and hit **Share**. The terminal font starts at **12**;
@@ -248,9 +293,9 @@ done, and remember the shell keeps running until you stop it.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `SUSHI_SHARE_MAX_SESSIONS` | `50` | Most shells shared at once on this server |
-| `SUSHI_SHARE_IDLE_TTL_MS` | `43200000` (12 h) | How long a detached shell with nobody attached is kept |
-| `SUSHI_SHARE_SCROLLBACK_BYTES` | `262144` (256 KB) | Scrollback replayed to whoever joins late |
+| `SUSHI_SHARE_MAX_SESSIONS` | `50` | Maximum shared and privately retained PTYs on this server |
+| `SUSHI_SHARE_IDLE_TTL_MS` | `43200000` (12 h) | Idle time before a detached PTY with nobody attached is closed |
+| `SUSHI_SHARE_SCROLLBACK_BYTES` | `262144` (256 KB) | Recent output replayed when someone reattaches |
 
 ---
 
@@ -1084,7 +1129,8 @@ ways past a question — including the old curses installers (`Configuring light
   older than a week are pruned, and removing a run from the list never stops anything on the host.
 - `POST /api/ssh/exec/run` answers *is it still running?* in one round trip (`test -p` on the FIFO,
   `tail -c` of the log, max 256 KiB, both paths validated against the exact `/tmp/.sushi-…` shapes).
-  A WebSocket PTY tab cannot outlive its socket, so only serverless runs are offered.
+  These run cards are for serverless commands. A WebSocket PTY uses the separate private
+  **Keep running** and **Saved WebSocket terminals** mechanism described above.
 
 Ctrl+C sends a real SIGINT when stdin is live and cancels the request otherwise, and always leaves the
 session healthy. After a deployment, an open tab shows a **Reload** banner instead of silently keeping

@@ -7,9 +7,9 @@ import type { ShareAccountIssuer } from "./share-ticket";
 /**
  * Team sharing for one interactive SSH PTY.
  *
- * A Sushi terminal normally owns its shell: one browser tab, one `ssh2` channel, and
- * when the tab closes the shell dies. Sharing wraps that single channel in a
- * `SharedSshSession` that many browsers attach to at once:
+ * An unretained terminal owns one `ssh2` channel and closes it on disconnect.
+ * A `SharedSshSession` can instead retain that channel privately for its owner,
+ * publish it to a team, or do both without replacing the shell:
  *
  *   - **Everyone sees the same screen.** Shell output is written to every attached
  *     participant, and a bounded scrollback ring buffer is replayed to whoever joins
@@ -111,6 +111,8 @@ export interface SharedSessionOptions {
   passcode?: "auto" | string | null;
   /** Pinned verifier for account joins from the frontend that published the share. */
   accountIssuer?: ShareAccountIssuer | null;
+  /** Private retained terminals are not listed or joinable as public shares. */
+  privateRetention?: boolean;
 }
 
 /**
@@ -131,18 +133,25 @@ export function generateSharePasscode(): string {
 }
 
 export function createShareId(): string {
-  return crypto.randomBytes(9).toString("base64url");
+  return crypto.randomBytes(18).toString("base64url");
 }
 
 export class SharedSshSession {
-  readonly shareId: string;
+  shareId: string;
+  /** Independent from a share link: never handed to passcode guests. */
+  readonly retainedId: string;
   readonly host: string;
   readonly port: number;
   readonly username: string;
   readonly label: string;
-  readonly accountIssuer: ShareAccountIssuer | null;
+  accountIssuer: ShareAccountIssuer | null;
   readonly createdAt = Date.now();
 
+  private shared: boolean;
+  private retained: boolean;
+  // Once a shell has been retained, its original socket may already be gone.
+  // Its output must continue through this object even after sharing is stopped.
+  private managedRouting: boolean;
   private readonly participants = new Map<string, ParticipantEntry>();
   private readonly ring: Buffer[] = [];
   private ringBytes = 0;
@@ -161,11 +170,15 @@ export class SharedSshSession {
 
   constructor(options: SharedSessionOptions) {
     this.shareId = createShareId();
+    this.retainedId = createShareId();
     this.host = options.host;
     this.port = options.port;
     this.username = options.username;
     this.label = options.label?.trim() || `${options.username}@${options.host}:${options.port}`;
     this.accountIssuer = options.accountIssuer ?? null;
+    this.shared = !options.privateRetention;
+    this.retained = Boolean(options.privateRetention);
+    this.managedRouting = this.retained;
     this.ssh = options.ssh;
     this.stream = options.stream;
     this.cols = clamp(options.cols, MIN_COLS, MAX_COLS);
@@ -200,6 +213,45 @@ export class SharedSshSession {
     return this.passcodeHash !== null;
   }
 
+  get isShared(): boolean {
+    return this.shared;
+  }
+
+  get isRetained(): boolean {
+    return this.retained;
+  }
+
+  get usesManagedRouting(): boolean {
+    return this.managedRouting;
+  }
+
+  /** Retention is private: only a gateway/account-authenticated owner may reattach. */
+  enableRetention(): void {
+    this.retained = true;
+    this.managedRouting = true;
+  }
+
+  disableRetention(): void {
+    this.retained = false;
+  }
+
+  /** Publish an already-retained shell without replacing its running SSH channel. */
+  publish(options: { write: boolean; passcode: "auto" | string | null; accountIssuer: ShareAccountIssuer | null }): string | null {
+    if (this.destroyed || this.shared) throw new Error("This terminal is already shared.");
+    // Republish under a new share ID. Previously revoked links and scoped
+    // account tickets must not become valid again when sharing is restarted.
+    const map = registry();
+    if (map.get(this.shareId) !== this) throw new Error("This terminal is no longer available.");
+    map.delete(this.shareId);
+    this.shareId = createShareId();
+    map.set(this.shareId, this);
+    this.write = options.write;
+    this.accountIssuer = options.accountIssuer;
+    const code = this.rotatePasscode(options.passcode);
+    this.shared = true;
+    return code;
+  }
+
   /**
    * Set by the socket that published the shell. Stopping a share from the HTTP API
    * happens on that socket's behalf, so it has to be told to go back to a private
@@ -225,7 +277,10 @@ export class SharedSshSession {
     };
     this.participants.set(id, entry);
     this.lastActivityAt = Date.now();
-    this.applySize();
+    // Reassert the size on owner reattachment even if dimensions match. Full-
+    // screen programs can react to the window-change event and repaint after
+    // the bounded replay, without injecting input into the running command.
+    this.applySize(opts.role === "owner" && this.retained);
     return entry;
   }
 
@@ -299,7 +354,7 @@ export class SharedSshSession {
   }
 
   /** The PTY keeps the smallest attached screen so nobody's lines wrap. */
-  private applySize(): void {
+  private applySize(force = false): void {
     if (this.destroyed || this.status !== "live") return;
     let cols = Number.POSITIVE_INFINITY;
     let rows = Number.POSITIVE_INFINITY;
@@ -308,7 +363,7 @@ export class SharedSshSession {
       rows = Math.min(rows, entry.rows);
     }
     if (!Number.isFinite(cols) || !Number.isFinite(rows)) return;
-    if (cols === this.cols && rows === this.rows) return;
+    if (!force && cols === this.cols && rows === this.rows) return;
     this.cols = cols;
     this.rows = rows;
     try {
@@ -425,6 +480,12 @@ export class SharedSshSession {
     }
   }
 
+  broadcastOwners(payload: Record<string, unknown>): void {
+    for (const entry of this.participants.values()) {
+      if (entry.role === "owner") this.send(entry, payload);
+    }
+  }
+
   broadcastParticipants(): void {
     this.broadcast({ type: "participants", participants: this.participantsList() });
   }
@@ -449,6 +510,25 @@ export class SharedSshSession {
    */
   revoke(reason = "The host stopped sharing this session.", opts: { notifyOwner?: boolean } = {}): void {
     if (this.destroyed) return;
+    if (this.managedRouting) {
+      // A retained shell may now be owned by a different socket. Unpublish it
+      // without losing the routing object or the still-running SSH channel.
+      this.shared = false;
+      this.accountIssuer = null;
+      this.passcodeHash = null;
+      this.failedAttempts = 0;
+      for (const entry of [...this.participants.values()]) {
+        if (entry.role === "owner") {
+          if (opts.notifyOwner) this.send(entry, { type: "share", action: "stopped", reason });
+          continue;
+        }
+        this.send(entry, { type: "share-closed", reason });
+        this.participants.delete(entry.id);
+        try { entry.ws.close(1000, "Share ended"); } catch { /* already closed */ }
+      }
+      this.broadcastParticipants();
+      return;
+    }
     removeSharedSession(this.shareId);
     for (const entry of [...this.participants.values()]) {
       if (entry.role === "owner") {
@@ -538,17 +618,18 @@ function registry(): Map<string, SharedSshSession> {
  * to clean them up: an idle share (no participant for `SUSHI_SHARE_IDLE_TTL_MS`) is
  * closed and its SSH connection released. The timer never holds the process open.
  */
+export function reapIdleSharedSessions(now = Date.now()): void {
+  for (const session of [...registry().values()]) {
+    if (session.participantCount > 0) continue;
+    if (now - session.lastActivityAt < idleTtlMs()) continue;
+    session.destroy("Detached SSH terminal closed after its idle retention limit.");
+  }
+}
+
 function startReaper(): void {
   if (reaperStarted) return;
   reaperStarted = true;
-  const timer = setInterval(() => {
-    const now = Date.now();
-    for (const session of [...registry().values()]) {
-      if (session.participantCount > 0) continue;
-      if (now - session.lastActivityAt < idleTtlMs()) continue;
-      session.destroy(`Shared session closed after ${Math.round(idleTtlMs() / 3600000)}h idle.`);
-    }
-  }, 60_000);
+  const timer = setInterval(reapIdleSharedSessions, 60_000);
   timer.unref?.();
 }
 
@@ -557,7 +638,7 @@ export function registerSharedSession(session: SharedSshSession): { ok: boolean;
   if (map.size >= maxSessions()) {
     return {
       ok: false,
-      error: `Too many shared sessions on this gateway (limit ${maxSessions()}). Stop an existing share first.`,
+      error: `Too many retained or shared SSH sessions on this gateway (limit ${maxSessions()}). End an existing session first.`,
     };
   }
   map.set(session.shareId, session);
@@ -566,7 +647,16 @@ export function registerSharedSession(session: SharedSshSession): { ok: boolean;
 }
 
 export function getSharedSession(shareId: string): SharedSshSession | undefined {
-  return registry().get(shareId.trim());
+  const session = registry().get(shareId.trim());
+  return session?.isShared ? session : undefined;
+}
+
+/** A retained terminal ID is not a credential; callers must authenticate first. */
+export function getRetainedSshSession(sessionId: string): SharedSshSession | undefined {
+  const id = sessionId.trim();
+  return [...registry().values()].find(
+    (session) => session.retainedId === id && session.isRetained && session.status === "live"
+  );
 }
 
 export function removeSharedSession(shareId: string): void {
@@ -574,7 +664,7 @@ export function removeSharedSession(shareId: string): void {
 }
 
 export function listSharedSessions(): SharedSessionSummary[] {
-  return [...registry().values()].map((s) => s.summary());
+  return [...registry().values()].filter((s) => s.isShared).map((s) => s.summary());
 }
 
 /**
@@ -585,7 +675,7 @@ export function listSharedSessions(): SharedSessionSummary[] {
 export function stopSharedSession(shareId: string, reason?: string): { ok: boolean; error?: string } {
   const session = getSharedSession(shareId.trim());
   if (!session) return { ok: false, error: "No active share with that ID." };
-  if (session.hasAttachedOwner) {
+  if (session.hasAttachedOwner || (session.usesManagedRouting && session.isRetained)) {
     session.revoke(reason || "The share was stopped from the Sushi dashboard.", {
       notifyOwner: true,
     });
@@ -614,7 +704,7 @@ export function findSharedSessionByHost(
 ): SharedSshSession | undefined {
   const target = `${username}@${host}:${port}`;
   return [...registry().values()].find(
-    (s) => s.status === "live" && `${s.username}@${s.host}:${s.port}` === target
+    (s) => s.isShared && s.status === "live" && `${s.username}@${s.host}:${s.port}` === target
   );
 }
 

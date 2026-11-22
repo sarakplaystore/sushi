@@ -102,6 +102,17 @@ import { DonateModal } from "./DonateModal";
 import { AiDisclaimer } from "./AiDisclaimer";
 import { DONATION_ADDRESS } from "@/lib/client/donation";
 import { SshTerminalSession } from "./SshTerminalSession";
+import { RetainedPtyList } from "./RetainedPtyList";
+import {
+  RETAINED_PTY_EVENT,
+  RETAINED_PTY_KEY,
+  forgetRetainedPty,
+  loadRetainedPtys,
+  moveRetainedPty,
+  retainedPtyMatches,
+  type PtyCloseSafety,
+  type RetainedPty,
+} from "@/lib/client/retained-pty";
 import { SftpBrowserSession } from "./SftpBrowserSession";
 import { RdpDesktopSession } from "./RdpDesktopSession";
 import {
@@ -318,6 +329,26 @@ export function SushiWorkspace() {
   // ---------------------------------------------------------------------------
   const [recentHosts, setRecentHosts] = useState<RecentHostEntry[]>([]);
   const [resumableRuns, setResumableRuns] = useState<ResumableRun[]>([]);
+  /** Private PTY IDs live on this browser, not in share links or synced vault state. */
+  const [retainedPtys, setRetainedPtys] = useState<RetainedPty[]>([]);
+  const [retainedPtyNotice, setRetainedPtyNotice] = useState<string | null>(null);
+  const ptyCloseSafetyRef = useRef<Record<string, PtyCloseSafety>>({});
+  const handlePtySafetyChange = useCallback((tabId: string, state: PtyCloseSafety) => {
+    ptyCloseSafetyRef.current[tabId] = state;
+  }, []);
+  useEffect(() => {
+    const refresh = () => setRetainedPtys(loadRetainedPtys());
+    const onStorage = (event: StorageEvent) => {
+      if (event.key === RETAINED_PTY_KEY || event.key === null) refresh();
+    };
+    refresh();
+    window.addEventListener(RETAINED_PTY_EVENT, refresh);
+    window.addEventListener("storage", onStorage);
+    return () => {
+      window.removeEventListener(RETAINED_PTY_EVENT, refresh);
+      window.removeEventListener("storage", onStorage);
+    };
+  }, []);
   /** Run each open SSH tab should take over (keyed by tab id). */
   const [tabResumes, setTabResumes] = useState<Record<string, ResumableRun>>({});
   /** The "go back to the still-running command?" prompt (null = not shown). */
@@ -623,15 +654,22 @@ export function SushiWorkspace() {
       const claimedRunIds = new Set<string>();
       const initialResumes: Record<string, ResumableRun> = {};
       const restoredTabs: SessionTab[] = [];
+      const localRetained = loadRetainedPtys();
 
       for (const ptab of mergedWs.openTabs) {
         if (localClosedTabIdsRef.current.has(ptab.id)) continue;
-        const resolvedProfile = resolvePersistedTabProfile(
+        const retained = ptab.protocol === "ssh" ? localRetained.find((entry) => entry.tabId === ptab.id) : undefined;
+        let resolvedProfile = resolvePersistedTabProfile(
           ptab,
           plain.hosts,
           nextKeys,
           nextEnforce
         );
+        // A retained PTY needs gateway/account auth, not a new SSH login. This
+        // also restores ad-hoc tabs whose SSH password was never persisted.
+        if (retained && (!resolvedProfile || !retainedPtyMatches(retained, retained.gatewayUrl, resolvedProfile))) {
+          resolvedProfile = retained.profile;
+        }
         if (!resolvedProfile) continue;
         tabUpdatedAtMapRef.current[ptab.id] = ptab.updatedAt;
         restoredTabs.push({
@@ -642,7 +680,7 @@ export function SushiWorkspace() {
           initialPath: ptab.initialPath,
           createdAt: ptab.createdAt,
         });
-        const run = matchRunningCommandForTab(ptab, mergedWs.resumableRuns, claimedRunIds);
+        const run = retained ? undefined : matchRunningCommandForTab(ptab, mergedWs.resumableRuns, claimedRunIds);
         if (run) {
           claimedRunIds.add(run.id);
           tabRunIdsRef.current[ptab.id] = run.id;
@@ -709,9 +747,11 @@ export function SushiWorkspace() {
     );
     const existingIds = new Set(tabsRef.current.map((t) => t.id));
     const nextResumes: Record<string, ResumableRun> = {};
+    const localRetained = loadRetainedPtys();
     let tabsChanged = false;
 
     const updatedExisting = tabsRef.current.map((tab) => {
+      const retained = tab.protocol === "ssh" ? localRetained.find((entry) => entry.tabId === tab.id) : undefined;
       const resolvedProfile = resolvePersistedTabProfile(
         {
           id: tab.id,
@@ -729,7 +769,8 @@ export function SushiWorkspace() {
       );
 
       let nextTab = tab;
-      if (resolvedProfile && JSON.stringify(resolvedProfile) !== JSON.stringify(tab.profile)) {
+      if (resolvedProfile && (!retained || retainedPtyMatches(retained, retained.gatewayUrl, resolvedProfile)) &&
+          JSON.stringify(resolvedProfile) !== JSON.stringify(tab.profile)) {
         const nextTitle =
           tab.title === tab.profile.name && resolvedProfile.name
             ? resolvedProfile.name
@@ -738,7 +779,7 @@ export function SushiWorkspace() {
         tabsChanged = true;
       }
 
-      if (nextTab.protocol === "ssh" && !tabRunIdsRef.current[nextTab.id]) {
+      if (nextTab.protocol === "ssh" && !retained && !tabRunIdsRef.current[nextTab.id]) {
         const matchingRun = matchRunningCommandForTab(
           { protocol: nextTab.protocol, profile: nextTab.profile },
           mergedWs.resumableRuns,
@@ -757,12 +798,16 @@ export function SushiWorkspace() {
     const addedRemoteTabs: SessionTab[] = [];
     for (const ptab of mergedWs.openTabs) {
       if (existingIds.has(ptab.id) || localClosedTabIdsRef.current.has(ptab.id)) continue;
-      const resolvedProfile = resolvePersistedTabProfile(
+      const retained = ptab.protocol === "ssh" ? localRetained.find((entry) => entry.tabId === ptab.id) : undefined;
+      let resolvedProfile = resolvePersistedTabProfile(
         ptab,
         plain.hosts,
         nextKeys,
         nextEnforce
       );
+      if (retained && (!resolvedProfile || !retainedPtyMatches(retained, retained.gatewayUrl, resolvedProfile))) {
+        resolvedProfile = retained.profile;
+      }
       if (!resolvedProfile) continue;
       tabUpdatedAtMapRef.current[ptab.id] = ptab.updatedAt;
       addedRemoteTabs.push({
@@ -774,7 +819,7 @@ export function SushiWorkspace() {
         createdAt: ptab.createdAt,
       });
       tabsChanged = true;
-      const run = matchRunningCommandForTab(ptab, mergedWs.resumableRuns, claimedRunIds);
+      const run = retained ? undefined : matchRunningCommandForTab(ptab, mergedWs.resumableRuns, claimedRunIds);
       if (run) {
         claimedRunIds.add(run.id);
         tabRunIdsRef.current[ptab.id] = run.id;
@@ -1444,6 +1489,48 @@ export function SushiWorkspace() {
     [enforceKeyWhitelist, persistTabsLocally, scheduleWorkspaceSync, sshKeys]
   );
 
+  /** Reopen a specifically identified PTY; never select one merely by host name. */
+  const resumeRetainedPty = useCallback((entry: RetainedPty) => {
+    const existing = tabsRef.current.find((tab) => tab.id === entry.tabId);
+    if (existing) {
+      selectActiveTab(existing.id);
+      return;
+    }
+    const saved = hosts.find((host) => host.protocol === "ssh" && retainedPtyMatches(entry, entry.gatewayUrl, host));
+    const resolved = saved ? resolveProfileWithKeychain(saved, sshKeys, enforceKeyWhitelist) : null;
+    // The original SSH secret is not needed to reattach. A sanitized snapshot is
+    // sufficient even for a quick-connect host that was never saved in the vault.
+    const profile = resolved?.ok ? resolved.profile : entry.profile;
+    const tabId = `tab-${randomUUID()}`;
+    if (!moveRetainedPty(entry.tabId, tabId)) {
+      setRetainedPtyNotice("Could not save the terminal in this browser. It was not reopened; check browser storage and try again.");
+      return;
+    }
+    const now = Date.now();
+    const tab: SessionTab = {
+      id: tabId, title: profile.name, protocol: "ssh", profile, createdAt: now,
+    };
+    tabUpdatedAtMapRef.current[tabId] = now;
+    const nextTabs = [...tabsRef.current, tab];
+    setRetainedPtyNotice(null);
+    setMobileSidebarOpen(false);
+    setTabs(nextTabs);
+    setActiveTabId(tabId);
+    persistTabsLocally(nextTabs, tabId, true);
+    scheduleWorkspaceSync();
+  }, [enforceKeyWhitelist, hosts, persistTabsLocally, scheduleWorkspaceSync, selectActiveTab, sshKeys]);
+
+  const forgetSavedPty = useCallback((entry: RetainedPty) => {
+    if (!window.confirm("Forget this saved terminal? This does not stop it. You will lose this browser's way to resume it, and the gateway may keep it until its idle limit.")) return;
+    if (!forgetRetainedPty(entry.tabId, entry.sessionId)) {
+      setRetainedPtyNotice("Could not update browser storage. The saved terminal was not forgotten.");
+    } else {
+      setRetainedPtyNotice(null);
+    }
+  }, []);
+
+  const detachedPtys = retainedPtys.filter((entry) => !tabs.some((tab) => tab.id === entry.tabId));
+
   // ---------------------------------------------------------------------------
   // Session history: recently connected hosts, and runs that outlived their tab
   // ---------------------------------------------------------------------------
@@ -1651,8 +1738,17 @@ export function SushiWorkspace() {
 
   const closeSessionTab = (tabId: string, e?: React.MouseEvent) => {
     e?.stopPropagation();
-    // Closing the tab does not stop the command: its run stays in the history so the
-    // "go back?" prompt (or the launchpad list) can reopen it on any device.
+    const tab = tabsRef.current.find((item) => item.id === tabId);
+    const savedPty = loadRetainedPtys().find((entry) => entry.tabId === tabId);
+    const safety = ptyCloseSafetyRef.current[tabId];
+    const isWs = safety ? safety.transport === "ws" || Boolean(savedPty) : Boolean(effectiveWsSsh || gatewaySettings.gatewayUrl.trim() || savedPty);
+    const confirmed = Boolean(savedPty && tab && safety?.confirmedSessionId === savedPty.sessionId &&
+      retainedPtyMatches(savedPty, gatewaySettings.gatewayUrl, tab.profile));
+    if (tab?.protocol === "ssh" && isWs && !confirmed &&
+        !window.confirm("This terminal is not confirmed as saved for reattachment. Closing it may stop its running command. Close it anyway?")) return;
+    // A confirmed retained PTY stays in local history; serverless run history uses
+    // its own mechanism. Closing an ordinary unretained WS shell ends that shell.
+    delete ptyCloseSafetyRef.current[tabId];
     const now = Date.now();
     localClosedTabIdsRef.current.add(tabId);
     delete tabRunIdsRef.current[tabId];
@@ -1708,6 +1804,10 @@ export function SushiWorkspace() {
       if (direct && direct.protocol === tab.protocol) {
         const resolved = resolveProfileWithKeychain(direct, sshKeys, enforceKeyWhitelist);
         const nextProfile = resolved.ok ? resolved.profile : direct;
+        const retained = tab.protocol === "ssh" ? loadRetainedPtys().find((entry) => entry.tabId === tab.id) : undefined;
+        // Do not relabel a live/resumable shell as a different host after editing
+        // its saved profile. It remains bound to the original PTY identity.
+        if (retained && !retainedPtyMatches(retained, retained.gatewayUrl, nextProfile)) return tab;
         if (JSON.stringify(nextProfile) !== JSON.stringify(tab.profile)) {
           anyTabUpdated = true;
           tabUpdatedAtMapRef.current[tab.id] = Date.now();
@@ -2721,6 +2821,12 @@ export function SushiWorkspace() {
                     : "block"
               }
             >
+              {(detachedPtys.length > 0 || retainedPtyNotice) && (
+                <div className="mb-4 space-y-2">
+                  <RetainedPtyList entries={detachedPtys} onResume={resumeRetainedPty} onForget={forgetSavedPty} />
+                  {retainedPtyNotice && <p role="alert" className="text-xs text-rose-300">{retainedPtyNotice}</p>}
+                </div>
+              )}
 
               {/* Recently connected (session history: nothing here is a saved host) */}
               {(recentHosts.length > 0 || resumableRunCandidates(resumableRuns).length > 0) && (
@@ -3341,6 +3447,8 @@ export function SushiWorkspace() {
               <div className="flex min-h-0 flex-1 flex-col">
                 {/* Recently connected stays on top on a phone too. */}
                 <div className="mb-3 max-h-[34dvh] shrink-0 space-y-2 overflow-y-auto rounded-2xl border border-white/8 bg-[#0c1017] p-3">
+                  <RetainedPtyList entries={detachedPtys} onResume={resumeRetainedPty} onForget={forgetSavedPty} />
+                  {retainedPtyNotice && <p role="alert" className="text-xs text-rose-300">{retainedPtyNotice}</p>}
                   <div className="flex items-center justify-between">
                     <h2 className="flex items-center gap-1.5 text-xs font-semibold text-white">
                       <Clock className="h-3.5 w-3.5 text-slate-400" />
@@ -3488,10 +3596,12 @@ export function SushiWorkspace() {
               >
                 {tab.protocol === "ssh" && (
                   <SshTerminalSession
+                    tabId={tab.id}
                     profile={tab.profile}
                     isActive={isActive}
                     initialPath={tab.initialPath}
                     wsAvailable={effectiveWsSsh}
+                    retainedPtySupported={Boolean(gatewaySettings.gatewayUrl.trim() ? remoteCaps?.retainedSshPty : localCaps?.retainedSshPty)}
                     gatewaySettings={gatewaySettings}
                     snippets={snippets}
                     onOpenCompanionSftp={(cwd) =>
@@ -3499,6 +3609,7 @@ export function SushiWorkspace() {
                     }
                     onOpenRdp={() => openRdpCompanion(tab.profile)}
                     onOpenGatewayModal={() => setGatewayModalOpen(true)}
+                    onPtySafetyChange={handlePtySafetyChange}
                     onConnected={() => handleSessionConnected(tab.profile, tab.profile.id)}
                     onRunChange={(run) => handleRunUpdated(run, tab.id)}
                     onStopHostRuns={() => clearHostResumableRuns(tab.profile)}

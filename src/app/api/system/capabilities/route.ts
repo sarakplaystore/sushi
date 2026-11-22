@@ -42,6 +42,7 @@ export async function GET(req: NextRequest) {
     // WebSocket gateway can do — Vercel serverless has nowhere to keep it.
     sharedSsh: wsActive,
     shareAccountTickets: wsActive,
+    retainedSshPty: wsActive,
     serverVault: isServerVaultEnabled(),
     storageBackend: getStateStoreKind(),
     requiresGatewayToken: Boolean(process.env.SUSHI_GATEWAY_TOKEN?.trim()),

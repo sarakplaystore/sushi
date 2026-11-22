@@ -188,6 +188,8 @@ export interface SystemCapabilities {
   rdpProbe: boolean;
   /** Team-shared SSH PTY sessions are possible (needs a persistent gateway). */
   sharedSsh?: boolean;
+  /** Remote account joins accept share-scoped frontend-signed tickets. */
+  shareAccountTickets?: boolean;
   serverVault: boolean;
   storageBackend?: "disk" | "redis" | "turso" | "firestore" | "none";
   requiresGatewayToken: boolean;

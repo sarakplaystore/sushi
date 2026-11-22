@@ -927,6 +927,17 @@ export function mergePasskeySummaries(
 // Request & WebSocket Authentication Guard
 // ---------------------------------------------------------------------------
 
+/** Verify only the protocol gateway key, never a cookie or Sushi account token. */
+export function verifyGatewayTokenHeaders(headers: Headers | IncomingMessage["headers"]): boolean {
+  const expected = process.env.SUSHI_GATEWAY_TOKEN?.trim();
+  if (!expected) return false;
+  let raw: string | string[] | undefined | null;
+  if (headers instanceof Headers) raw = headers.get("x-sushi-token") || headers.get("authorization");
+  else raw = headers["x-sushi-token"] || headers.authorization;
+  const supplied = (Array.isArray(raw) ? raw[0] : raw || "").replace(/^Bearer\s+/i, "").trim();
+  return Boolean(supplied && safeEqualStrings(supplied, expected));
+}
+
 /** Account and vault operations require an admin session, not a gateway token.
  * Gateway tokens authorize protocol access on a companion VPS only. */
 export async function verifyAdminSession(headers: Headers): Promise<{ ok: boolean; username?: string; error?: string }> {

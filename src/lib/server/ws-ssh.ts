@@ -9,7 +9,9 @@ import {
   generateSharePasscode,
   registerSharedSession,
   getSharedSession,
+  sharedSessionLimits,
 } from "./shared-ssh";
+import { parseShareAccountIssuer, verifyShareTicket, type ShareAccountIssuer } from "./share-ticket";
 
 /**
  * `/ws/ssh` — the interactive PTY endpoint.
@@ -41,10 +43,11 @@ function clamp(value: unknown, fallback: number, min: number, max: number): numb
 
 /** The sub-object the browser sends to create or join a share. */
 interface ShareAuthPayload {
-  create?: { write?: boolean; passcode?: string | null; label?: string } | boolean;
+  create?: { write?: boolean; passcode?: string | null; label?: string; accountIssuer?: unknown } | boolean;
   join?: string;
   passcode?: string;
   name?: string;
+  ticket?: string;
 }
 
 function asSharePayload(value: unknown): ShareAuthPayload | null {
@@ -80,9 +83,29 @@ export function handleSshConnection(ws: WebSocket, req: IncomingMessage): void {
    */
   let publishedShare: SharedSshSession | null = null;
   let authenticated = false;
+  let authInProgress = false;
   let shareCredentials: ConnectionCredentials | null = null;
   let lastCols = 100;
   let lastRows = 30;
+  const priorOutput: Buffer[] = [];
+  let priorOutputBytes = 0;
+
+  // A guest joining after the Share button was pressed needs the existing screen,
+  // not just the output emitted after publishing. Keep a bounded pre-share replay.
+  const rememberOutput = (chunk: Buffer) => {
+    const cap = sharedSessionLimits().scrollbackBytes;
+    if (chunk.length >= cap) {
+      priorOutput.length = 0;
+      priorOutput.push(Buffer.from(chunk.subarray(chunk.length - cap)));
+      priorOutputBytes = cap;
+      return;
+    }
+    priorOutput.push(chunk);
+    priorOutputBytes += chunk.length;
+    while (priorOutputBytes > cap && priorOutput.length > 1) {
+      priorOutputBytes -= priorOutput.shift()!.length;
+    }
+  };
 
   const sendJson = (payload: Record<string, unknown>) => {
     if (ws.readyState !== ws.OPEN) return;
@@ -157,7 +180,8 @@ export function handleSshConnection(ws: WebSocket, req: IncomingMessage): void {
     shareId: string,
     payload: ShareAuthPayload,
     cols: number,
-    rows: number
+    rows: number,
+    tokens: { session?: string | null; gateway?: string | null }
   ) => {
     const session = getSharedSession(shareId);
     if (!session || session.status !== "live") {
@@ -171,16 +195,20 @@ export function handleSshConnection(ws: WebSocket, req: IncomingMessage): void {
       return;
     }
 
-    const accountCheck = await verifyRequestAccess(
-      withBrowserTokenHeaders(req.headers, {
-        session: reqUrl.searchParams.get("session"),
-        gateway: queryToken,
-      })
-    );
+    const ticketValid = verifyShareTicket(payload.ticket, shareId, session.accountIssuer);
+    const accountCheck = ticketValid ? { ok: true } : await verifyRequestAccess(
+      withBrowserTokenHeaders(req.headers, tokens)
+    ).catch(() => ({ ok: false }));
+    // Auth may have awaited storage while this socket closed or the share ended.
+    if (finished) return;
+    if (getSharedSession(shareId) !== session || session.status !== "live") {
+      sendJson({ type: "error", code: "SHARE_NOT_FOUND", message: "This shared session has ended." });
+      closeSocket(1008, "Share not found");
+      return;
+    }
 
-    // A signed-in Sushi account always gets in; otherwise the 6-digit code does.
-    // (A passcode-only share still accepts the account, so the host is never locked
-    // out of their own shell by a code they misplaced.)
+    // A scoped account ticket (or a valid local account/gateway token) can join
+    // without a code. Guests never receive a full gateway or frontend session key.
     const viaAccount = accountCheck.ok;
     if (!viaAccount) {
       const passcodeCheck = session.verifyPasscode(payload.passcode);
@@ -205,7 +233,9 @@ export function handleSshConnection(ws: WebSocket, req: IncomingMessage): void {
 
     shared = session;
     const entry = session.attach(ws, {
-      role: viaAccount ? "owner" : "guest",
+      // Only the socket that published the shell owns it. A signed-in rejoiner
+      // is still a participant, not the publisher and not a share administrator.
+      role: "guest",
       name: payload.name,
       canWrite: session.write,
       cols,
@@ -234,9 +264,16 @@ export function handleSshConnection(ws: WebSocket, req: IncomingMessage): void {
     passcode?: unknown;
     label?: string;
     name?: string;
+    accountIssuer?: unknown;
   }) => {
     if (shared || !sshSession || !shellStream) {
-      sendJson({ type: "error", message: "Connect the terminal before sharing it." });
+      sendJson({ type: "share", action: "error", message: "Connect the terminal before sharing it." });
+      return;
+    }
+    const accountIssuer: ShareAccountIssuer | null = options.accountIssuer === undefined
+      ? null : parseShareAccountIssuer(options.accountIssuer);
+    if (options.accountIssuer !== undefined && !accountIssuer) {
+      sendJson({ type: "share", action: "error", message: "The account verifier or gateway address is invalid." });
       return;
     }
 
@@ -251,13 +288,17 @@ export function handleSshConnection(ws: WebSocket, req: IncomingMessage): void {
       rows: lastRows,
       write: options.write !== false,
       passcode: normalizePasscodeRequest(options.passcode),
+      accountIssuer,
     });
 
     const registered = registerSharedSession(session);
     if (!registered.ok) {
-      sendJson({ type: "error", message: registered.error });
+      sendJson({ type: "share", action: "error", message: registered.error });
       return;
     }
+    // Seed the replay before attaching the publisher, so its screen is not echoed
+    // twice while a new guest can see output from before sharing was enabled.
+    for (const chunk of priorOutput) session.handleOutput(chunk);
 
     shared = session;
     publishedShare = session;
@@ -335,6 +376,8 @@ export function handleSshConnection(ws: WebSocket, req: IncomingMessage): void {
     }
 
     if (msg.type === "auth" && !authenticated) {
+      if (authInProgress || finished) return;
+      authInProgress = true;
       // Joining a shared shell is the one request that carries no SSH credentials.
       const share = asSharePayload(msg.share);
       const joinId = typeof share?.join === "string" ? share.join.trim() : "";
@@ -343,7 +386,11 @@ export function handleSshConnection(ws: WebSocket, req: IncomingMessage): void {
           joinId,
           share ?? {},
           clamp(msg.cols, 100, MIN_COLS, MAX_COLS),
-          clamp(msg.rows, 30, MIN_ROWS, MAX_ROWS)
+          clamp(msg.rows, 30, MIN_ROWS, MAX_ROWS),
+          {
+            session: (typeof msg.sessionToken === "string" ? msg.sessionToken.trim() : "") || reqUrl.searchParams.get("session"),
+            gateway: (typeof msg.gatewayToken === "string" ? msg.gatewayToken.trim() : "") || queryToken,
+          }
         );
         return;
       }
@@ -356,7 +403,8 @@ export function handleSshConnection(ws: WebSocket, req: IncomingMessage): void {
           gateway:
             (typeof msg.gatewayToken === "string" ? msg.gatewayToken.trim() : "") || queryToken,
         })
-      );
+      ).catch(() => ({ ok: false, error: "Could not verify gateway or account access." }));
+      if (finished) return;
       if (!tokenCheck.ok) {
         sendJson({ type: "error", message: tokenCheck.error });
         closeSocket(1008, "Unauthorized");
@@ -385,7 +433,14 @@ export function handleSshConnection(ws: WebSocket, req: IncomingMessage): void {
             : null;
 
       try {
-        sshSession = await connectSsh(creds, 15000);
+        const connected = await connectSsh(creds, 15000);
+        // If the browser disappeared while SSH was connecting, the earlier
+        // detach had nothing to close. Do not leave this late connection running.
+        if (finished || ws.readyState !== ws.OPEN) {
+          connected.client.end();
+          return;
+        }
+        sshSession = connected;
 
         sshSession.client.on("error", (err: Error) => {
           sendJson({ type: "error", message: err.message });
@@ -415,6 +470,11 @@ export function handleSshConnection(ws: WebSocket, req: IncomingMessage): void {
         sshSession.client.shell(
           { term: "xterm-256color", cols: lastCols, rows: lastRows },
           (err, stream) => {
+            if (finished || ws.readyState !== ws.OPEN) {
+              stream?.close();
+              cleanup();
+              return;
+            }
             if (err) {
               sendJson({
                 type: "error",
@@ -433,6 +493,7 @@ export function handleSshConnection(ws: WebSocket, req: IncomingMessage): void {
             });
 
             stream.on("data", (chunk: Buffer) => {
+              rememberOutput(chunk);
               const target = outputTarget();
               if (target) {
                 target.handleOutput(chunk);
@@ -442,6 +503,7 @@ export function handleSshConnection(ws: WebSocket, req: IncomingMessage): void {
             });
 
             stream.stderr.on("data", (chunk: Buffer) => {
+              rememberOutput(chunk);
               const target = outputTarget();
               if (target) {
                 target.handleOutput(chunk);
@@ -473,6 +535,7 @@ export function handleSshConnection(ws: WebSocket, req: IncomingMessage): void {
                 passcode: mintedPasscode,
                 label: createOptions.label,
                 name: asSharePayload(msg.share)?.name,
+                accountIssuer: createOptions.accountIssuer,
               });
             }
           }
@@ -534,11 +597,17 @@ export function handleSshConnection(ws: WebSocket, req: IncomingMessage): void {
           passcode: mintedPasscode,
           label: typeof msg.label === "string" ? msg.label : undefined,
           name: typeof msg.name === "string" ? msg.name : undefined,
+          accountIssuer: msg.accountIssuer,
         });
-      } else if (msg.action === "stop") {
-        stopSharing();
-      } else if (msg.action === "rotate") {
-        rotatePasscode();
+      } else if (msg.action === "stop" || msg.action === "rotate") {
+        // A passcode guest can send arbitrary WebSocket frames. Only the socket
+        // that published this shell may change or revoke the share.
+        if (!shared || shared !== publishedShare || !participantId) {
+          sendJson({ type: "share", action: "error", message: "Only the host can manage this share." });
+          return;
+        }
+        if (msg.action === "stop") stopSharing();
+        else rotatePasscode();
       }
     }
   });

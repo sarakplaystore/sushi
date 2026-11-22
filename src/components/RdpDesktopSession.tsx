@@ -248,14 +248,13 @@ export function RdpDesktopSession({
     setProbing(true);
     try {
       const httpBase = resolveGatewayHttpBase(gatewaySettings.gatewayUrl);
-      const res = await fetch(`${httpBase}/api/rdp/probe`, {
-        method: "POST",
-        headers: getAuthHeaders(gatewaySettings),
-        body: JSON.stringify({
-          host: profile.host,
-          port: profile.port || 3389,
-        }),
-      });
+      const init = {
+        method: "POST", headers: getAuthHeaders(gatewaySettings),
+        body: JSON.stringify({ host: profile.host, port: profile.port || 3389 }),
+      };
+      let res = await fetch(`${httpBase}/api/rdp/probe`, init);
+      // Older slim gateways did not expose the probe; the frontend still can.
+      if (httpBase && res.status === 404) res = await fetch("/api/rdp/probe", init);
       const data = (await res.json()) as RdpProbeResult;
       setProbeResult(data);
     } catch (err) {
@@ -519,15 +518,20 @@ export function RdpDesktopSession({
         if (gatewaySettings.gatewayToken) qp.set("token", gatewaySettings.gatewayToken);
         proxyAddress = `${wsBase}?${qp.toString()}`;
       } else {
+        // The slim gateway has WebSockets, not the serverless HTTP RDP routes.
+        // When native CleanPath is unavailable, use the frontend's own endpoints.
         proxyAddress = buildServerlessRdpProxyUrl({
-          httpBase: resolveGatewayHttpBase(gatewaySettings.gatewayUrl),
-          gatewaySettings,
+          httpBase: "",
+          gatewaySettings: gatewaySettings.gatewayUrl.trim()
+            ? { ...gatewaySettings, gatewayToken: "" }
+            : gatewaySettings,
           ignoreCert: profile.ignoreCert !== false,
         });
       }
 
-      const httpBase = resolveGatewayHttpBase(gatewaySettings.gatewayUrl);
-      const wasmUrl = `${httpBase}/api/rdp/wasm`;
+      // WASM is a frontend asset. A GATEWAY_ONLY deployment intentionally has no
+      // Next.js build or /api/rdp/wasm, even when the RDP socket is on the gateway.
+      const wasmUrl = "/api/rdp/wasm";
 
       try {
         const handle = await connectIronRdpSession({

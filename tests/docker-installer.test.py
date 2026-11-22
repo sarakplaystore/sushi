@@ -19,6 +19,20 @@ ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = ROOT / "scripts/install-vps.sh"
 
 
+class ReadmeInstallTest(unittest.TestCase):
+    def test_one_click_command_is_prominent_and_links_to_details(self):
+        readme = (ROOT / "README.md").read_text()
+        heading = "## One-click Docker install"
+        command = "curl -fsSL https://raw.githubusercontent.com/sarakplaystore/sushi/main/scripts/install-vps.sh | bash"
+        self.assertLess(readme.index(heading), readme.index("## Features"))
+        top_section = readme.split(heading, 1)[1].split("\n## ", 1)[0]
+        self.assertIn(command, top_section)
+        self.assertIn("3000", top_section)
+        self.assertIn("#quick-start", top_section)
+        self.assertIn("HTTPS", top_section)
+        self.assertIn("#one-click-docker-install", readme.split("## Quick Start", 1)[1])
+
+
 class InstallerTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

@@ -126,6 +126,14 @@ async function testGatewayTokenUi() {
     await render(empty);
     assert.equal(tokenInput().value, "");
     assert.equal(tokenInput().type, "password");
+    assert.equal(generator().parentElement?.firstElementChild, generator(), "key controls are the first content in the dialog");
+    assert.equal(button("Generate and show token").closest("section"), generator(), "the button is in the first visible section");
+    assert.equal(button("Generate and show token").closest("details"), null, "the button is not hidden in a collapsed guide");
+    assert(button("Generate and show token").compareDocumentPosition(confirmation()) & dom.window.Node.DOCUMENT_POSITION_FOLLOWING,
+      "the button is discoverable before the confirmation instructions");
+    assert(generator().querySelector('[role="group"][aria-label="Where did you deploy the gateway?"]'));
+    assert.match(generator().textContent || "", /To enable generation, confirm below/i);
+    assert.equal(generator().querySelector<HTMLDivElement>("#gateway-token-display")?.hidden, true, "no empty key is revealed");
     assert.equal(button("Generate and show token").disabled, true, "requires an explicit absence confirmation");
     assert.equal(button("Copy token").disabled, true);
     assert.match(generator().textContent || "", /sealed or hidden variable still counts as existing/i);
@@ -140,7 +148,11 @@ async function testGatewayTokenUi() {
     assert.equal(button("Generate and show token").disabled, false);
     Object.defineProperty(dom.window, "isSecureContext", { configurable: true, value: false });
     await click("Generate and show token");
-    assert.match(generator().querySelector('[role="alert"]')?.textContent || "", /Open Sushi over HTTPS/i);
+    const generationError = generator().querySelector<HTMLElement>('[role="alert"]');
+    assert(generationError);
+    assert.match(generationError.textContent || "", /Open Sushi over HTTPS/i);
+    assert(generationError.compareDocumentPosition(confirmation()) & dom.window.Node.DOCUMENT_POSITION_FOLLOWING,
+      "a failed generation explains the problem near the action");
     assert.equal(tokenInput().value, "", "insecure contexts fail without generating a value");
     assert.equal(randomCalls, 0);
     Object.defineProperty(dom.window, "isSecureContext", { configurable: true, value: true });
@@ -170,7 +182,16 @@ async function testGatewayTokenUi() {
     assert.match(generator().textContent || "", /add\s+SUSHI_GATEWAY_TOKEN/i);
     assert.match(generator().textContent || "", /do not overwrite it/i);
     assert.match(generator().textContent || "", /closing this panel discards/i);
-    assert(!container.textContent?.includes(first), "the token is only in the input, not duplicated in page text");
+    const revealedKey = generator().querySelector<HTMLDivElement>("#gateway-token-display");
+    assert(revealedKey);
+    assert.equal(revealedKey.hidden, false, "generation visibly reveals the key beside the button");
+    assert.equal(revealedKey.querySelector("code")?.textContent, first, "the complete generated key is shown");
+    assert.match(revealedKey.querySelector("code")?.className || "", /break-all/, "the key wraps on narrow screens");
+    const generationStatus = generator().querySelector<HTMLElement>('[role="status"]');
+    assert(generationStatus);
+    assert(!generationStatus.textContent?.includes(first), "the live status does not announce the key");
+    assert(generationStatus.compareDocumentPosition(confirmation()) & dom.window.Node.DOCUMENT_POSITION_FOLLOWING,
+      "generation and copy feedback stay near the key controls");
     assert.equal(dom.window.localStorage.getItem("sushi_gateway_settings_v1"), null, "generation alone does not save");
     assert.equal(dom.window.localStorage.getItem("sushi_encrypted_vault_v1"), "vault-must-not-change");
     assert.equal(dom.window.localStorage.getItem("sushi.auth.sessionToken.v1"), "admin-session-must-not-leak");
@@ -181,12 +202,21 @@ async function testGatewayTokenUi() {
     assert.equal(clipboard.length, 0, "generation does not silently copy a secret");
     const visibilityButton = container.querySelector<HTMLButtonElement>('button[aria-controls="gateway-token"]');
     assert(visibilityButton);
-    await act(async () => { visibilityButton.click(); await flush(); });
+    assert.equal(button("Hide gateway key").getAttribute("aria-expanded"), "true");
+    await click("Hide gateway key");
     assert.equal(tokenInput().type, "password", "the generated value can be hidden again");
     assert.equal(tokenInput().value, first);
-    assert.match(generator().querySelector('[role="status"]')?.textContent || "", /hidden in the field/);
-    await act(async () => { visibilityButton.click(); await flush(); });
+    assert.equal(revealedKey.hidden, true);
+    assert(!container.textContent?.includes(first), "a hidden key is removed from visible text");
+    assert.match(generator().querySelector('[role="status"]')?.textContent || "", /hidden/);
+    assert.equal(button("Show gateway key").getAttribute("aria-expanded"), "false");
+    await click("Show gateway key");
     assert.equal(tokenInput().type, "text");
+    assert.equal(revealedKey.querySelector("code")?.textContent, first);
+    await act(async () => { visibilityButton.click(); await flush(); });
+    assert.equal(revealedKey.hidden, true, "the original eye control also hides the prominent display");
+    await act(async () => { visibilityButton.click(); await flush(); });
+    assert.equal(revealedKey.querySelector("code")?.textContent, first);
 
     await click("Copy token");
     assert.deepEqual(clipboard, [first], "only the explicit copy action copies the generated token");
@@ -282,6 +312,12 @@ async function testGatewayTokenUi() {
     assert.equal(networkCalls, 0);
 
     await render({ gatewayUrl: "", gatewayToken: "existing-saved-token" });
+    assert.equal(revealedKey.hidden, true, "a saved token is masked when the panel opens");
+    assert(!container.textContent?.includes("existing-saved-token"));
+    await click("Show gateway key");
+    assert.equal(revealedKey.querySelector("code")?.textContent, "existing-saved-token", "saved keys can be revealed at the top");
+    await click("Hide gateway key");
+    assert(!container.textContent?.includes("existing-saved-token"), "hiding removes the displayed saved key");
     await checkAbsence();
     assert.equal(button("Generate and show token").disabled, true, "a saved token cannot be overwritten");
     await setToken("");

@@ -56,7 +56,7 @@ const GATEWAY_ONLY_SNIPPET = `# Companion gateway + guacd on a VPS, from a Sushi
 node scripts/provision-gateway.mjs local
 docker compose -f docker-compose.gateway.yml up -d --build
 # Put an HTTPS reverse proxy in front of 127.0.0.1:3000.
-# Read the token privately from .env.gateway.local and enter it below.`;
+# Read the token privately from .env.gateway.local and enter it in Sushi above.`;
 
 const RAILWAY_TEMPLATE_SNIPPET = `# One-time setup in Railway's template composer, NOT an existing service:
 # 1. Workspace → Templates → New Template. Add "guacd" from the Docker image
@@ -93,7 +93,7 @@ node scripts/provision-gateway.mjs railway --apply
 # trusted machine; the helper reads unsealed variables locally. Avoid concurrent
 # edits: Railway variable writes are not atomic create-if-absent.
 # Copy the token privately from sushi-gateway → Variables.
-# Settings → Networking → Generate Domain → paste that URL below`;
+# Settings → Networking → Generate Domain → paste that URL in Sushi above`;
 
 const RAILWAY_DASHBOARD_SNIPPET = `# Railway without the CLI: New Project → GitHub Repo → this repository.
 # 1. sushi-gateway: Settings → Build Configuration → Dockerfile Path
@@ -105,7 +105,7 @@ const RAILWAY_DASHBOARD_SNIPPET = `# Railway without the CLI: New Project → Gi
 #    does not write to Railway. Never overwrite an existing or sealed token.
 #    ALLOWED_ORIGIN defaults to ${DEFAULT_GATEWAY_ALLOWED_ORIGIN} if absent;
 #    add it to Variables only if your Sushi frontend uses a different origin.
-# 4. Settings → Networking → Generate Domain → paste it below`;
+# 4. Settings → Networking → Generate Domain → paste it in Sushi above`;
 
 const RENDER_SNIPPET = `# Render: Dashboard → New + → Blueprint → this repository.
 # render.yaml builds Dockerfile.gateway and generates a persistent 256-bit base64
@@ -113,7 +113,7 @@ const RENDER_SNIPPET = `# Render: Dashboard → New + → Blueprint → this rep
 # blank, set a strong token explicitly. Copy it privately from Environment.
 # If ALLOWED_ORIGIN is absent, the gateway defaults to ${DEFAULT_GATEWAY_ALLOWED_ORIGIN};
 # add an Environment variable to override it for another frontend. Existing values stay.
-# Copy the public service URL and matching token into Sushi below.
+# Copy the public service URL and matching token into Sushi above.
 # A free Render instance may sleep; the panel's keep-awake pings are not a guarantee.`;
 
 /**
@@ -590,10 +590,10 @@ export function GatewaySetupModal({
         onKeyDown={handleDialogKeyDown}
         className="flex max-h-full w-full max-w-2xl flex-col overflow-hidden rounded-2xl border border-white/10 bg-[#0f131b] shadow-2xl"
       >
-        <div className="flex items-center justify-between gap-3 border-b border-white/8 px-4 py-4 sm:px-6">
-          <div className="flex items-center gap-2.5">
-            <Radio className="h-4 w-4 text-[#ff6b57]" />
-            <h2 id="gateway-modal-title" className="text-base font-semibold text-white">
+        <div className="flex items-center justify-between gap-3 border-b border-white/8 px-4 py-3 sm:px-6 sm:py-4">
+          <div className="flex min-w-0 items-center gap-2.5">
+            <Radio className="h-4 w-4 shrink-0 text-[#ff6b57]" />
+            <h2 id="gateway-modal-title" className="text-sm font-semibold text-white sm:text-base">
               PTY Gateway Settings
             </h2>
           </div>
@@ -609,16 +609,88 @@ export function GatewaySetupModal({
         </div>
 
         <div className="min-h-0 flex-1 space-y-5 overflow-y-auto px-4 py-5 sm:px-6">
-          <section aria-labelledby="gateway-guide-title" className="space-y-4 rounded-xl border border-sky-400/20 bg-sky-400/5 p-4">
-            <div className="space-y-1.5">
-              <p className="text-[10px] font-semibold uppercase tracking-wider text-sky-300">After deploying</p>
-              <h3 id="gateway-guide-title" className="text-sm font-semibold text-white">Find your PTY gateway</h3>
-              <p className="text-xs leading-relaxed text-slate-300">
-                Interactive PTY connections go through a running Sushi gateway service. Use that
-                service’s public address—not your database URL or the SSH server you want to connect to.
+          {/* Put key controls first so they are discoverable without scrolling past the deployment guide. */}
+          <section aria-labelledby="gateway-token-generator-title" className="space-y-2.5 rounded-xl border border-amber-400/20 bg-amber-400/5 p-4">
+            <div className="space-y-1">
+              <h3 id="gateway-token-generator-title" className="text-sm font-semibold text-amber-100">
+                Gateway key / token
+              </h3>
+              <p className="text-[11px] leading-relaxed text-slate-300">
+                Show a key entered in this browser, or create a new one. Sushi cannot retrieve a key from the gateway.
               </p>
             </div>
-
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onClick={generateGatewayToken}
+                disabled={!confirmedTokenAbsent || gatewayToken.length > 0 || gatewaySettings.gatewayToken.length > 0 || probing}
+                className="rounded-lg border border-amber-300/30 bg-amber-400/10 px-3 py-1.5 text-xs font-medium text-amber-100 hover:bg-amber-400/20 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-amber-200 disabled:cursor-not-allowed disabled:opacity-70"
+              >
+                Generate and show token
+              </button>
+              {gatewayToken && (
+                <button
+                  type="button"
+                  aria-controls="gateway-token-display"
+                  aria-expanded={showGatewayToken}
+                  onClick={() => setShowGatewayToken((visible) => !visible)}
+                  className="rounded-lg border border-white/12 bg-white/5 px-3 py-1.5 text-xs font-medium text-slate-200 hover:bg-white/10 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-300"
+                >
+                  {showGatewayToken ? "Hide gateway key" : "Show gateway key"}
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => void copyText("gateway-token", gatewayToken)}
+                disabled={!gatewayToken || (generatedToken && !confirmedTokenAbsent)}
+                className="inline-flex items-center gap-1 rounded-lg border border-white/12 bg-white/5 px-3 py-1.5 text-xs font-medium text-slate-200 hover:bg-white/10 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-300 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                <Copy aria-hidden="true" className="h-3.5 w-3.5" /> Copy token
+              </button>
+            </div>
+            {tokenGenerationError && <p role="alert" className="text-[11px] text-rose-300">{tokenGenerationError}</p>}
+            <div
+              id="gateway-token-display"
+              role="group"
+              aria-label="Revealed gateway key"
+              hidden={!gatewayToken || !showGatewayToken}
+              className="min-w-0 rounded-lg border border-amber-300/20 bg-[#0b0e14] p-2.5"
+            >
+              {gatewayToken && showGatewayToken && (
+                <>
+                  <p className="mb-1 text-[11px] text-amber-200">Gateway key — keep private</p>
+                  <code className="font-mono-code block select-all break-all text-xs leading-relaxed text-white">{gatewayToken}</code>
+                </>
+              )}
+            </div>
+            <p
+              role="status"
+              aria-live="polite"
+              className={copyResult?.id === "gateway-token" || generatedToken
+                ? "text-[11px] leading-relaxed text-slate-300"
+                : "sr-only"}
+            >
+              {copyResult?.id === "gateway-token"
+                ? copyResult.ok
+                  ? "Token copied to your clipboard. Paste it privately into your gateway, not chat."
+                  : "Could not copy. Show the token above, then select and copy it manually."
+                : generatedToken
+                  ? confirmedTokenAbsent
+                    ? `Token generated and ${showGatewayToken ? "shown above" : "hidden"}. It is not saved or configured on the gateway yet.`
+                    : "Confirm this gateway has no token before copying the generated value."
+                  : ""}
+            </p>
+            {!gatewayToken && !gatewaySettings.gatewayToken && !confirmedTokenAbsent && (
+              <p className="text-[11px] leading-relaxed text-amber-200">
+                To enable generation, confirm below that the gateway has no token.
+              </p>
+            )}
+            {(gatewayToken.length > 0 || gatewaySettings.gatewayToken.length > 0) && !generatedToken && (
+              <p className="text-[11px] leading-relaxed text-slate-400">
+                A token is already entered or saved here, so generation is disabled to avoid replacing it.
+              </p>
+            )}
+            <p className="text-[11px] font-medium text-slate-300">Where did you deploy the gateway?</p>
             <div role="group" aria-label="Where did you deploy the gateway?" className="flex flex-wrap gap-1.5">
               {DEPLOY_TARGETS.map((target) => (
                 <button
@@ -633,7 +705,7 @@ export function GatewaySetupModal({
                     setDeployTarget(target.id);
                   }}
                   aria-pressed={deployTarget === target.id}
-                  className={`rounded-lg border px-3 py-2 text-xs font-medium transition focus-visible:outline-2 focus-visible:outline-sky-300 ${
+                  className={`rounded-lg border px-2 py-1.5 text-xs font-medium transition focus-visible:outline-2 focus-visible:outline-sky-300 ${
                     deployTarget === target.id
                       ? "border-sky-400/50 bg-sky-400/15 text-sky-100"
                       : "border-white/10 bg-[#0b0e14] text-slate-300 hover:bg-white/5"
@@ -642,6 +714,58 @@ export function GatewaySetupModal({
                   {target.label}
                 </button>
               ))}
+            </div>
+            <label className="flex items-start gap-2 text-[11px] leading-relaxed text-slate-300">
+              <input
+                id="gateway-token-absent"
+                type="checkbox"
+                checked={confirmedTokenAbsent}
+                disabled={probing}
+                onChange={(event) => {
+                  setConfirmedTokenAbsent(event.target.checked);
+                  setTokenGenerationError(null);
+                  clearCopyFeedback();
+                }}
+                className="mt-0.5 h-3.5 w-3.5 shrink-0 accent-[#ff6b57]"
+              />
+              <span>I checked this gateway service on {activeTarget.short}: <code>SUSHI_GATEWAY_TOKEN</code> is absent (not sealed or hidden).</span>
+            </label>
+            <p className="text-[11px] leading-relaxed text-slate-300">
+              Generate one here only if the gateway has no <code>SUSHI_GATEWAY_TOKEN</code>.
+              A sealed or hidden variable still counts as existing; if present, use your saved
+              value instead. Replacing an existing token can break other clients; they would all
+              need to be updated.
+            </p>
+            <p className="text-[11px] leading-relaxed text-slate-300">
+              Sushi generates the token locally; it does not contact a provider or change the gateway.
+            </p>
+            {generatedToken && (
+              <ol className="list-decimal space-y-1 pl-4 text-[11px] leading-relaxed text-slate-300">
+                <li>
+                  Copy the token. On {activeTarget.short}, open {activeTokenLocation.where} and add
+                  <code> SUSHI_GATEWAY_TOKEN</code> with that exact value. If it already exists, stop; do not overwrite it.
+                </li>
+                <li>
+                  Deploy or restart the gateway. For a separate gateway, enter its public HTTPS address
+                  in Gateway URL below, then save these settings and open a real SSH session to verify
+                  the token and WebSocket.
+                </li>
+                <li>
+                  Until saved, closing this panel discards the new token. After saving, it is stored
+                  in this browser’s local storage. Never share it in chat.
+                </li>
+              </ol>
+            )}
+          </section>
+
+          <section aria-labelledby="gateway-guide-title" className="space-y-4 rounded-xl border border-sky-400/20 bg-sky-400/5 p-4">
+            <div className="space-y-1.5">
+              <p className="text-[10px] font-semibold uppercase tracking-wider text-sky-300">After deploying</p>
+              <h3 id="gateway-guide-title" className="text-sm font-semibold text-white">Find your PTY gateway</h3>
+              <p className="text-xs leading-relaxed text-slate-300">
+                Interactive PTY connections go through a running Sushi gateway service. Use that
+                service’s public address—not your database URL or the SSH server you want to connect to.
+              </p>
             </div>
 
             <ol className="space-y-3 text-xs leading-relaxed text-slate-300">
@@ -806,85 +930,6 @@ export function GatewaySetupModal({
               The show button reveals only the token entered in this browser; it cannot fetch a
               token from the gateway host.
             </p>
-
-            <section aria-labelledby="gateway-token-generator-title" className="space-y-2.5 rounded-lg border border-amber-400/20 bg-amber-400/5 p-3">
-              <h4 id="gateway-token-generator-title" className="text-xs font-semibold text-amber-100">
-                Need a new gateway token?
-              </h4>
-              <p className="text-[11px] leading-relaxed text-slate-300">
-                Generate one here only if the gateway has no <code>SUSHI_GATEWAY_TOKEN</code>.
-                A sealed or hidden variable still counts as existing; if present, use your saved
-                value instead. Replacing an existing token can break other clients; they would all
-                need to be updated.
-              </p>
-              <label className="flex items-start gap-2 text-[11px] leading-relaxed text-slate-300">
-                <input
-                  id="gateway-token-absent"
-                  type="checkbox"
-                  checked={confirmedTokenAbsent}
-                  disabled={probing}
-                  onChange={(event) => {
-                    setConfirmedTokenAbsent(event.target.checked);
-                    setTokenGenerationError(null);
-                    clearCopyFeedback();
-                  }}
-                  className="mt-0.5 h-3.5 w-3.5 shrink-0 accent-[#ff6b57]"
-                />
-                <span>I checked this gateway service on {activeTarget.short}: <code>SUSHI_GATEWAY_TOKEN</code> is absent (not sealed or hidden).</span>
-              </label>
-              <div className="flex flex-wrap items-center gap-2">
-                <button
-                  type="button"
-                  onClick={generateGatewayToken}
-                  disabled={!confirmedTokenAbsent || gatewayToken.length > 0 || gatewaySettings.gatewayToken.length > 0 || probing}
-                  className="rounded-lg border border-amber-300/30 bg-amber-400/10 px-3 py-1.5 text-xs font-medium text-amber-100 hover:bg-amber-400/20 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-amber-200 disabled:cursor-not-allowed disabled:opacity-50"
-                >
-                  Generate and show token
-                </button>
-                <button
-                  type="button"
-                  onClick={() => void copyText("gateway-token", gatewayToken)}
-                  disabled={!gatewayToken || (generatedToken && !confirmedTokenAbsent)}
-                  className="inline-flex items-center gap-1 rounded-lg border border-white/12 bg-white/5 px-3 py-1.5 text-xs font-medium text-slate-200 hover:bg-white/10 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-300 disabled:cursor-not-allowed disabled:opacity-50"
-                >
-                  <Copy aria-hidden="true" className="h-3.5 w-3.5" /> Copy token
-                </button>
-              </div>
-              {(gatewayToken.length > 0 || gatewaySettings.gatewayToken.length > 0) && !generatedToken && (
-                <p className="text-[11px] leading-relaxed text-slate-400">
-                  A token is already entered or saved here, so generation is disabled to avoid replacing it.
-                </p>
-              )}
-              {tokenGenerationError && <p role="alert" className="text-[11px] text-rose-300">{tokenGenerationError}</p>}
-              <p role="status" aria-live="polite" className="text-[11px] leading-relaxed text-slate-300">
-                {copyResult?.id === "gateway-token"
-                  ? copyResult.ok
-                    ? "Token copied to your clipboard. Paste it privately into your gateway, not chat."
-                    : "Could not copy. Show the token above, then select and copy it manually."
-                  : generatedToken
-                    ? confirmedTokenAbsent
-                      ? `Token generated and ${showGatewayToken ? "shown" : "hidden"} in the field above. It is not saved or configured on the gateway yet.`
-                      : "Confirm this gateway has no token before copying the generated value."
-                    : "Sushi generates the token locally; it does not contact a provider or change the gateway."}
-              </p>
-              {generatedToken && (
-                <ol className="list-decimal space-y-1 pl-4 text-[11px] leading-relaxed text-slate-300">
-                  <li>
-                    Copy the token. On {activeTarget.short}, open {activeTokenLocation.where} and add
-                    <code> SUSHI_GATEWAY_TOKEN</code> with that exact value. If it already exists, stop; do not overwrite it.
-                  </li>
-                  <li>
-                    Deploy or restart the gateway. For a separate gateway, enter its public HTTPS address
-                    in Gateway URL above, then save these settings and open a real SSH session to verify
-                    the token and WebSocket.
-                  </li>
-                  <li>
-                    Until saved, closing this panel discards the new token. After saving, it is stored
-                    in this browser’s local storage. Never share it in chat.
-                  </li>
-                </ol>
-              )}
-            </section>
 
             <p className="text-[11px] leading-relaxed text-slate-400">
               Paste the public address and matching token above, then test and save. The test checks
@@ -1159,13 +1204,13 @@ export function GatewaySetupModal({
           </details>
         </div>
 
-        <div className="flex flex-wrap items-center justify-end gap-2.5 border-t border-white/8 bg-[#0b0e14] px-4 py-3 sm:px-6 sm:py-4">
+        <div className="flex flex-wrap items-center justify-end gap-1.5 border-t border-white/8 bg-[#0b0e14] px-4 py-3 sm:gap-2.5 sm:px-6 sm:py-4">
           {saveError && <p role="alert" className="w-full text-xs leading-relaxed text-rose-300">{saveError}</p>}
           <button
             type="button"
             onClick={onClose}
             disabled={probing}
-            className="rounded-xl px-4 py-2 text-xs font-medium text-slate-400 hover:bg-white/5 hover:text-white disabled:opacity-50"
+            className="rounded-xl px-2 py-2 text-xs font-medium text-slate-400 hover:bg-white/5 hover:text-white disabled:opacity-50 sm:px-4"
           >
             Close
           </button>
@@ -1173,7 +1218,7 @@ export function GatewaySetupModal({
             type="button"
             onClick={handleSave}
             disabled={probing}
-            className="rounded-xl bg-[#ff6b57] px-4 py-2 text-xs font-semibold text-white transition hover:bg-[#ff7f6e] disabled:opacity-50"
+            className="rounded-xl bg-[#ff6b57] px-2 py-2 text-xs font-semibold text-white transition hover:bg-[#ff7f6e] disabled:opacity-50 sm:px-4"
           >
             Save Gateway Settings
           </button>

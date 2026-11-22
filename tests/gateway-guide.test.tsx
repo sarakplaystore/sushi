@@ -117,6 +117,10 @@ async function testGatewayGuide() {
     const dialog = container.querySelector<HTMLElement>('[role="dialog"][aria-labelledby="gateway-modal-title"]');
     assert(dialog);
     assert.equal(dom.window.document.activeElement, dialog, "keyboard focus moves into the dialog");
+    const keyPanel = container.querySelector<HTMLElement>('section[aria-labelledby="gateway-token-generator-title"]');
+    assert(keyPanel);
+    assert.equal(keyPanel.parentElement?.firstElementChild, keyPanel, "key generation is visible before the long setup guide");
+    assert(keyPanel.compareDocumentPosition(guide()) & dom.window.Node.DOCUMENT_POSITION_FOLLOWING);
     assert.match(guide().textContent || "", /Find your PTY gateway/);
     assert.match(guide().textContent || "", /not your\s+database URL/i);
     assert.match(guide().textContent || "", /Public Networking/);

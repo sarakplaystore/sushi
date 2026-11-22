@@ -442,6 +442,24 @@ container. It will print the URL after the health check. The choice is saved in
 curl -fsSL https://raw.githubusercontent.com/sarakplaystore/sushi/main/scripts/install-vps.sh | bash -s -- --port 8080
 ```
 
+If Docker is missing, the installer downloads Docker's official convenience
+script and runs it with administrator privileges. Review the script and Docker's
+installation documentation first if required by your security policy.
+
+Before changing project files, the installer checks that Docker's daemon and Compose
+are reachable. If a container named `sushi` is already running, it warns that a
+restart can terminate active SSH sessions and asks for confirmation. On an
+unattended rerun it stops instead; after those sessions finish, pass `--yes` to
+allow the restart. The health check requires the full Sushi WebSocket service,
+not just an arbitrary HTTP response. An existing checkout is automatically
+updated only when it is on a clean `main` branch; otherwise the installer warns
+and uses the local copy.
+
+```bash
+# Unattended upgrade (may terminate active Sushi SSH terminals)
+curl -fsSL https://raw.githubusercontent.com/sarakplaystore/sushi/main/scripts/install-vps.sh | bash -s -- --port 8080 --yes
+```
+
 Docker is the primary setup; the other deployment methods remain available:
 
 | You have | Run this | Notes |
@@ -455,7 +473,7 @@ Docker is the primary setup; the other deployment methods remain available:
 | **Vercel + native PTY** | Vercel for the UI, Railway or Render for [`Dockerfile.gateway`](Dockerfile.gateway) | See [Deploy to Vercel](#3-deploy-to-vercel--optional-companion-gateway-vps-railway-or-render) — no server to maintain |
 
 Useful installer flags: `--port 8080`, `--dir ~/sushi`, `--https your.domain` (adds Caddy with
-automatic HTTPS), `--prebuilt` (skip the build), `--node` (no Docker: Node.js), and
+automatic HTTPS), `--yes` (allow restarting an existing Sushi container), `--prebuilt` (skip the build), `--node` (no Docker: Node.js), and
 `--foreground` (Python: keep it in this terminal). The VPS installer preserves credentials and data on reruns, updating only `PORT`
 in an existing `.env`. The Compose volume is not deleted by ordinary `docker compose down`
 (do not add `-v`). Restarting or upgrading the container **ends its active SSH PTYs**;

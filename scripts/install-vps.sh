@@ -3,11 +3,15 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/sarakplaystore/sushi/main/scripts/install-vps.sh | bash
 #
+#   # The installer asks for the web UI port (default: 3000).
+#   # For unattended installs, pass a port explicitly:
+#   curl -fsSL https://raw.githubusercontent.com/sarakplaystore/sushi/main/scripts/install-vps.sh | bash -s -- --port 8080
+#
 #   # or from a checkout, with options:
 #   bash scripts/install-vps.sh --port 8080
 #   bash scripts/install-vps.sh --https sushi.example.com      # + Caddy & automatic HTTPS
 #   bash scripts/install-vps.sh --prebuilt                      # pull ghcr.io image, no build
-#   bash scripts/install-vps.sh --node                          # no Docker: Node.js + systemd
+#   bash scripts/install-vps.sh --node                          # no Docker: Node.js
 #
 # It installs Docker if missing, writes a .env with a random SUSHI_AUTH_SECRET,
 # starts Sushi + guacd, waits until /api/system/capabilities answers, and prints
@@ -20,7 +24,9 @@ set -euo pipefail
 
 REPO_URL="https://github.com/sarakplaystore/sushi.git"
 RAW_URL="https://raw.githubusercontent.com/sarakplaystore/sushi/main"
-PORT="${PORT:-3000}"
+PORT="${PORT:-}"
+PORT_EXPLICIT=0
+[ -n "$PORT" ] && PORT_EXPLICIT=1
 HTTPS_DOMAIN=""
 MODE="build"          # build | prebuilt | node
 INSTALL_DIR="${SUSHI_DIR:-$PWD/sushi}"
@@ -38,7 +44,7 @@ usage() {
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --port) PORT="$2"; shift 2 ;;
+    --port) [ $# -ge 2 ] || die "--port requires a value"; PORT="$2"; PORT_EXPLICIT=1; shift 2 ;;
     --dir) INSTALL_DIR="$2"; shift 2 ;;
     --https) HTTPS_DOMAIN="$2"; shift 2 ;;
     --prebuilt) MODE="prebuilt"; shift ;;
@@ -48,6 +54,62 @@ while [ $# -gt 0 ]; do
     *) die "Unknown option: $1 (try --help)" ;;
   esac
 done
+
+# Keep later cd/Compose/systemd paths stable for relative --dir values.
+case "$INSTALL_DIR" in /*) ;; *) INSTALL_DIR="$PWD/$INSTALL_DIR" ;; esac
+
+# Read the existing simple PORT assignment without executing the .env file.
+# Refuse unusual expressions instead of silently choosing a different port.
+saved_port() {
+  [ -f "$INSTALL_DIR/.env" ] || return 0
+  awk '
+    /^[[:space:]]*(export[[:space:]]+)?PORT[[:space:]]*=/ {
+      value = $0
+      sub(/^[^=]*=/, "", value)
+      sub(/[[:space:]]*#.*/, "", value)
+      gsub(/^[[:space:]\r]+|[[:space:]\r]+$/, "", value)
+      gsub(/^[\047\042]|[\047\042]$/, "", value)
+      port = value
+    }
+    END { if (port != "") print port }
+  ' "$INSTALL_DIR/.env"
+}
+
+valid_port() {
+  [[ "$1" =~ ^[0-9]{1,5}$ ]] && [ "$((10#$1))" -ge 1 ] && [ "$((10#$1))" -le 65535 ]
+}
+
+choose_port() {
+  local default="3000" existing="" answer="" tty_input=""
+  if [ "$PORT_EXPLICIT" -eq 0 ]; then
+    existing="$(saved_port)"
+    if [ -n "$existing" ]; then
+      valid_port "$existing" || die "Invalid PORT in $INSTALL_DIR/.env. Fix it or supply --port."
+      default="$existing"
+    fi
+    # A piped installer receives the script on stdin. Read its controlling TTY
+    # instead, but do not block CI or unattended installs with no terminal.
+    if [ -t 0 ]; then tty_input=/dev/stdin
+    elif ( : </dev/tty ) 2>/dev/null; then tty_input=/dev/tty
+    fi
+    if [ -n "$tty_input" ]; then
+      while :; do
+        printf 'Web UI port [%s]: ' "$default" >&2
+        IFS= read -r answer <"$tty_input" || die "Port selection cancelled."
+        PORT="${answer:-$default}"
+        valid_port "$PORT" && break
+        warn "Enter a port from 1 to 65535."
+      done
+    else
+      PORT="$default"
+      echo "No interactive terminal; using web UI port $PORT (override with --port)."
+    fi
+  fi
+  valid_port "$PORT" || die "Invalid web UI port '$PORT' (choose 1–65535)."
+  PORT="$((10#$PORT))"
+}
+
+choose_port
 
 bold "Sushi installer — self-hosted web SSH · SFTP · RDP workspace"
 echo "  install dir: $INSTALL_DIR"
@@ -123,17 +185,19 @@ ensure_source() {
   if [ -f "$INSTALL_DIR/package.json" ]; then
     ok "Using existing checkout at $INSTALL_DIR"
     if [ -d "$INSTALL_DIR/.git" ]; then
-      ( cd "$INSTALL_DIR" && git pull --ff-only >/dev/null 2>&1 ) && ok "Updated to the latest main" || warn "Could not git pull — continuing with the local copy"
+      ( cd "$INSTALL_DIR" && git pull --ff-only >/dev/null 2>&1 ) && ok "Updated the existing checkout" || warn "Could not git pull — continuing with the local copy"
     fi
     return 0
   fi
   bold "Downloading Sushi into $INSTALL_DIR…"
   mkdir -p "$(dirname "$INSTALL_DIR")"
-  if git clone --depth 1 "$REPO_URL" "$INSTALL_DIR"; then ok "Source downloaded"; else die "git clone failed"; fi
+  if git clone --depth 1 --branch main "$REPO_URL" "$INSTALL_DIR"; then ok "Source downloaded"; else die "git clone failed"; fi
 }
 
 write_env() {
   cd "$INSTALL_DIR"
+  [ ! -L .env ] || die "Refusing to replace a symlinked .env; use a regular file instead."
+  umask 077
   if [ ! -f .env ]; then
     [ -f .env.example ] && cp .env.example .env
     {
@@ -142,10 +206,24 @@ write_env() {
       echo "SUSHI_AUTH_SECRET=$(openssl rand -hex 32 2>/dev/null || head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
       echo "PORT=$PORT"
     } >> .env
+    chmod 600 .env
     ok "Wrote .env with a random SUSHI_AUTH_SECRET"
   else
-    ok "Keeping your existing .env"
+    ok "Keeping your existing .env and credentials"
   fi
+  # Update only PORT, leaving credentials and the data volume untouched. Remove
+  # duplicate assignments so Compose uses the same port on later restarts.
+  local tmp
+  tmp="$(mktemp .env.port.XXXXXX)"
+  if ! awk '
+    !/^[[:space:]]*(export[[:space:]]+)?PORT[[:space:]]*=/ { print }
+    END { print "PORT=" port }
+  ' port="$PORT" .env > "$tmp"; then
+    rm -f "$tmp"
+    die "Could not update the port in .env."
+  fi
+  chmod 600 "$tmp"
+  mv "$tmp" .env
 }
 
 wait_for_http() {
@@ -179,8 +257,16 @@ setup_https() {
 }
 
 install_systemd_service() {
+  if ! have systemctl || ! systemctl show --property=Version >/dev/null 2>&1; then
+    warn "systemd is unavailable; Docker's restart policy will start the containers when Docker starts."
+    return 0
+  fi
   bold "Installing a systemd service (start on boot, restart on crash)…"
-  local user="${SUDO_USER:-$(id -un)}"
+  local compose_command compose_file=""
+  if docker compose version >/dev/null 2>&1; then compose_command="$(command -v docker) compose"
+  else compose_command="$(command -v docker-compose)"
+  fi
+  [ "$MODE" = "prebuilt" ] && [ -f docker-compose.prebuilt.yml ] && compose_file="-f docker-compose.prebuilt.yml"
   $SUDO tee /etc/systemd/system/sushi.service >/dev/null <<UNIT
 [Unit]
 Description=Sushi (SSH/SFTP/RDP web workspace)
@@ -191,9 +277,8 @@ Requires=docker.service
 Type=oneshot
 RemainAfterExit=yes
 WorkingDirectory=$INSTALL_DIR
-ExecStart=$(command -v docker) compose up -d
-ExecStop=$(command -v docker) compose down
-User=$user
+ExecStart=$compose_command $compose_file up -d
+ExecStop=$compose_command $compose_file down
 TimeoutStartSec=0
 
 [Install]
@@ -202,6 +287,19 @@ UNIT
   $SUDO systemctl daemon-reload
   $SUDO systemctl enable sushi.service >/dev/null 2>&1 || true
   ok "systemd service installed (systemctl status sushi)"
+}
+
+run_compose() {
+  if docker compose version >/dev/null 2>&1; then
+    if [ -n "$SUDO" ]; then $SUDO -E env PORT="$PORT" docker compose "$@"
+    else env PORT="$PORT" docker compose "$@"
+    fi
+  elif have docker-compose; then
+    if [ -n "$SUDO" ]; then $SUDO -E env PORT="$PORT" docker-compose "$@"
+    else env PORT="$PORT" docker-compose "$@"
+    fi
+  else die "Docker Compose is missing (install docker-compose-plugin)."
+  fi
 }
 
 # ------------------------------------------------------------------- install ---
@@ -213,16 +311,16 @@ case "$MODE" in
     if [ "$MODE" = "prebuilt" ]; then
       bold "Pulling the prebuilt image and starting Sushi + guacd…"
       if [ -f docker-compose.prebuilt.yml ]; then
-        $SUDO -E PORT="$PORT" docker compose -f docker-compose.prebuilt.yml up -d || die "docker compose failed"
+        run_compose -f docker-compose.prebuilt.yml up -d || die "docker compose failed"
       else
         warn "docker-compose.prebuilt.yml missing — falling back to a local build"
-        $SUDO -E PORT="$PORT" docker compose up -d --build || die "docker compose failed"
+        run_compose up -d --build || die "docker compose failed"
       fi
     else
       bold "Building and starting Sushi + Apache Guacamole (first build takes a few minutes)…"
-      $SUDO -E PORT="$PORT" docker compose up -d --build || die "docker compose failed"
+      run_compose up -d --build || die "docker compose failed"
     fi
-    wait_for_http || true
+    wait_for_http || die "Sushi did not become healthy. Check the Docker Compose logs before retrying."
     install_systemd_service
     setup_https
     ;;
@@ -252,14 +350,16 @@ echo
 printf '\033[1;32m  Sushi is up!  %s\033[0m\n' "$URL"
 echo "  Local check:  http://${SHOWN_HOST}:${PORT}"
 echo "  Directory:    $INSTALL_DIR"
-echo "  Data:         docker volume 'sushi-data' (or $INSTALL_DIR/data) — back it up: auth.json + vault.enc.json"
+echo "  Data:         Docker Compose volume 'sushi-data' (project-prefixed; or $INSTALL_DIR/data in Node mode) — back it up: auth.json + vault.enc.json"
 echo
 if [ "$MODE" = "node" ]; then
   echo "  Stop:   kill \$(cat $INSTALL_DIR/sushi.pid)"
   echo "  Logs:   tail -f $INSTALL_DIR/sushi.log"
 else
-  echo "  Stop:   cd $INSTALL_DIR && docker compose down"
-  echo "  Logs:   cd $INSTALL_DIR && docker compose logs -f sushi"
+  COMPOSE_FILE=""
+  [ "$MODE" = "prebuilt" ] && [ -f "$INSTALL_DIR/docker-compose.prebuilt.yml" ] && COMPOSE_FILE="-f docker-compose.prebuilt.yml "
+  echo "  Stop:   cd $INSTALL_DIR && docker compose ${COMPOSE_FILE}down"
+  echo "  Logs:   cd $INSTALL_DIR && docker compose ${COMPOSE_FILE}logs -f sushi"
 fi
 echo
 if [ -z "$HTTPS_DOMAIN" ]; then

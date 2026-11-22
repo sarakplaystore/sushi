@@ -58,7 +58,7 @@ assert.ok(sh.startsWith("#!/usr/bin/env bash"), "bash shebang");
 assert.match(sh, /^set -euo pipefail$/m, "strict mode");
 assert.match(sh, /get\.docker\.com/, "installs Docker when missing");
 assert.match(sh, /SUSHI_AUTH_SECRET=\$\(openssl rand -hex 32/, "generates a random auth secret");
-assert.match(sh, /docker compose up -d --build/, "builds and starts the stack");
+assert.match(sh, /run_compose up -d --build/, "builds and starts the stack");
 assert.match(sh, /docker-compose\.prebuilt\.yml/, "supports the prebuilt image path");
 assert.match(sh, /systemctl enable sushi\.service/, "installs a systemd unit so it survives reboot");
 assert.match(sh, /reverse_proxy 127\.0\.0\.1/, "can put Caddy HTTPS in front");
@@ -102,6 +102,7 @@ assert.equal(String(buildStep?.with?.push), "true", "pushes the image");
 const dockerfile = read("Dockerfile");
 assert.match(dockerfile, /^FROM node:22-alpine AS deps/m, "Node 22 base");
 assert.match(dockerfile, /USER sushi/, "runs as a non-root user");
+assert.match(dockerfile, /COPY --from=builder[^\n]*\/app\/public \.\/public/, "ships public assets");
 assert.match(dockerfile, /HEALTHCHECK[\s\S]*api\/system\/capabilities/, "image healthcheck");
 assert.match(dockerfile, /ENV DATA_DIR=\/app\/data/, "data dir is fixed for the volume mount");
 

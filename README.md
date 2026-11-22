@@ -649,15 +649,16 @@ and the [Firestore migration instructions](#migrate-an-existing-disk-or-redis-st
    change the shared vault.
 
    **Connect an already-deployed gateway:** In Sushi, open **Settings → Gateway** and choose
-   Railway, Render, or VPS under **Find your PTY gateway**. The guide shows where to find the
-   public service URL and matching token, and lets you copy this Sushi page's exact origin for
+   Railway, Render, or VPS under **Gateway key / token** at the top. The guide shows where to
+   find the public service URL and matching token, and lets you copy this Sushi page's exact origin for
    the gateway's `ALLOWED_ORIGIN`. Paste the base `https://` URL and token into the gateway fields;
    do not append `/ws/ssh` or use a private/`guacd` address. Click **Test Gateway Endpoint**,
    save, and open an SSH session. The test checks public HTTP capabilities only, without sending
    credentials—it does not validate the token or prove that a WebSocket session works. Only use a
    trusted gateway; Sushi saves the token in this browser's local storage. The show button reveals
-   only the token entered here; it cannot retrieve a token from the gateway host. When the gateway
-   token is absent, the panel's **Generate and show token** button uses browser cryptographic randomness
+   the full, wrapping token at the top of the panel, and hiding or closing the panel masks it again.
+   It reveals only the token entered here; it cannot retrieve a token from the gateway host. When
+   the gateway token is absent, the panel's **Generate and show token** button uses browser cryptographic randomness
    and leaves the value in the form; it neither contacts the provider nor saves or copies it until you
    choose to do so. Add the exact same value to the gateway and deploy its changes. Generation is
    disabled while a token is entered or saved here. If a token is sealed or hidden, use a previously

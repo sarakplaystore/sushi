@@ -10,7 +10,7 @@
 > Full terms: [`DISCLAIMER.md`](DISCLAIMER.md) · Data handling: [`PRIVACY.md`](PRIVACY.md) ·
 > Reporting a vulnerability: [`SECURITY.md`](SECURITY.md).
 
-**Sushi** is a self-hosted and Vercel-ready web workspace for **SSH**, **SFTP**, and **RDP** remote infrastructure management.
+**Sushi** is a self-hosted web workspace (with optional Vercel deployment) for **SSH**, **SFTP**, and **RDP** remote infrastructure management.
 
 It is designed around a **Hybrid VPS + Serverless Architecture**:
 - **Self-Hosted on a VPS (Docker Compose or Node.js)**: Runs a unified HTTP + WebSocket server (`server.ts`) paired with Apache Guacamole's `guacd` daemon for full interactive `xterm.js` PTY SSH terminals, graphical SFTP file management + remote code editing, and live 60fps HTML5 Remote Desktop (RDP) sessions.
@@ -424,8 +424,25 @@ The database is parsed with SQLite compiled to WebAssembly (`sql.js`) and decryp
 
 ## Quick Start
 
-**Pick the one-liner for your platform. Each installs, configures, builds and starts Sushi
-(Web UI + SSH + SFTP + guacd for RDP) — no manual config, no cloning by hand.**
+**Recommended: install Sushi and its WebSocket gateway together with Docker Compose**
+(Web UI + SSH + SFTP + guacd for RDP). On a Linux server, run:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/sarakplaystore/sushi/main/scripts/install-vps.sh | bash
+```
+
+The installer asks for the **web UI port**, defaulting to `3000`; choose an unused
+port from 1–65535. The app listens on that host port and uses port 3000 inside the
+container. It will print the URL after the health check. The choice is saved in
+`.env` and offered again when you rerun the installer. Explicit `--port` or the
+`PORT` environment variable bypasses the prompt; with no terminal the saved port
+(or 3000 for a new install) is used. For unattended installs:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/sarakplaystore/sushi/main/scripts/install-vps.sh | bash -s -- --port 8080
+```
+
+Docker is the primary setup; the other deployment methods remain available:
 
 | You have | Run this | Notes |
 | --- | --- | --- |
@@ -438,14 +455,14 @@ The database is parsed with SQLite compiled to WebAssembly (`sql.js`) and decryp
 | **Vercel + native PTY** | Vercel for the UI, Railway or Render for [`Dockerfile.gateway`](Dockerfile.gateway) | See [Deploy to Vercel](#3-deploy-to-vercel--optional-companion-gateway-vps-railway-or-render) — no server to maintain |
 
 Useful installer flags: `--port 8080`, `--dir ~/sushi`, `--https your.domain` (adds Caddy with
-automatic HTTPS), `--prebuilt` (skip the build), `--node` (no Docker: Node.js + systemd), and
-`--foreground` (Python: keep it in this terminal). Every path is safe to re-run: your `.env`,
-`data/` and the `sushi-data` volume are never deleted, so re-running **upgrades** the code.
+automatic HTTPS), `--prebuilt` (skip the build), `--node` (no Docker: Node.js), and
+`--foreground` (Python: keep it in this terminal). The VPS installer preserves credentials and data on reruns, updating only `PORT`
+in an existing `.env`. The Compose volume is not deleted by ordinary `docker compose down`
+(do not add `-v`). Restarting or upgrading the container **ends its active SSH PTYs**;
+let important interactive commands finish first.
 
-> **Docker image:** published to GitHub Container Registry by
-> [`.github/workflows/docker-publish.yml`](.github/workflows/docker-publish.yml) on every push to
-> `main` and on `v*` tags (linux/amd64 + linux/arm64). If the image is not published yet, use the
-> `--build` / build-from-source paths above — nothing else changes.
+> **Prebuilt image:** the prebuilt options require the GHCR image to be available for your
+> architecture. If it is unavailable, use the recommended source-building installer above.
 
 ### 0. One-click deploys
 
@@ -460,7 +477,7 @@ automatic HTTPS), `--prebuilt` (skip the build), `--node` (no Docker: Node.js + 
 then adds missing gateway variables (see §3 for the CLI and dashboard routes).
 
 ```bash
-# Docker, one line, everything included (Sushi + guacd)
+# Docker image alone (add guacd separately for live RDP)
 docker run -d --name sushi --restart unless-stopped -p 3000:3000 \
   -v sushi-data:/app/data ghcr.io/sarakplaystore/sushi:latest
 ```
@@ -488,7 +505,7 @@ Or run the one-step installer (any Linux distro, adds `--https your.domain` for 
 ```bash
 bash scripts/install-vps.sh                 # build locally
 bash scripts/install-vps.sh --prebuilt      # pull ghcr.io image instead
-bash scripts/install-vps.sh --node          # no Docker: Node.js + systemd unit
+bash scripts/install-vps.sh --node          # no Docker: Node.js
 ```
 
 Keep the `sushi-data` volume (or `DATA_DIR` when running Node directly) persistent
@@ -498,7 +515,7 @@ disables shared vault sync. Firestore or Redis REST can optionally replace disk
 for the account and vault; switching stores does not automatically copy data.
 
 `docker-compose.yml` launches both:
-- `sushi` on port `3000` (Web UI + API + `/ws/ssh` + `/ws/rdp`)
+- `sushi` on the selected host port (default `3000`; Web UI + API + `/ws/ssh` + `/ws/rdp`)
 - `guacd` (`guacamole/guacd:1.5.5`) on an internal bridge network for live RDP rendering
 
 > **Plain `http://<vps-ip>:3000` works**, including SSH, SFTP, RDP, the encrypted vault and Termix import.
@@ -508,6 +525,30 @@ for the account and vault; switching stores does not automatically copy data.
 > test, put Sushi behind HTTPS (Caddy / Nginx + a domain): over plain HTTP your Sushi login and the
 > server passwords/keys you send travel unencrypted, and **passkeys only work on HTTPS** (or
 > `http://localhost`). Sushi shows a dismissible notice when it is opened over plain HTTP.
+
+#### Moving an existing Vercel installation to Docker
+
+Installing Docker does **not** automatically copy your Vercel account or vault. Do
+not delete the Vercel deployment, remote database or an active gateway while you
+are checking the new instance. Running PTYs cannot be transferred; restarting a
+running gateway or Docker server can terminate them.
+
+1. In the old installation, unlock the vault and use **Vault Encryption →
+   Portable Encrypted Sushi Backup → Download Portable Backup**. Keep its backup
+   passphrase, the old deployment and database until the new setup is verified.
+2. Either configure Docker to use the **same** supported Turso, Redis or Firestore
+   backend, credentials and exact storage namespace as Vercel (including any
+   environment-specific prefix), or set up a new account on Docker and use Sushi's
+   **Choose Backup to Restore**. Restoring replaces the new instance's current
+   vault rather than merging it. Switching to local disk does not migrate the remote data. Edit
+   the install directory's `.env` privately and run `docker compose up -d --build`
+   to apply changes. For Firestore service-account files, also make the file
+   available inside the container or use the supported credentials JSON setting.
+3. Set up HTTPS, sign in at the new address, unlock/import the vault, and verify
+   your connections before retiring the old deployment. Browser-local data and
+   passkeys bound to the old hostname are not automatically moved; enroll a new
+   passkey at the new HTTPS hostname. Never paste database tokens into chat or
+   commit them to Git.
 
 ### 3. Deploy to Vercel (+ Optional Companion Gateway: VPS, Railway or Render)
 

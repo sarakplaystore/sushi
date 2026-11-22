@@ -304,19 +304,17 @@ export function HostProfileModal({
     try {
       const apiBase = resolveGatewayHttpBase(gatewaySettings.gatewayUrl);
       if (protocol === "rdp") {
-        // Always prefer local /api/rdp/probe if remote gateway only exposes WS
-        const res = await fetch("/api/rdp/probe", {
-          method: "POST",
-          headers: getAuthHeaders(gatewaySettings),
-          body: JSON.stringify({
-            host: host.trim(),
-            port: Number(port || 3389),
-          }),
-        });
+        // The gateway may be the only machine that can reach a private target.
+        const init = {
+          method: "POST", headers: getAuthHeaders(gatewaySettings),
+          body: JSON.stringify({ host: host.trim(), port: Number(port || 3389) }),
+        };
+        let res = await fetch(`${apiBase}/api/rdp/probe`, init);
+        if (apiBase && res.status === 404) res = await fetch("/api/rdp/probe", init);
         const data = (await res.json()) as RdpProbeResult;
         setRdpProbeResult(data);
       } else {
-        // Test SSH/SFTP via local serverless/node endpoint (fallback to gateway if needed)
+        // Test on the attached gateway, with a fallback for older gateways.
         const draftProfile = buildProfile();
         if (!draftProfile) {
           setTesting(false);

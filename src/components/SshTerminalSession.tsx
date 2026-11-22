@@ -10,8 +10,6 @@ import {
   Trash2,
   ShieldCheck,
   Radio,
-  Minus,
-  Plus,
   X,
   Palette,
   Loader2,
@@ -37,13 +35,19 @@ import type {
 import {
   type GatewaySettings,
   buildWebSocketUrl,
+  fetchGatewayCapabilities,
   getAuthHeaders,
 } from "@/lib/client/gateway";
 import {
   type SharedSessionView,
+  fetchShareAccountIssuer,
   loadShareDisplayName,
+  shareManagementHeaders,
+  shareManagementUrl,
 } from "@/lib/client/shared-ssh";
 import { ShareSessionModal, type ShareStartOptions } from "./ShareSessionModal";
+import { DEFAULT_TERMINAL_FONT_SIZE, TerminalFontSizeControl } from "./TerminalFontSizeControl";
+import { normalizeShareGateway } from "@/lib/share-gateway";
 import {
   type ExecStdinChannel,
   canStreamExecStdin,
@@ -261,7 +265,10 @@ export function SshTerminalSession({
     null
   );
   /** Set when "Start sharing" is pressed before the PTY exists. */
-  const pendingShareRef = useRef<ShareStartOptions | null>(null);
+  const pendingShareRef = useRef<Record<string, unknown> | null>(null);
+  const ptyReadyRef = useRef(false);
+  // Changing settings elsewhere must not redirect a link away from this live PTY.
+  const gatewayForSessionRef = useRef<GatewaySettings>({ ...gatewaySettings });
   const shareActivityTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const [transportMode, setTransportMode] = useState<"ws" | "serverless">(
@@ -295,44 +302,81 @@ export function SshTerminalSession({
   }, []);
 
   const startSharing = useCallback(
-    (options: ShareStartOptions) => {
+    async (options: ShareStartOptions) => {
       setShareError(null);
-      const frame = {
-        type: "share",
-        action: "start" as const,
-        write: options.write,
-        passcode: options.access === "passcode" ? "auto" : "none",
-        name: loadShareDisplayName() || undefined,
-      };
-      if (!sendShareControl(frame)) {
-        // The shell is still connecting: publish it the moment the PTY exists.
-        pendingShareRef.current = options;
-        setShareBusy(true);
-        return;
-      }
       setShareBusy(true);
+      const gateway = gatewayForSessionRef.current;
+      try {
+        let accountIssuer: { publicKey: string; audience: string } | undefined;
+        if (gateway.gatewayUrl.trim()) {
+          const address = normalizeShareGateway(gateway.gatewayUrl);
+          if (typeof window !== "undefined" && window.location.protocol === "https:" && address.startsWith("http:")) {
+            throw new Error("An HTTPS Sushi site needs a secure HTTPS/WSS gateway for sharing.");
+          }
+          // Old gateways cannot verify frontend sessions. Never publish an
+          // account-only share there and pretend other signed-in users can join.
+          if (options.access === "account") {
+            const probe = await fetchGatewayCapabilities(gateway);
+            if (!probe.ok || !probe.caps?.shareAccountTickets) {
+              throw new Error("Update the attached gateway to enable signed-in account sharing, or choose a share code.");
+            }
+          }
+          try {
+            accountIssuer = await fetchShareAccountIssuer(gateway.gatewayUrl);
+          } catch (error) {
+            if (options.access === "account") throw error;
+            // Code-protected shares can still work if the account service is down.
+          }
+        }
+        if (gatewayForSessionRef.current !== gateway) throw new Error("The terminal reconnected. Try sharing again.");
+        const frame = {
+          type: "share", action: "start", write: options.write,
+          passcode: options.access === "passcode" ? "auto" : "none",
+          name: loadShareDisplayName() || undefined,
+          ...(accountIssuer ? { accountIssuer } : {}),
+        };
+        if (ptyReadyRef.current && sendShareControl(frame)) return;
+        if (statusRef.current === "connecting") {
+          pendingShareRef.current = frame;
+          return;
+        }
+        throw new Error("Connect the WebSocket terminal before sharing it.");
+      } catch (error) {
+        setShareBusy(false);
+        setShareError(error instanceof Error ? error.message : "Could not start sharing.");
+      }
     },
     [sendShareControl]
   );
 
   const stopSharing = useCallback(
-    (shareId?: string) => {
+    async (shareId?: string) => {
       setShareError(null);
-      // A share hosted by another tab/session has to be stopped through the API:
-      // this socket has no hold on it.
+      // A share hosted by another tab must be stopped in the actual PTY process.
       if (shareId && shareId !== sharedInfo?.shareId) {
-        void fetch(`/api/ssh/share?id=${encodeURIComponent(shareId)}`, {
-          method: "DELETE",
-          headers: getAuthHeaders(gatewaySettings),
-        }).catch(() => undefined);
-        setShareModalOpen(false);
+        setShareBusy(true);
+        try {
+          const gateway = gatewayForSessionRef.current;
+          const res = await fetch(`${shareManagementUrl(gateway)}?id=${encodeURIComponent(shareId)}`, {
+            method: "DELETE", headers: shareManagementHeaders(gateway), cache: "no-store",
+            credentials: gateway.gatewayUrl.trim() ? "omit" : "same-origin",
+          });
+          const data = await res.json().catch(() => ({})) as { error?: string };
+          if (!res.ok) throw new Error(data.error || `Could not stop the share (HTTP ${res.status}).`);
+        } catch (error) {
+          setShareError(error instanceof Error ? error.message : "Could not stop the share.");
+        } finally {
+          setShareBusy(false);
+        }
         return;
       }
       if (!sendShareControl({ type: "share", action: "stop" })) {
         setShareError("Connect the terminal before sharing it.");
+      } else {
+        setShareBusy(true);
       }
     },
-    [gatewaySettings, sendShareControl, sharedInfo?.shareId]
+    [sendShareControl, sharedInfo?.shareId]
   );
 
   const rotateSharePasscode = useCallback(() => {
@@ -352,9 +396,14 @@ export function SshTerminalSession({
   const [currentCwd, setCurrentCwd] = useState<string>(
     initialPath || profile.initialPath || "~"
   );
-  // Default terminal text size when a session opens (the −/+ buttons adjust 11–20).
-  const [fontSize, setFontSize] = useState(14);
+  // Default terminal text size when a session opens (the −/+ buttons adjust 4–40).
+  const [fontSize, setFontSize] = useState(DEFAULT_TERMINAL_FONT_SIZE);
   const [themeKey, setThemeKey] = useState<string>("obsidian");
+  // Dynamic xterm imports may finish after the user changes the toolbar.
+  const fontSizeRef = useRef(fontSize);
+  const themeKeyRef = useRef(themeKey);
+  fontSizeRef.current = fontSize;
+  themeKeyRef.current = themeKey;
   const [showSearch, setShowSearch] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [showSnippets, setShowSnippets] = useState(false);
@@ -1675,6 +1724,8 @@ export function SshTerminalSession({
 
     async function initSession() {
       if (!containerRef.current) return;
+      ptyReadyRef.current = false;
+      gatewayForSessionRef.current = { ...gatewaySettings };
       // Every session starts clean: the previous failure (and its countdown) is
       // gone before a byte of the new connection is attempted.
       connectFailureRef.current = null;
@@ -1692,10 +1743,10 @@ export function SshTerminalSession({
 
       if (disposed || !containerRef.current) return;
 
-      const activeTheme = TERMINAL_THEMES[themeKey] || TERMINAL_THEMES.obsidian;
+      const activeTheme = TERMINAL_THEMES[themeKeyRef.current] || TERMINAL_THEMES.obsidian;
       const term = new Terminal({
         cursorBlink: true,
-        fontSize,
+        fontSize: fontSizeRef.current,
         fontFamily:
           '"JetBrains Mono", "Fira Code", "SFMono-Regular", Menlo, Consolas, monospace',
         lineHeight: 1.24,
@@ -1924,6 +1975,12 @@ export function SshTerminalSession({
       term.onData(handleTermData);
 
       const switchToServerlessShell = (notice?: string) => {
+        ptyReadyRef.current = false;
+        if (pendingShareRef.current) {
+          pendingShareRef.current = null;
+          setShareBusy(false);
+          setShareError("Sharing requires a connected WebSocket PTY. Check the gateway and reconnect.");
+        }
         modeRef.current = "serverless";
         setTransportMode("serverless");
         if (notice) {
@@ -2046,6 +2103,7 @@ export function SshTerminalSession({
             if (msg.type !== "pong") gotServerMessage = true;
             if (msg.type === "ready") {
               openedReady = true;
+              ptyReadyRef.current = true;
               setStatus("connected");
               if (msg.fingerprint) setFingerprint(msg.fingerprint);
               onConnectedRef.current?.();
@@ -2054,15 +2112,7 @@ export function SshTerminalSession({
               const pendingShare = pendingShareRef.current;
               if (pendingShare) {
                 pendingShareRef.current = null;
-                ws.send(
-                  JSON.stringify({
-                    type: "share",
-                    action: "start",
-                    write: pendingShare.write,
-                    passcode: pendingShare.access === "passcode" ? "auto" : "none",
-                    name: loadShareDisplayName() || undefined,
-                  })
-                );
+                ws.send(JSON.stringify(pendingShare));
               }
               if (initialPath && initialPath !== "~") {
                 ws.send(
@@ -2086,6 +2136,9 @@ export function SshTerminalSession({
                 setSharedInfo(null);
                 setSharePasscode(null);
                 setShareBusy(false);
+              } else if (msg.action === "error") {
+                setShareBusy(false);
+                setShareError(String(msg.message || "Could not manage this share."));
               }
             } else if (msg.type === "participants") {
               setSharedInfo((prev) =>
@@ -2141,8 +2194,15 @@ export function SshTerminalSession({
         };
 
         ws.onclose = (event) => {
-          if (disposed) return;
+          if (disposed || wsRef.current !== ws) return;
+          ptyReadyRef.current = false;
+          if (pendingShareRef.current) {
+            pendingShareRef.current = null;
+            setShareBusy(false);
+            setShareError("The terminal disconnected before sharing could start.");
+          }
           if (openedReady) {
+            setShareBusy(false);
             setStatus("disconnected");
             // This socket is gone, so this tab no longer hosts that share. The
             // shell itself keeps running for whoever is still attached.
@@ -2191,8 +2251,9 @@ export function SshTerminalSession({
       const applyFit = () => {
         if (!containerRef.current || containerRef.current.clientWidth === 0) return;
         const previousCols = term.cols;
+        const previousRows = term.rows;
         fitAddon.fit();
-        if (term.cols === previousCols) return;
+        if (term.cols === previousCols && term.rows === previousRows) return;
 
         if (modeRef.current === "ws") {
           if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
@@ -2203,6 +2264,7 @@ export function SshTerminalSession({
           return;
         }
 
+        if (term.cols === previousCols) return;
         // Serverless: repaint the prompt only when it is safe to — the line is
         // untouched (no caret movement), nothing is running, and nothing else has
         // been printed since the prompt.
@@ -2283,9 +2345,16 @@ export function SshTerminalSession({
       selectionBackground: activeTheme.selectionBackground,
     };
     try {
+      const previousCols = term.cols;
+      const previousRows = term.rows;
       fitAddonRef.current?.fit();
+      const ws = wsRef.current;
+      if (modeRef.current === "ws" && ws?.readyState === WebSocket.OPEN &&
+          (term.cols !== previousCols || term.rows !== previousRows)) {
+        ws.send(JSON.stringify({ type: "resize", cols: term.cols, rows: term.rows }));
+      }
     } catch {
-      // ignore
+      // ignore hidden/unmeasured terminals
     }
   }, [fontSize, themeKey]);
 
@@ -2294,8 +2363,16 @@ export function SshTerminalSession({
     if (!isActive) return;
     const t = setTimeout(() => {
       try {
+        const term = termRef.current;
+        const previousCols = term?.cols;
+        const previousRows = term?.rows;
         fitAddonRef.current?.fit();
-        termRef.current?.focus();
+        const ws = wsRef.current;
+        if (term && modeRef.current === "ws" && ws?.readyState === WebSocket.OPEN &&
+            (term.cols !== previousCols || term.rows !== previousRows)) {
+          ws.send(JSON.stringify({ type: "resize", cols: term.cols, rows: term.rows }));
+        }
+        term?.focus();
       } catch {
         // ignore
       }
@@ -2785,27 +2862,7 @@ export function SshTerminalSession({
           </div>
 
           {/* Font size */}
-          <div className="hidden items-center rounded-lg border border-white/10 bg-white/5 md:flex">
-            <button
-              type="button"
-              onClick={() => setFontSize((s) => Math.max(11, s - 1))}
-              className="p-1.5 text-slate-300 hover:text-white"
-              title="Decrease font size"
-            >
-              <Minus className="h-3 w-3" />
-            </button>
-            <span className="font-mono-code px-1 text-[11px] text-slate-300">
-              {fontSize}
-            </span>
-            <button
-              type="button"
-              onClick={() => setFontSize((s) => Math.min(20, s + 1))}
-              className="p-1.5 text-slate-300 hover:text-white"
-              title="Increase font size"
-            >
-              <Plus className="h-3 w-3" />
-            </button>
-          </div>
+          <TerminalFontSizeControl size={fontSize} setSize={setFontSize} />
 
           {/* Clear */}
           <button
@@ -3225,7 +3282,7 @@ export function SshTerminalSession({
           onStop={stopSharing}
           onRotate={rotateSharePasscode}
           onOpenGatewayModal={onOpenGatewayModal}
-          gatewaySettings={gatewaySettings}
+          gatewaySettings={gatewayForSessionRef.current}
         />
       )}
     </div>

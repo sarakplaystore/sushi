@@ -133,10 +133,11 @@ export function getCorsHeaders(origin?: string | null): Record<string, string> {
 
   const headers: Record<string, string> = {
     "Access-Control-Allow-Origin": effectiveOrigin,
-    "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+    "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
     "Access-Control-Allow-Headers":
       "Content-Type, Authorization, X-Sushi-Token, X-Sushi-Session, X-Sushi-Admin-Cert",
     "Access-Control-Max-Age": "86400",
+    "Vary": "Origin",
   };
   if (effectiveOrigin !== "*") {
     headers["Access-Control-Allow-Credentials"] = "true";

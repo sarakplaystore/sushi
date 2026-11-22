@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import type { ClientChannel } from "ssh2";
 import type { WebSocket } from "ws";
 import type { ConnectedSshSession } from "./ssh-client";
+import type { ShareAccountIssuer } from "./share-ticket";
 
 /**
  * Team sharing for one interactive SSH PTY.
@@ -79,6 +80,7 @@ export interface SharedSessionSummary {
   /** Guests may send keystrokes (the share was started in write mode). */
   write: boolean;
   requiresPasscode: boolean;
+  accountTickets: boolean;
   scrollbackBytes: number;
   participants: SharedParticipant[];
 }
@@ -107,6 +109,8 @@ export interface SharedSessionOptions {
   write: boolean;
   /** `auto` mints a 6-digit code, a string uses it, `null` = Sushi account only. */
   passcode?: "auto" | string | null;
+  /** Pinned verifier for account joins from the frontend that published the share. */
+  accountIssuer?: ShareAccountIssuer | null;
 }
 
 /**
@@ -136,6 +140,7 @@ export class SharedSshSession {
   readonly port: number;
   readonly username: string;
   readonly label: string;
+  readonly accountIssuer: ShareAccountIssuer | null;
   readonly createdAt = Date.now();
 
   private readonly participants = new Map<string, ParticipantEntry>();
@@ -160,6 +165,7 @@ export class SharedSshSession {
     this.port = options.port;
     this.username = options.username;
     this.label = options.label?.trim() || `${options.username}@${options.host}:${options.port}`;
+    this.accountIssuer = options.accountIssuer ?? null;
     this.ssh = options.ssh;
     this.stream = options.stream;
     this.cols = clamp(options.cols, MIN_COLS, MAX_COLS);
@@ -319,9 +325,15 @@ export class SharedSshSession {
   // ---- scrollback ------------------------------------------------------------
 
   private appendScrollback(chunk: Buffer): void {
+    const cap = scrollbackCapBytes();
+    if (chunk.length >= cap) {
+      this.ring.length = 0;
+      this.ring.push(Buffer.from(chunk.subarray(chunk.length - cap)));
+      this.ringBytes = cap;
+      return;
+    }
     this.ring.push(chunk);
     this.ringBytes += chunk.length;
-    const cap = scrollbackCapBytes();
     while (this.ringBytes > cap && this.ring.length > 1) {
       const dropped = this.ring.shift();
       if (!dropped) break;
@@ -377,7 +389,14 @@ export class SharedSshSession {
       this.failedAttempts = 0;
       return null;
     }
-    const code = mode === "auto" ? generateSharePasscode() : mode;
+    let code = mode === "auto" ? generateSharePasscode() : mode;
+    if (mode === "auto" && this.passcodeHash) {
+      // Rotation must actually invalidate the previous code, even in the rare
+      // event that the random generator initially picks the same six digits.
+      while (crypto.timingSafeEqual(hashPasscode(this.shareId, code), this.passcodeHash)) {
+        code = generateSharePasscode();
+      }
+    }
     this.passcodeHash = hashPasscode(this.shareId, code);
     this.failedAttempts = 0;
     this.failedWindowStart = 0;
@@ -408,6 +427,15 @@ export class SharedSshSession {
 
   broadcastParticipants(): void {
     this.broadcast({ type: "participants", participants: this.participantsList() });
+  }
+
+  /** API rotations must update the publisher without giving a new code to guests. */
+  notifyPublisherOfRotation(code: string | null): void {
+    for (const entry of this.participants.values()) {
+      if (entry.role === "owner") {
+        this.send(entry, { type: "share", action: "rotated", passcode: code || undefined, share: this.summary() });
+      }
+    }
   }
 
   // ---- teardown --------------------------------------------------------------
@@ -483,6 +511,7 @@ export class SharedSshSession {
       status: this.status,
       write: this.write,
       requiresPasscode: this.requiresPasscode,
+      accountTickets: Boolean(this.accountIssuer),
       scrollbackBytes: this.scrollbackBytes,
       participants: this.participantsList(),
     };
@@ -572,7 +601,9 @@ export function rotateSharedPasscode(
 ): { ok: boolean; passcode?: string | null; error?: string } {
   const session = getSharedSession(shareId.trim());
   if (!session) return { ok: false, error: "No active share with that ID." };
-  return { ok: true, passcode: session.rotatePasscode(mode) };
+  const passcode = session.rotatePasscode(mode);
+  session.notifyPublisherOfRotation(passcode);
+  return { ok: true, passcode };
 }
 
 /** Used by the terminal to offer "rejoin" for a shell that is still being shared. */

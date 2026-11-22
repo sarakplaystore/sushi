@@ -3,6 +3,7 @@ import next from "next";
 import { createGatewayWebSockets } from "./src/lib/server/ws-gateway";
 import { checkGuacdAvailable, getGuacdConfig } from "./src/lib/server/guacd-bridge";
 import { getCorsHeaders } from "./src/lib/server/security";
+import { handleGatewayHttpRoute, isGatewayHttpRoute } from "./src/lib/server/gateway-http";
 import { DEFAULT_GATEWAY_ALLOWED_ORIGIN } from "./src/lib/gateway-defaults.mjs";
 
 const dev = process.env.NODE_ENV !== "production";
@@ -54,7 +55,10 @@ async function bootstrap() {
           serverlessSshExec: false,
           serverlessSftp: false,
           rdpGuacd: guacdOk,
-          rdpProbe: false,
+          rdpCleanPath: true,
+          rdpProbe: true,
+          sharedSsh: true,
+          shareAccountTickets: true,
           serverVault: false,
           requiresGatewayToken: Boolean(process.env.SUSHI_GATEWAY_TOKEN?.trim()),
           guacdHost: `${guacdCfg.host}:${guacdCfg.port}`,
@@ -68,8 +72,14 @@ async function bootstrap() {
         return;
       }
 
-      // Unknown API routes must 404 (not 200) so frontends fall back to their own
-      // serverless endpoints, e.g. "Test SSH Auth" -> local /api/ssh/test.
+      // Protocol management must run in this very process, where the PTY lives.
+      // Only a small set of authenticated, non-streaming protocol routes is exposed.
+      if (isGatewayHttpRoute(url.pathname)) {
+        await handleGatewayHttpRoute(req, res, url);
+        return;
+      }
+
+      // Other APIs remain on the frontend, and must 404 rather than look healthy.
       const isUnknownApi = url.pathname.startsWith("/api/");
       res.writeHead(isUnknownApi ? 404 : 200, {
         ...cors,
@@ -80,7 +90,7 @@ async function bootstrap() {
           isUnknownApi
             ? {
                 ok: false,
-                error: `${url.pathname} is not served by a GATEWAY_ONLY Sushi gateway (WebSocket SSH/RDP only).`,
+                error: `${url.pathname} is not served by a GATEWAY_ONLY Sushi gateway.`,
               }
             : {
                 service: "sushi-gateway",

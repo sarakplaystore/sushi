@@ -15,14 +15,15 @@ import {
   Users,
   X,
 } from "lucide-react";
-import type { GatewaySettings, } from "@/lib/client/gateway";
-import { getAuthHeaders } from "@/lib/client/gateway";
+import type { GatewaySettings } from "@/lib/client/gateway";
 import { copyTextToClipboard } from "@/lib/client/clipboard";
 import {
   type ShareListResponse,
   type SharedSessionView,
   buildShareJoinUrl,
   formatShareAge,
+  shareManagementHeaders,
+  shareManagementUrl,
   sortParticipants,
 } from "@/lib/client/shared-ssh";
 
@@ -45,8 +46,8 @@ interface ShareSessionModalProps {
   canShare: boolean;
   busy: boolean;
   error: string | null;
-  onStart: (options: ShareStartOptions) => void;
-  onStop: (shareId?: string) => void;
+  onStart: (options: ShareStartOptions) => void | Promise<void>;
+  onStop: (shareId?: string) => void | Promise<void>;
   onRotate: () => void;
   onOpenGatewayModal: () => void;
   gatewaySettings: GatewaySettings;
@@ -76,10 +77,13 @@ export function ShareSessionModal({
   const [requiresGateway, setRequiresGateway] = useState(false);
   const [idleHours, setIdleHours] = useState<number | null>(null);
 
-  const joinUrl = useMemo(
-    () => (activeShare ? buildShareJoinUrl(activeShare.shareId) : ""),
-    [activeShare]
-  );
+  const joinUrl = useMemo(() => {
+    try {
+      return activeShare ? buildShareJoinUrl(activeShare.shareId, gatewaySettings.gatewayUrl) : "";
+    } catch {
+      return "";
+    }
+  }, [activeShare, gatewaySettings.gatewayUrl]);
 
   // Ages ("4m", "2h 10m") have to tick or they read as frozen.
   useEffect(() => {
@@ -91,23 +95,24 @@ export function ShareSessionModal({
 
   const refreshShares = useCallback(async () => {
     try {
-      const res = await fetch("/api/ssh/share", {
-        headers: getAuthHeaders(gatewaySettings),
+      const res = await fetch(shareManagementUrl(gatewaySettings), {
+        headers: shareManagementHeaders(gatewaySettings),
+        credentials: gatewaySettings.gatewayUrl.trim() ? "omit" : "same-origin",
         cache: "no-store",
       });
-      if (!res.ok) {
-        setShares([]);
-        setListError(null);
-        return;
+      const data = (await res.json().catch(() => ({}))) as ShareListResponse;
+      if (!res.ok || data.ok === false) {
+        throw new Error(res.status === 404 && gatewaySettings.gatewayUrl.trim()
+          ? "Update the gateway to list and manage shared sessions."
+          : data.error || `Could not read shared sessions (HTTP ${res.status}).`);
       }
-      const data = (await res.json()) as ShareListResponse;
       setShares(data.shares ?? []);
       setRequiresGateway(Boolean(data.requiresGateway));
       if (data.limits?.idleTtlMs) setIdleHours(Math.round(data.limits.idleTtlMs / 3_600_000));
       setListError(null);
-    } catch {
-      setShares([]);
-      setListError("Could not read the list of shared sessions from this server.");
+    } catch (error) {
+      setShares(null);
+      setListError(error instanceof Error ? error.message : "Could not read the list of shared sessions.");
     }
   }, [gatewaySettings]);
 
@@ -295,8 +300,9 @@ export function ShareSessionModal({
                   />
                   <button
                     type="button"
+                    disabled={!joinUrl}
                     onClick={() => void copy("link", joinUrl)}
-                    className="inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-xs font-medium text-slate-200 transition hover:bg-white/10"
+                    className="inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-xs font-medium text-slate-200 transition hover:bg-white/10 disabled:opacity-50"
                   >
                     {copied === "link" ? (
                       <Check className="h-3.5 w-3.5 text-emerald-400" />
@@ -305,7 +311,7 @@ export function ShareSessionModal({
                     )}
                     {copied === "link" ? "Copied" : "Copy"}
                   </button>
-                  <a
+                  {joinUrl && <a
                     href={joinUrl}
                     target="_blank"
                     rel="noreferrer"
@@ -313,8 +319,9 @@ export function ShareSessionModal({
                     title="Open the join page in a new tab"
                   >
                     <ExternalLink className="h-3.5 w-3.5" />
-                  </a>
+                  </a>}
                 </div>
+                {!joinUrl && <p className="text-xs text-rose-300">The gateway address is invalid; no link was created.</p>}
               </div>
 
               {/* Passcode */}
@@ -433,7 +440,7 @@ export function ShareSessionModal({
                     </span>
                     <span className="flex shrink-0 items-center gap-1">
                       <a
-                        href={buildShareJoinUrl(s.shareId)}
+                        href={buildShareJoinUrl(s.shareId, gatewaySettings.gatewayUrl)}
                         target="_blank"
                         rel="noreferrer"
                         className="rounded-lg border border-white/10 bg-white/5 px-2 py-1 text-[11px] text-slate-200 transition hover:bg-white/10"
@@ -442,8 +449,9 @@ export function ShareSessionModal({
                       </a>
                       <button
                         type="button"
-                        onClick={() => onStop(s.shareId)}
-                        className="rounded-lg border border-rose-500/30 bg-rose-500/10 px-2 py-1 text-[11px] text-rose-200 transition hover:bg-rose-500/20"
+                        disabled={busy}
+                        onClick={() => void Promise.resolve(onStop(s.shareId)).then(refreshShares)}
+                        className="rounded-lg border border-rose-500/30 bg-rose-500/10 px-2 py-1 text-[11px] text-rose-200 transition hover:bg-rose-500/20 disabled:opacity-50"
                       >
                         Stop
                       </button>

@@ -11,14 +11,18 @@ import {
   Terminal,
   Users,
 } from "lucide-react";
-import { type GatewaySettings, buildWebSocketUrl, loadGatewaySettings } from "@/lib/client/gateway";
+import { buildWebSocketUrl, getAuthHeaders } from "@/lib/client/gateway";
+import { isShareId } from "@/lib/share-gateway";
 import { getStoredSessionToken } from "@/lib/client/auth-storage";
 import { copyTextToClipboard } from "@/lib/client/clipboard";
+import { DEFAULT_TERMINAL_FONT_SIZE, TerminalFontSizeControl } from "@/components/TerminalFontSizeControl";
 import {
   type SharedParticipantView,
   type SharedSessionView,
   buildShareJoinUrl,
+  fetchShareAccountTicket,
   formatShareAge,
+  gatewayFromShareSearch,
   loadShareDisplayName,
   recallSharePasscode,
   rememberSharePasscode,
@@ -60,7 +64,9 @@ function decodeBase64Bytes(b64: string): Uint8Array {
 }
 
 export function SharedTerminalSession({ shareId }: { shareId: string }) {
-  const [gatewaySettings] = useState<GatewaySettings>(() => loadGatewaySettings());
+  // Links without a gateway are same-origin; never consult a visitor's unrelated
+  // local gateway settings or send their private gateway key to a link destination.
+  const [gatewayUrl, setGatewayUrl] = useState<string | null>(null);
   const [phase, setPhase] = useState<Phase>("gate");
   const [share, setShare] = useState<SharedSessionView | null>(null);
   const [participants, setParticipants] = useState<SharedParticipantView[]>([]);
@@ -70,6 +76,10 @@ export function SharedTerminalSession({ shareId }: { shareId: string }) {
   const [canWrite, setCanWrite] = useState(true);
   const [youId, setYouId] = useState<string | null>(null);
   const [signedIn, setSignedIn] = useState<boolean | null>(null);
+  const [terminalReady, setTerminalReady] = useState(false);
+  const [fontSize, setFontSize] = useState(DEFAULT_TERMINAL_FONT_SIZE);
+  const fontSizeRef = useRef(fontSize);
+  fontSizeRef.current = fontSize;
   const [needsPasscode, setNeedsPasscode] = useState(false);
   const [name, setName] = useState("");
   const [passcode, setPasscode] = useState("");
@@ -81,9 +91,28 @@ export function SharedTerminalSession({ shareId }: { shareId: string }) {
   const fitRef = useRef<import("@xterm/addon-fit").FitAddon | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const disposedRef = useRef(false);
+  const attemptRef = useRef(0);
   const activityTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const joinUrl = useMemo(() => buildShareJoinUrl(shareId), [shareId]);
+  const joinUrl = useMemo(() => {
+    if (gatewayUrl === null) return "";
+    try { return buildShareJoinUrl(shareId, gatewayUrl); } catch { return ""; }
+  }, [shareId, gatewayUrl]);
+
+  useEffect(() => {
+    try {
+      if (!isShareId(shareId)) throw new Error("Invalid shared-session link.");
+      const gateway = gatewayFromShareSearch(window.location.search);
+      if (window.location.protocol === "https:" && gateway.startsWith("http:")) {
+        throw new Error("This link needs a secure HTTPS/WSS gateway.");
+      }
+      setGatewayUrl(gateway);
+    } catch (error) {
+      setErrorCode("BAD_LINK");
+      setError(error instanceof Error ? error.message : "Invalid shared-session link.");
+      setPhase("error");
+    }
+  }, [shareId]);
 
   // ---- terminal ---------------------------------------------------------------
 
@@ -100,7 +129,7 @@ export function SharedTerminalSession({ shareId }: { shareId: string }) {
 
       const term = new Terminal({
         cursorBlink: true,
-        fontSize: 14,
+        fontSize: fontSizeRef.current,
         fontFamily:
           '"JetBrains Mono", "Fira Code", "SFMono-Regular", Menlo, Consolas, monospace',
         lineHeight: 1.24,
@@ -125,8 +154,15 @@ export function SharedTerminalSession({ shareId }: { shareId: string }) {
 
       termRef.current = term;
       fitRef.current = fitAddon;
+      setTerminalReady(true);
       term.focus();
-    })();
+    })().catch(() => {
+      if (!cancelled) {
+        setErrorCode("TERMINAL_LOAD_FAILED");
+        setError("The terminal could not load. Refresh this page and try again.");
+        setPhase("error");
+      }
+    });
 
     const observer = new ResizeObserver(() => {
       const term = termRef.current;
@@ -151,8 +187,32 @@ export function SharedTerminalSession({ shareId }: { shareId: string }) {
       termRef.current = null;
       fitRef.current = null;
       disposedRef.current = true;
+      attemptRef.current += 1;
+      wsRef.current?.close();
+      wsRef.current = null;
+      if (activityTimer.current) clearTimeout(activityTimer.current);
     };
   }, []);
+
+  // Changing text size refits the same terminal and updates the shared PTY; it
+  // must not open a new SSH connection. The ref also covers async xterm loading.
+  useEffect(() => {
+    const term = termRef.current;
+    const fit = fitRef.current;
+    if (!term || !fit) return;
+    term.options.fontSize = fontSize;
+    const previousCols = term.cols;
+    const previousRows = term.rows;
+    try {
+      fit.fit();
+      const ws = wsRef.current;
+      if ((term.cols !== previousCols || term.rows !== previousRows) && ws?.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: "resize", cols: term.cols, rows: term.rows }));
+      }
+    } catch {
+      // A hidden terminal will be fitted once its container is measured.
+    }
+  }, [fontSize, terminalReady]);
 
   // Ages in the participant list have to tick.
   useEffect(() => {
@@ -170,7 +230,9 @@ export function SharedTerminalSession({ shareId }: { shareId: string }) {
     let cancelled = false;
     void (async () => {
       try {
-        const res = await fetch("/api/auth/status", { cache: "no-store" });
+        const res = await fetch("/api/auth/status", {
+          headers: getAuthHeaders({ gatewayUrl: "", gatewayToken: "" }), cache: "no-store",
+        });
         const data = (await res.json()) as { authenticated?: boolean };
         if (!cancelled) setSignedIn(Boolean(data.authenticated));
       } catch {
@@ -185,9 +247,10 @@ export function SharedTerminalSession({ shareId }: { shareId: string }) {
   // ---- connection -------------------------------------------------------------
 
   const connect = useCallback(
-    (options?: { passcode?: string; name?: string }) => {
+    async (options?: { passcode?: string; name?: string }) => {
       const displayName = (options?.name ?? name).trim();
       const code = (options?.passcode ?? passcode).trim();
+      if (gatewayUrl === null || !terminalReady) return;
 
       if (!displayName) {
         setError("Add your name so the team can see who is in the shell.");
@@ -195,16 +258,33 @@ export function SharedTerminalSession({ shareId }: { shareId: string }) {
         return;
       }
 
+      const attempt = ++attemptRef.current;
       wsRef.current?.close();
+      wsRef.current = null;
       setError(null);
       setErrorCode(null);
       setPhase("connecting");
       termRef.current?.reset();
 
-      const ws = new WebSocket(buildWebSocketUrl("/ws/ssh", gatewaySettings));
+      let ticket: string | undefined;
+      if (gatewayUrl && signedIn && !code) {
+        try { ticket = await fetchShareAccountTicket(shareId, gatewayUrl); } catch {
+          // A passcode can still work if the frontend account service is unavailable.
+        }
+      }
+      if (attempt !== attemptRef.current || disposedRef.current) return;
+      let ws: WebSocket;
+      try {
+        ws = new WebSocket(buildWebSocketUrl("/ws/ssh", { gatewayUrl, gatewayToken: "" }));
+      } catch {
+        setError("Could not open the gateway address in this share link.");
+        setPhase("error");
+        return;
+      }
       wsRef.current = ws;
 
       let opened = false;
+      let terminalOutcome = false;
       const ping = setInterval(() => {
         if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "ping" }));
       }, 20_000);
@@ -214,16 +294,18 @@ export function SharedTerminalSession({ shareId }: { shareId: string }) {
         ws.send(
           JSON.stringify({
             type: "auth",
-            sessionToken: getStoredSessionToken() || undefined,
-            gatewayToken: gatewaySettings.gatewayToken || undefined,
+            // A link-selected external gateway never receives this site's full
+            // session or this browser's saved gateway key.
+            sessionToken: gatewayUrl ? undefined : getStoredSessionToken() || undefined,
             cols: termRef.current?.cols || 100,
             rows: termRef.current?.rows || 30,
-            share: { join: shareId, passcode: code || undefined, name: displayName },
+            share: { join: shareId, passcode: code || undefined, name: displayName, ticket },
           })
         );
       };
 
       ws.onmessage = (event) => {
+        if (disposedRef.current || wsRef.current !== ws) return;
         let msg: Record<string, any>;
         try {
           msg = JSON.parse(event.data);
@@ -232,7 +314,9 @@ export function SharedTerminalSession({ shareId }: { shareId: string }) {
         }
 
         if (msg.type === "ready") {
-          clearInterval(ping);
+          // Keep pinging during the live session; many gateway proxies time out
+          // otherwise-idle WebSockets after a minute.
+          setNeedsPasscode(false);
           setPhase("live");
           setShare((msg.share as SharedSessionView) ?? null);
           setCanWrite(msg.write !== false);
@@ -245,7 +329,9 @@ export function SharedTerminalSession({ shareId }: { shareId: string }) {
           if (typeof msg.replay === "string" && msg.replay.length > 0) {
             termRef.current?.write(decodeBase64Bytes(msg.replay));
           }
-          termRef.current?.focus();
+          const term = termRef.current;
+          if (term) ws.send(JSON.stringify({ type: "resize", cols: term.cols, rows: term.rows }));
+          term?.focus();
           return;
         }
 
@@ -267,12 +353,13 @@ export function SharedTerminalSession({ shareId }: { shareId: string }) {
         }
 
         if (msg.type === "error") {
+          terminalOutcome = true;
           clearInterval(ping);
           const codeName = typeof msg.code === "string" ? msg.code : null;
           setErrorCode(codeName);
           setError(String(msg.message || "Could not join the shared session."));
           if (codeName === "PASSCODE_REQUIRED" || codeName === "BAD_PASSCODE") {
-            setNeedsPasscode(true);
+            setNeedsPasscode(codeName === "BAD_PASSCODE");
             setPhase("gate");
           } else if (codeName === "SHARE_NOT_FOUND") {
             setPhase("ended");
@@ -283,6 +370,7 @@ export function SharedTerminalSession({ shareId }: { shareId: string }) {
         }
 
         if (msg.type === "share-closed") {
+          terminalOutcome = true;
           clearInterval(ping);
           setPhase("ended");
           setError(String(msg.reason || "The host stopped sharing this session."));
@@ -290,6 +378,7 @@ export function SharedTerminalSession({ shareId }: { shareId: string }) {
         }
 
         if (msg.type === "exit") {
+          terminalOutcome = true;
           clearInterval(ping);
           setPhase("ended");
           setError(String(msg.reason || "The shared shell ended."));
@@ -302,20 +391,21 @@ export function SharedTerminalSession({ shareId }: { shareId: string }) {
 
       ws.onclose = () => {
         clearInterval(ping);
-        if (disposedRef.current || wsRef.current !== ws) return;
+        if (disposedRef.current || wsRef.current !== ws || terminalOutcome) return;
         if (!opened) {
           setErrorCode(null);
           setPhase("error");
-          setError("Could not reach this Sushi server's WebSocket endpoint.");
+          setError("Could not reach the share's WebSocket gateway. Check its address and allowed origin.");
           return;
         }
         setPhase("lost");
       };
     },
-    [gatewaySettings, name, passcode, shareId]
+    [gatewayUrl, name, passcode, shareId, signedIn, terminalReady]
   );
 
   const leave = useCallback(() => {
+    attemptRef.current += 1;
     const ws = wsRef.current;
     wsRef.current = null;
     try {
@@ -336,8 +426,10 @@ export function SharedTerminalSession({ shareId }: { shareId: string }) {
   };
 
   const sortedParticipants = useMemo(() => sortParticipants(participants), [participants]);
-  const readyToJoin = signedIn !== null;
-  const canJoinNow = signedIn === true || (name.trim().length > 0 && passcode.trim().length === 6);
+  const readyToJoin = signedIn !== null && gatewayUrl !== null && terminalReady;
+  const canJoinNow = Boolean(name.trim()) &&
+    ((signedIn === true && !needsPasscode) || /^\d{6}$/.test(passcode.trim())) &&
+    !(errorCode === "PASSCODE_REQUIRED" && !signedIn);
 
   return (
     <div className="flex h-[100dvh] flex-col bg-[#090b10] text-slate-100">
@@ -362,6 +454,7 @@ export function SharedTerminalSession({ shareId }: { shareId: string }) {
         </div>
 
         <div className="ml-auto flex flex-wrap items-center gap-1.5">
+          <TerminalFontSizeControl size={fontSize} setSize={setFontSize} />
           {phase === "live" && (
             <span className="inline-flex items-center gap-1.5 rounded-md border border-emerald-500/30 bg-emerald-500/10 px-2 py-0.5 text-[11px] font-medium text-emerald-300">
               <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
@@ -376,8 +469,9 @@ export function SharedTerminalSession({ shareId }: { shareId: string }) {
           )}
           <button
             type="button"
+            disabled={!joinUrl}
             onClick={() => void copyLink()}
-            className="inline-flex items-center gap-1.5 rounded-lg border border-white/10 bg-white/5 px-2.5 py-1 text-xs text-slate-200 transition hover:bg-white/10"
+            className="inline-flex items-center gap-1.5 rounded-lg border border-white/10 bg-white/5 px-2.5 py-1 text-xs text-slate-200 transition hover:bg-white/10 disabled:opacity-50"
             title="Copy the link so someone else can join too"
           >
             {copied ? <Check className="h-3.5 w-3.5 text-emerald-400" /> : <Link2 className="h-3.5 w-3.5" />}
@@ -417,6 +511,9 @@ export function SharedTerminalSession({ shareId }: { shareId: string }) {
                   </span>
                   . Everyone sees the same screen and the same running commands.
                 </p>
+                {gatewayUrl && <p className="break-all text-[12px] leading-relaxed text-slate-500">
+                  Gateway: {gatewayUrl}. Verify this address with the host before entering a code.
+                </p>}
               </div>
 
               <div className="space-y-1.5">
@@ -426,6 +523,7 @@ export function SharedTerminalSession({ shareId }: { shareId: string }) {
                 <input
                   id="share-name"
                   value={name}
+                  disabled={!readyToJoin}
                   onChange={(e) => setName(e.target.value)}
                   placeholder="Ana"
                   autoComplete="name"
@@ -433,7 +531,7 @@ export function SharedTerminalSession({ shareId }: { shareId: string }) {
                 />
               </div>
 
-              {(needsPasscode || (!signedIn && signedIn !== null)) && (
+              {errorCode !== "PASSCODE_REQUIRED" && (needsPasscode || (!signedIn && signedIn !== null)) && (
                 <div className="space-y-1.5">
                   <label htmlFor="share-code" className="text-[11px] font-semibold uppercase tracking-wider text-slate-400">
                     6-digit share code
@@ -441,6 +539,7 @@ export function SharedTerminalSession({ shareId }: { shareId: string }) {
                   <input
                     id="share-code"
                     value={passcode}
+                    disabled={!readyToJoin}
                     onChange={(e) => setPasscode(e.target.value.replace(/\D/g, "").slice(0, 6))}
                     inputMode="numeric"
                     placeholder="000000"
@@ -470,7 +569,9 @@ export function SharedTerminalSession({ shareId }: { shareId: string }) {
 
               {signedIn === false && (
                 <p className="text-[12px] leading-relaxed text-slate-500">
-                  Not signed in to this Sushi instance — the share code is how you get in.
+                  Not signed in to this Sushi instance. Use the share code, or{" "}
+                  <a href="/" target="_blank" rel="noreferrer" className="text-[#ff9587] underline">sign in</a>{" "}
+                  and reload this page for an account-only share.
                 </p>
               )}
             </div>
@@ -515,7 +616,16 @@ export function SharedTerminalSession({ shareId }: { shareId: string }) {
                 {phase === "ended" ? "This shared shell has ended" : "Could not join"}
               </p>
               <p className="text-[13px] leading-relaxed text-slate-400">{error}</p>
-              {phase !== "ended" || errorCode !== "SHARE_NOT_FOUND" ? (
+              {errorCode === "TERMINAL_LOAD_FAILED" ? (
+                <button
+                  type="button"
+                  onClick={() => window.location.reload()}
+                  className="inline-flex items-center gap-2 rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-sm font-medium text-slate-100 transition hover:bg-white/10"
+                >
+                  <RotateCw className="h-4 w-4" />
+                  Reload page
+                </button>
+              ) : errorCode !== "BAD_LINK" && (phase !== "ended" || errorCode !== "SHARE_NOT_FOUND") ? (
                 <button
                   type="button"
                   onClick={() => connect()}

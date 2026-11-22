@@ -3,7 +3,8 @@
 # `server.ts` with GATEWAY_ONLY=true, so it builds in seconds and starts in one.
 #
 # It serves /ws/ssh (native interactive PTY), /ws/rdp and /ws/rdp-cleanpath, plus
-# GET /health and GET /api/system/capabilities for platform health checks.
+# GET /health and GET /api/system/capabilities for platform health checks. Selected
+# token-protected SSH management/diagnostic and RDP probe APIs also run here.
 #
 # Used by .railway/railway.ts and render.yaml. Locally, provision a persistent
 # private token first; it is never generated inside this disposable container:
@@ -25,8 +26,8 @@ ENV NODE_ENV=production
 ENV NEXT_TELEMETRY_DISABLED=1
 ENV HOST=0.0.0.0
 ENV PORT=3000
-# Gateway mode: WebSocket SSH/RDP only. Every other API route 404s on purpose, so
-# the Vercel frontend keeps using its own serverless endpoints (see server.ts).
+# Gateway mode: WebSockets and selected protocol-management APIs only. Account,
+# vault, SFTP and streaming routes remain on the Vercel frontend (see server.ts).
 ENV GATEWAY_ONLY=true
 # Point at a guacd service on the same private network to also enable live HTML5
 # RDP. The Railway config deploys guacd next to the gateway; Render's blueprint

@@ -186,12 +186,17 @@ storage, no new sync path.
 A normal Sushi terminal is private: one tab, one shell, and the shell dies with the tab.
 **Share** (in the terminal header) turns that shell into a shared one:
 
-1. Open a host's terminal and hit **Share**.
+1. Open a host's terminal and hit **Share**. The terminal font starts at **12**;
+   the −/+ controls adjust it from **4 to 40** without reconnecting the shell.
 2. Pick **Anyone with the link** (Sushi mints a 6-digit code) or **Signed-in Sushi
    accounts** (the link only works for people logged in to this instance), and decide
    whether teammates may type.
-3. Send the link (`<your-sushi>/share/<id>`). Whoever opens it types their name, the
-   code if there is one, and **Join session**.
+3. Send the link (`<your-sushi>/share/<id>`). For a separate gateway, the link also
+   identifies its public address, so a guest does not need to configure their own
+   gateway. It never contains the gateway key, account session, SSH credentials or
+   share code; send the code separately. Whoever opens it types their name, the code
+   if there is one, and **Join session**. Verify the displayed gateway address with
+   the host before entering a code.
 
 From then on there is exactly **one** SSH connection to the host, no matter how many
 browsers are attached. Output goes to everyone; keystrokes from anyone with write
@@ -209,14 +214,31 @@ Where it works, and where it does not:
 | | Shared shell |
 | --- | --- |
 | VPS / Docker install (`server.ts`) | ✅ |
-| `GATEWAY_ONLY=true` gateway | ✅ |
-| Vercel serverless | ❌ serverless has no process to hold a PTY open — the Share panel says so and offers *Attach a gateway* (VPS, Railway or Render) |
+| Vercel UI + an attached, persistent gateway | ✅ the PTY and share registry live on the gateway, not on Vercel |
+| Vercel serverless without a gateway | ❌ serverless has no process to hold a PTY open — the Share panel offers *Attach a gateway* |
 
-Managing shares: **Share → Other shared sessions here** lists everything currently
-published on this server, with **Rejoin** and **Stop**. The same list is available to
-scripts and dashboards at `GET /api/ssh/share` (account required); `DELETE
-/api/ssh/share?id=…` stops one, and `PATCH` with `{"id": …, "passcode": "auto"}` rotates
-its code (`"passcode": null` switches it to account-only).
+**Upgrade both sides:** deploy the updated Vercel frontend and rebuild/redeploy the
+persistent gateway from the same version. Older gateways can still accept a code join,
+when the new link points to them, but cannot list/manage shares or verify the new
+account-only tickets. Recreate old gateway share links so they include the gateway
+address. The gateway must allow WebSockets from the exact frontend origin in
+`ALLOWED_ORIGIN`; an HTTPS frontend also needs an HTTPS/WSS gateway. A sleeping,
+restarted or redeployed gateway drops its PTYs and shares; use an always-on service
+if they must remain open.
+
+For account-only shares on a separate gateway, the authenticated host registers this
+Sushi site's public verifier when starting the share. A signed-in guest obtains a
+60-second ticket scoped to that share and gateway; neither the full account session
+nor the gateway key is sent to the link's destination. Only the publishing host or
+an authenticated gateway administrator can rotate or stop a share; a guest with a
+code cannot do so.
+
+Managing shares: **Share → Other shared sessions here** lists the registry on the
+actual PTY server, with **Rejoin** and **Stop**. Scripts can use `GET /api/ssh/share`,
+`DELETE /api/ssh/share?id=…`, and `PATCH` with `{"id": …, "passcode": "auto"}` to rotate
+the code (`"passcode": null` switches it to account-only). A same-origin Sushi admin
+session or the target gateway's protocol key is required; a `GATEWAY_ONLY` process
+requires its key. Do not put the key in a share link or give it to guests.
 
 **Treat a share link as a handover of the host account.** Everyone in the shell runs
 commands as the SSH user of that connection, with that user's `sudo`, on the machine
@@ -675,11 +697,14 @@ and the [Firestore migration instructions](#migrate-an-existing-disk-or-redis-st
    > `/health` ping every 4 minutes only while the gateway settings panel is open; browsers or
    > hosts can still suspend it, and a dropped session cannot be restored.
 
-   The gateway image is deliberately slim: it contains no Next.js build and no web assets,
-   only `server.ts` with `GATEWAY_ONLY=true`, so it starts in about a second and answers
-   `GET /health` and `GET /api/system/capabilities` for platform health checks. Every other
-   API route 404s on purpose, which is what makes the Vercel frontend keep using its own
-   serverless endpoints (for example *Test SSH Auth* → the Vercel `/api/ssh/test`).
+   The gateway image is deliberately slim: it contains no Next.js build or web assets.
+   `server.ts` with `GATEWAY_ONLY=true` answers `GET /health` and
+   `GET /api/system/capabilities` for health checks. With the gateway key it also serves
+   share management, SSH connection testing/system information, run-status and stop
+   helpers, and the RDP probe, so those can reach machines on the gateway's network.
+   Other APIs, including the serverless SSH stream and SFTP, stay on the frontend and
+   return 404 from this gateway. Those frontend routes can only reach hosts accessible
+   from Vercel; attaching the PTY gateway does not proxy SFTP or serverless fallback.
 
 **Upgrading an existing browser-local Vercel account:** Back up the old vault
 first. Preserve the existing effective signing secret and deployment identity,

@@ -41,6 +41,7 @@ export async function GET(req: NextRequest) {
     // Sharing holds one SSH channel open for many browsers, which only a persistent
     // WebSocket gateway can do — Vercel serverless has nowhere to keep it.
     sharedSsh: wsActive,
+    shareAccountTickets: wsActive,
     serverVault: isServerVaultEnabled(),
     storageBackend: getStateStoreKind(),
     requiresGatewayToken: Boolean(process.env.SUSHI_GATEWAY_TOKEN?.trim()),

@@ -2025,7 +2025,8 @@ export function SushiWorkspace() {
   );
   const effectiveRdpCleanPath = Boolean(
     remoteCaps
-      ? remoteCaps.rdpCleanPath
+      // Older Sushi companion gateways serve CleanPath but omitted this flag.
+      ? (remoteCaps.rdpCleanPath ?? remoteCaps.mode === "gateway")
       : localCaps
         ? (localCaps.rdpCleanPath ?? true)
         : true

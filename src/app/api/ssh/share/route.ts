@@ -1,8 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getCorsHeaders } from "@/lib/server/security";
-import { verifyAdminSession } from "@/lib/server/auth";
+import { verifyAdminSession, verifyGatewayTokenHeaders } from "@/lib/server/auth";
 import {
   listSharedSessions,
+  getSharedSession,
   rotateSharedPasscode,
   sharedSessionLimits,
   stopSharedSession,
@@ -33,9 +34,17 @@ function sharingAvailable(): boolean {
   return Boolean((globalThis as Record<string, unknown>).__SUSHI_WS_ACTIVE__);
 }
 
+// Share management is protocol-level access, not account/vault management.
+// An attached gateway key can manage its own shares; otherwise require the
+// same-origin admin guard (not a cookie accepted across arbitrary origins).
+async function authorizeManagement(req: NextRequest) {
+  if (verifyGatewayTokenHeaders(req.headers)) return { ok: true, error: undefined };
+  return verifyAdminSession(req.headers);
+}
+
 export async function GET(req: NextRequest) {
-  const cors = getCorsHeaders(req.headers.get("origin"));
-  const auth = await verifyAdminSession(req.headers);
+  const cors = { ...getCorsHeaders(req.headers.get("origin")), "Cache-Control": "private, no-store" };
+  const auth = await authorizeManagement(req);
   if (!auth.ok) {
     return NextResponse.json({ ok: false, error: auth.error }, { status: 401, headers: cors });
   }
@@ -53,8 +62,8 @@ export async function GET(req: NextRequest) {
 }
 
 export async function DELETE(req: NextRequest) {
-  const cors = getCorsHeaders(req.headers.get("origin"));
-  const auth = await verifyAdminSession(req.headers);
+  const cors = { ...getCorsHeaders(req.headers.get("origin")), "Cache-Control": "private, no-store" };
+  const auth = await authorizeManagement(req);
   if (!auth.ok) {
     return NextResponse.json({ ok: false, error: auth.error }, { status: 401, headers: cors });
   }
@@ -75,8 +84,8 @@ export async function DELETE(req: NextRequest) {
 }
 
 export async function PATCH(req: NextRequest) {
-  const cors = getCorsHeaders(req.headers.get("origin"));
-  const auth = await verifyAdminSession(req.headers);
+  const cors = { ...getCorsHeaders(req.headers.get("origin")), "Cache-Control": "private, no-store" };
+  const auth = await authorizeManagement(req);
   if (!auth.ok) {
     return NextResponse.json({ ok: false, error: auth.error }, { status: 401, headers: cors });
   }
@@ -101,6 +110,13 @@ export async function PATCH(req: NextRequest) {
         ? body.passcode.trim()
         : "auto";
 
+  if (requested === null && process.env.GATEWAY_ONLY === "true" &&
+      getSharedSession(id) && !getSharedSession(id)?.accountIssuer) {
+    return NextResponse.json(
+      { ok: false, error: "This share has no frontend account verifier. Start it again from an updated Sushi site." },
+      { status: 409, headers: cors }
+    );
+  }
   const result = rotateSharedPasscode(id, requested);
   if (!result.ok) {
     return NextResponse.json({ ok: false, error: result.error }, { status: 404, headers: cors });

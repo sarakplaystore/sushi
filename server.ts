@@ -1,3 +1,6 @@
+// Next's custom server must initialize its Node async-context globals before
+// gateway routes import `next/server` (the `next` CLI does this automatically).
+import "next/dist/server/node-environment";
 import http from "node:http";
 import next from "next";
 import { createGatewayWebSockets } from "./src/lib/server/ws-gateway";
@@ -59,6 +62,7 @@ async function bootstrap() {
           rdpProbe: true,
           sharedSsh: true,
           shareAccountTickets: true,
+          retainedSshPty: true,
           serverVault: false,
           requiresGatewayToken: Boolean(process.env.SUSHI_GATEWAY_TOKEN?.trim()),
           guacdHost: `${guacdCfg.host}:${guacdCfg.port}`,

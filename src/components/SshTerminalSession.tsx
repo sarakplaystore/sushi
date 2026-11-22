@@ -49,6 +49,15 @@ import { ShareSessionModal, type ShareStartOptions } from "./ShareSessionModal";
 import { DEFAULT_TERMINAL_FONT_SIZE, TerminalFontSizeControl } from "./TerminalFontSizeControl";
 import { normalizeShareGateway } from "@/lib/share-gateway";
 import {
+  RETAINED_PTY_EVENT,
+  RETAINED_PTY_KEY,
+  forgetRetainedPty,
+  loadRetainedPtys,
+  retainedPtyMatches,
+  saveRetainedPty,
+  type PtyCloseSafety,
+} from "@/lib/client/retained-pty";
+import {
   type ExecStdinChannel,
   canStreamExecStdin,
   createExecRequestBody,
@@ -111,15 +120,20 @@ import type { ResumableRun } from "@/lib/client/session-resume";
 import { TranslatePanel } from "@/components/TranslatePanel";
 
 interface SshTerminalSessionProps {
+  tabId: string;
   profile: HostProfile;
   isActive: boolean;
   initialPath?: string;
   wsAvailable: boolean;
+  /** Capability advertised by the process that will actually hold this PTY. */
+  retainedPtySupported: boolean;
   gatewaySettings: GatewaySettings;
   snippets: CommandSnippet[];
   onOpenCompanionSftp: (cwd?: string) => void;
   onOpenRdp: () => void;
   onOpenGatewayModal: () => void;
+  /** Used by the workspace close guard; a stale local ID is not proof of retention. */
+  onPtySafetyChange?: (tabId: string, state: PtyCloseSafety) => void;
   /**
    * The session really connected (used for the "Recently connected" history and to
    * offer a command that is still running on this host).
@@ -208,15 +222,18 @@ type SecretPrompt =
   | { action: "run"; command: string; elevateUser: string };
 
 export function SshTerminalSession({
+  tabId,
   profile,
   isActive,
   initialPath,
   wsAvailable,
+  retainedPtySupported,
   gatewaySettings,
   snippets,
   onOpenCompanionSftp,
   onOpenRdp,
   onOpenGatewayModal,
+  onPtySafetyChange,
   onConnected,
   onRunChange,
   onStopHostRuns,
@@ -272,7 +289,7 @@ export function SshTerminalSession({
   const shareActivityTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const [transportMode, setTransportMode] = useState<"ws" | "serverless">(
-    wsAvailable ? "ws" : "serverless"
+    wsAvailable || gatewaySettings.gatewayUrl.trim() ? "ws" : "serverless"
   );
   const [status, setStatus] = useState<
     "connecting" | "connected" | "disconnected" | "error"
@@ -284,6 +301,23 @@ export function SshTerminalSession({
   const statusRef = useRef(status);
   statusRef.current = status;
   const [fingerprint, setFingerprint] = useState<string | undefined>();
+
+  // Private PTY persistence is separate from team sharing and from the
+  // serverless No timeout switch. Never show it as protected until the gateway
+  // has acknowledged it and the browser has saved the reattachment identifier.
+  const [ptyRetention, setPtyRetention] = useState<"checking" | "on" | "off" | "pending" | "unconfirmed">("checking");
+  const [ptyRetentionError, setPtyRetentionError] = useState<string | null>(null);
+  const [resumeProblem, setResumeProblem] = useState(false);
+  const [ptyIdleTtlMs, setPtyIdleTtlMs] = useState(12 * 60 * 60 * 1000);
+  const [ptyCapability, setPtyCapability] = useState(retainedPtySupported);
+  const ptySessionIdRef = useRef<string | null>(null);
+  const ptyControlTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const autoRetentionAttemptedRef = useRef(false);
+
+  const clearPtyControlTimer = useCallback(() => {
+    if (ptyControlTimerRef.current) clearTimeout(ptyControlTimerRef.current);
+    ptyControlTimerRef.current = null;
+  }, []);
 
   /**
    * Share control frames ride on the same socket as the terminal, so they can only be
@@ -300,6 +334,119 @@ export function SshTerminalSession({
       return false;
     }
   }, []);
+
+  const requestPtyRetention = useCallback((action: "enable" | "disable") => {
+    if (!ptyReadyRef.current || !sendShareControl({ type: "persistence", action })) {
+      setPtyRetentionError("The terminal is disconnected; reconnect before changing Keep running.");
+      return;
+    }
+    clearPtyControlTimer();
+    setPtyRetention("pending");
+    setPtyRetentionError(null);
+    ptyControlTimerRef.current = setTimeout(() => {
+      setPtyRetention("unconfirmed");
+      setPtyRetentionError("The gateway did not confirm this change. Do not close the tab until Keep running is confirmed.");
+      ptyControlTimerRef.current = null;
+    }, 5000);
+  }, [clearPtyControlTimer, sendShareControl]);
+
+  const togglePtyRetention = useCallback(() => {
+    if (!ptyCapability || !ptyReadyRef.current || ptyRetention === "pending") return;
+    const action = ptyRetention === "on" ? "disable" : "enable";
+    if (action === "disable" && !window.confirm(
+      "Turn off Keep running? Closing the last tab will end this private SSH terminal unless it is still shared."
+    )) return;
+    // A deliberate user choice must not be undone by a later capability probe.
+    autoRetentionAttemptedRef.current = true;
+    requestPtyRetention(action);
+  }, [ptyCapability, ptyRetention, requestPtyRetention]);
+
+  // Capabilities can arrive after the socket has opened (for example after a
+  // gateway retry). Apply them only to the gateway that owns this live PTY, and
+  // enable the default once without reconnecting or interrupting its command.
+  useEffect(() => {
+    if (!retainedPtySupported) return;
+    try {
+      if (normalizeShareGateway(gatewaySettings.gatewayUrl) !== normalizeShareGateway(gatewayForSessionRef.current.gatewayUrl)) return;
+    } catch { return; }
+    setPtyCapability(true);
+    if (transportMode !== "ws" || status !== "connected" || ptyRetention !== "off" || autoRetentionAttemptedRef.current) return;
+    autoRetentionAttemptedRef.current = true;
+    let keepByDefault = true;
+    try { keepByDefault = localStorage.getItem("sushi.keepPtyAlive") !== "0"; } catch { /* saving the ID is checked separately */ }
+    if (keepByDefault) requestPtyRetention("enable");
+  }, [gatewaySettings.gatewayUrl, ptyRetention, requestPtyRetention, retainedPtySupported, status, transportMode]);
+
+  const hasCurrentSavedPty = useCallback(() => {
+    const id = ptySessionIdRef.current;
+    return Boolean(id && loadRetainedPtys().some((entry) =>
+      entry.tabId === tabId && entry.sessionId === id &&
+      retainedPtyMatches(entry, gatewayForSessionRef.current.gatewayUrl, profile)
+    ));
+  }, [profile, tabId]);
+
+  // A different browser tab may remove/move the record. Do not keep showing a
+  // green confirmation after this browser no longer has the identifier.
+  useEffect(() => {
+    if (ptyRetention !== "on") return;
+    const check = () => {
+      if (hasCurrentSavedPty()) return;
+      setPtyRetention("unconfirmed");
+      setPtyRetentionError("The saved terminal identifier is no longer available in this browser. Keep this tab open and enable Keep running again.");
+    };
+    const onStorage = (event: StorageEvent) => {
+      if (event.key === RETAINED_PTY_KEY || event.key === null) check();
+    };
+    window.addEventListener(RETAINED_PTY_EVENT, check);
+    window.addEventListener("storage", onStorage);
+    check();
+    return () => {
+      window.removeEventListener(RETAINED_PTY_EVENT, check);
+      window.removeEventListener("storage", onStorage);
+    };
+  }, [hasCurrentSavedPty, ptyRetention]);
+
+  useEffect(() => {
+    const confirmedSessionId = status === "connected" && ptyRetention === "on" && hasCurrentSavedPty()
+      ? ptySessionIdRef.current : null;
+    onPtySafetyChange?.(tabId, { transport: transportMode, confirmedSessionId });
+  }, [hasCurrentSavedPty, onPtySafetyChange, ptyRetention, status, tabId, transportMode]);
+
+  // Warn on a real browser close/reload too, not only when the workspace × is
+  // clicked. Browsers show their own generic message and may suppress it.
+  useEffect(() => {
+    if (transportMode !== "ws" || status !== "connected") return;
+    const onBeforeUnload = (event: BeforeUnloadEvent) => {
+      if (ptyRetention === "on" && hasCurrentSavedPty()) return;
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", onBeforeUnload);
+    return () => window.removeEventListener("beforeunload", onBeforeUnload);
+  }, [hasCurrentSavedPty, ptyRetention, status, transportMode]);
+
+  const endPty = useCallback(() => {
+    if (!window.confirm("End this SSH terminal? The shell and any shared participants will be disconnected. Foreground commands are usually interrupted, but detached processes may continue.")) return;
+    if (!ptyReadyRef.current || !sendShareControl({ type: "persistence", action: "end" })) {
+      setPtyRetentionError("Could not end the terminal while disconnected. Reconnect to the saved terminal and try again.");
+    }
+  }, [sendShareControl]);
+
+  const forgetAndStartNew = useCallback(() => {
+    const saved = loadRetainedPtys().find((entry) => entry.tabId === tabId);
+    if (!saved || !window.confirm(
+      "Forget the saved terminal and open a new SSH shell? The old terminal may still be running, and its command will not be restarted automatically."
+    )) return;
+    if (!forgetRetainedPty(tabId, saved.sessionId)) {
+      setPtyRetentionError("Could not update browser storage; the saved terminal was not forgotten.");
+      return;
+    }
+    ptySessionIdRef.current = null;
+    setResumeProblem(false);
+    setPtyRetention("checking");
+    setRetryIn(null);
+    setConnectSeq((n) => n + 1);
+  }, [tabId]);
 
   const startSharing = useCallback(
     async (options: ShareStartOptions) => {
@@ -479,7 +626,7 @@ export function SshTerminalSession({
   const [awaitingAnswer, setAwaitingAnswer] = useState(false);
 
   // Refs used inside xterm.onData closure for Serverless Streaming Shell mode
-  const modeRef = useRef<"ws" | "serverless">(wsAvailable ? "ws" : "serverless");
+  const modeRef = useRef<"ws" | "serverless">(wsAvailable || gatewaySettings.gatewayUrl.trim() ? "ws" : "serverless");
   /** Mirrors `connectFailure` for the xterm / socket callbacks. */
   const connectFailureRef = useRef<SshConnectFailure | null>(null);
   /** True while the shell is still opening: typing has nowhere to go yet. */
@@ -1725,6 +1872,13 @@ export function SshTerminalSession({
     async function initSession() {
       if (!containerRef.current) return;
       ptyReadyRef.current = false;
+      clearPtyControlTimer();
+      autoRetentionAttemptedRef.current = false;
+      setPtyCapability(retainedPtySupported);
+      setPtyRetention("checking");
+      setPtyRetentionError(null);
+      setResumeProblem(false);
+      setStatus("connecting");
       gatewayForSessionRef.current = { ...gatewaySettings };
       // Every session starts clean: the previous failure (and its countdown) is
       // gone before a byte of the new connection is attempted.
@@ -1796,10 +1950,21 @@ export function SshTerminalSession({
       secretPromptRef.current = null;
       secretBufferRef.current = "";
 
-      const shouldUseWs = Boolean(wsAvailable || gatewaySettings.gatewayUrl.trim());
+      const savedPty = loadRetainedPtys().find((entry) => entry.tabId === tabId);
+      ptySessionIdRef.current = savedPty?.sessionId ?? null;
+      // Either the auth frame handles the default, or a late capability update
+      // may handle it once after the original shell is ready.
+      autoRetentionAttemptedRef.current = Boolean(savedPty || retainedPtySupported);
+      const shouldUseWs = Boolean(savedPty || wsAvailable || gatewaySettings.gatewayUrl.trim());
       modeRef.current = shouldUseWs ? "ws" : "serverless";
       setTransportMode(modeRef.current);
       setStatus("connecting");
+      if (savedPty && !retainedPtyMatches(savedPty, gatewaySettings.gatewayUrl, profile)) {
+        setResumeProblem(true);
+        setPtyRetention("unconfirmed");
+        failConnectRef.current("This saved terminal belongs to a different gateway or host. Restore the original Gateway settings and retry; no new shell was started.");
+        return;
+      }
 
       // Handle user keystrokes across both WS and Serverless modes
       const handleTermData = (data: string) => {
@@ -1808,6 +1973,7 @@ export function SshTerminalSession({
         // is still opening there is nothing to type into either.
         if (connectFailureRef.current || connectingRef.current) return;
         if (modeRef.current === "ws") {
+          if (!ptyReadyRef.current) return;
           const ws = wsRef.current;
           if (ws && ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify({ type: "input", data }));
@@ -2058,19 +2224,46 @@ export function SshTerminalSession({
       if (shouldUseWs) {
         const wsUrl = buildWebSocketUrl("/ws/ssh", gatewaySettings);
         term.writeln(
-          `\x1b[90mConnecting via WebSocket PTY to ${profile.username}@${profile.host}:${profile.port}...\x1b[0m`
+          `\x1b[90m${savedPty ? "Reattaching" : "Connecting"} via WebSocket PTY to ${profile.username}@${profile.host}:${profile.port}...\x1b[0m`
         );
 
         let openedReady = false;
+        let ended = false;
         let fellBack = false;
         let gotServerMessage = false;
         let lastServerError = "";
+        let keepByDefault = true;
+        try { keepByDefault = localStorage.getItem("sushi.keepPtyAlive") !== "0"; } catch { /* storage is checked again below */ }
+        const requestedKeep = !savedPty && retainedPtySupported && keepByDefault;
         const usingRemoteGateway = Boolean(gatewaySettings.gatewayUrl.trim());
         const utf8Decoder = new TextDecoder("utf-8");
         const ws = new WebSocket(wsUrl);
         wsRef.current = ws;
+        connectingRef.current = true;
+
+        const rememberPty = (value: { sessionId?: unknown; idleTtlMs?: unknown } | undefined): boolean => {
+          const id = typeof value?.sessionId === "string" ? value.sessionId : "";
+          const idleTtlMs = Number(value?.idleTtlMs) >= 60000 ? Number(value?.idleTtlMs) : 12 * 60 * 60 * 1000;
+          let gatewayUrl = "";
+          try { gatewayUrl = normalizeShareGateway(gatewaySettings.gatewayUrl); } catch { /* save below fails closed */ }
+          const saved = Boolean(id && (gatewayUrl || !gatewaySettings.gatewayUrl.trim()) && saveRetainedPty({
+            tabId, sessionId: id, gatewayUrl, profile, savedAt: Date.now(), idleTtlMs,
+          }));
+          if (!saved) {
+            setPtyRetention("unconfirmed");
+            setPtyRetentionError("The browser could not save this terminal for reattachment. Keep this tab open, check browser storage, and try again.");
+            return false;
+          }
+          ptySessionIdRef.current = id;
+          setPtyCapability(true);
+          setPtyIdleTtlMs(idleTtlMs);
+          setPtyRetention("on");
+          setPtyRetentionError(null);
+          return true;
+        };
 
         ws.onopen = () => {
+          if (disposed || wsRef.current !== ws) { ws.close(); return; }
           ws.send(
             JSON.stringify({
               type: "auth",
@@ -2078,15 +2271,18 @@ export function SshTerminalSession({
               gatewayToken: gatewaySettings.gatewayToken || undefined,
               cols: term.cols || 100,
               rows: term.rows || 30,
-              credentials: {
-                host: profile.host,
-                port: profile.port,
-                username: profile.username,
-                authMethod: profile.authMethod,
-                password: profile.password,
-                privateKey: profile.privateKey,
-                passphrase: profile.passphrase,
-              },
+              ...(savedPty ? { resumeId: savedPty.sessionId } : {
+                keepAlive: requestedKeep,
+                credentials: {
+                  host: profile.host,
+                  port: profile.port,
+                  username: profile.username,
+                  authMethod: profile.authMethod,
+                  password: profile.password,
+                  privateKey: profile.privateKey,
+                  passphrase: profile.passphrase,
+                },
+              }),
             })
           );
 
@@ -2098,14 +2294,43 @@ export function SshTerminalSession({
         };
 
         ws.onmessage = (event) => {
+          // A queued frame from an old socket must not overwrite the new shell's
+          // saved ID or state after a retry/remount.
+          if (disposed || wsRef.current !== ws) return;
           try {
             const msg = JSON.parse(event.data);
             if (msg.type !== "pong") gotServerMessage = true;
             if (msg.type === "ready") {
+              if (savedPty && (msg.resumed !== true || msg.persistence?.sessionId !== savedPty.sessionId)) {
+                setResumeProblem(true);
+                setPtyRetention("unconfirmed");
+                lastServerError = "The gateway did not confirm reattachment to the saved terminal. No new shell was started.";
+                failConnectRef.current(lastServerError);
+                ws.close();
+                return;
+              }
               openedReady = true;
+              connectingRef.current = false;
               ptyReadyRef.current = true;
               setStatus("connected");
               if (msg.fingerprint) setFingerprint(msg.fingerprint);
+              if (savedPty) {
+                // A bounded copy of the original PTY output; no command or cd is
+                // sent during reattachment, preserving interactive shell state.
+                term.reset();
+                if (typeof msg.replay === "string") {
+                  term.write(utf8Decoder.decode(decodeBase64Bytes(msg.replay), { stream: true }));
+                }
+                if (msg.share) setSharedInfo(msg.share as SharedSessionView);
+              }
+              if (msg.persistence?.sessionId) {
+                rememberPty(msg.persistence);
+              } else if (requestedKeep) {
+                setPtyRetention("unconfirmed");
+                setPtyRetentionError(String(msg.persistence?.error || "This gateway did not confirm that the terminal will stay running. Update the gateway before closing the tab."));
+              } else {
+                setPtyRetention("off");
+              }
               onConnectedRef.current?.();
               term.focus();
               // "Start sharing" pressed while this shell was still connecting.
@@ -2114,7 +2339,7 @@ export function SshTerminalSession({
                 pendingShareRef.current = null;
                 ws.send(JSON.stringify(pendingShare));
               }
-              if (initialPath && initialPath !== "~") {
+              if (!savedPty && initialPath && initialPath !== "~") {
                 ws.send(
                   JSON.stringify({
                     type: "input",
@@ -2127,6 +2352,23 @@ export function SshTerminalSession({
                 stream: true,
               });
               term.write(text);
+            } else if (msg.type === "persistence") {
+              clearPtyControlTimer();
+              if (msg.action === "enabled") {
+                if (rememberPty(msg)) {
+                  try { localStorage.setItem("sushi.keepPtyAlive", "1"); } catch { /* metadata save already checked */ }
+                }
+              } else if (msg.action === "disabled") {
+                const id = typeof msg.sessionId === "string" ? msg.sessionId : ptySessionIdRef.current;
+                const cleared = forgetRetainedPty(tabId, id || undefined);
+                ptySessionIdRef.current = null;
+                setPtyRetention("off");
+                setPtyRetentionError(cleared ? null : "Keep running is off, but browser storage could not be updated. A stale saved terminal may remain in the list.");
+                try { localStorage.setItem("sushi.keepPtyAlive", "0"); } catch { /* preference only */ }
+              } else if (msg.action === "error") {
+                setPtyRetention("unconfirmed");
+                setPtyRetentionError(String(msg.message || "The gateway could not keep this terminal running."));
+              }
             } else if (msg.type === "share") {
               if (msg.action === "started" || msg.action === "rotated") {
                 setSharedInfo((msg.share as SharedSessionView) ?? null);
@@ -2160,12 +2402,13 @@ export function SshTerminalSession({
               );
             } else if (msg.type === "error") {
               lastServerError = String(msg.message || "");
-              // A remote gateway that refuses our tokens closes with 1008 next;
-              // onclose falls back to serverless SSH instead of showing a dead end.
-              if (!(usingRemoteGateway && !openedReady)) {
+              if (savedPty && !openedReady) {
+                // Never fall back to a new serverless shell on a resume failure.
+                setResumeProblem(true);
+                setPtyRetention("unconfirmed");
+                failConnectRef.current(lastServerError || "Could not reattach to the saved terminal. No new shell was started.");
+              } else if (!(usingRemoteGateway && !openedReady)) {
                 if (!openedReady) {
-                  // The PTY never opened: one sentence and the retry card, exactly
-                  // like the serverless transport.
                   failConnectRef.current(lastServerError);
                 } else {
                   setStatus("error");
@@ -2173,6 +2416,16 @@ export function SshTerminalSession({
                 }
               }
             } else if (msg.type === "exit") {
+              ended = true;
+              connectingRef.current = false;
+              ptyReadyRef.current = false;
+              clearPtyControlTimer();
+              const id = ptySessionIdRef.current;
+              if (id && !forgetRetainedPty(tabId, id)) {
+                setPtyRetentionError("The terminal ended, but browser storage could not be updated; a stale saved entry may remain.");
+              }
+              ptySessionIdRef.current = null;
+              setPtyRetention("off");
               setStatus("disconnected");
               term.writeln("\r\n\x1b[33mRemote SSH session ended.\x1b[0m");
             }
@@ -2183,6 +2436,13 @@ export function SshTerminalSession({
 
         ws.onerror = () => {
           if (!openedReady && !disposed && !fellBack) {
+            if (savedPty) {
+              setResumeProblem(true);
+              setPtyRetention("unconfirmed");
+              failConnectRef.current("Could not reach the saved terminal's gateway. Reconnect to try the same session; no new shell was started.");
+              ws.close();
+              return;
+            }
             fellBack = true;
             ws.close();
             switchToServerlessShell(
@@ -2204,10 +2464,25 @@ export function SshTerminalSession({
           if (openedReady) {
             setShareBusy(false);
             setStatus("disconnected");
-            // This socket is gone, so this tab no longer hosts that share. The
-            // shell itself keeps running for whoever is still attached.
+            connectingRef.current = false;
+            if (ptyControlTimerRef.current) clearPtyControlTimer();
+            if (!ended) {
+              setPtyRetention("unconfirmed");
+              setPtyRetentionError(ptySessionIdRef.current
+                ? "Disconnected. Reconnect to check the same saved terminal; it may still be running on the gateway."
+                : "Disconnected. This terminal was not confirmed as saved for reattachment.");
+              if (ptySessionIdRef.current) {
+                term.writeln("\r\n\x1b[33mDisconnected. Reconnect to try the same saved terminal; it may still be running on the gateway.\x1b[0m");
+              }
+            }
             setSharedInfo(null);
             setSharePasscode(null);
+            return;
+          }
+          if (savedPty) {
+            setResumeProblem(true);
+            setPtyRetention("unconfirmed");
+            if (!connectFailureRef.current) failConnectRef.current(lastServerError || "The saved terminal's gateway disconnected. No new shell was started; retry to reattach.");
             return;
           }
           if (fellBack) return;
@@ -2298,6 +2573,8 @@ export function SshTerminalSession({
 
     return () => {
       disposed = true;
+      ptyReadyRef.current = false;
+      clearPtyControlTimer();
       if (pingInterval) clearInterval(pingInterval);
       resizeObserver?.disconnect();
       abortExecRef.current?.abort();
@@ -2309,8 +2586,8 @@ export function SshTerminalSession({
 
   /**
    * Automatic retry: a failure that looks like a network problem is tried again
-   * after `SSH_RETRY_DELAY_SECONDS`. Reconnecting starts a whole new session, so it
-   * also clears the card, the terminal and any half-typed line.
+   * after `SSH_RETRY_DELAY_SECONDS`. A saved PTY is always reattached by ID; an
+   * ordinary failed connection is retried as a new session.
    */
   useEffect(() => {
     if (retryIn === null) return;
@@ -2325,11 +2602,13 @@ export function SshTerminalSession({
     return () => clearTimeout(timer);
   }, [retryIn]);
 
-  /** Reconnect button: retry now and push the countdown back. */
+  /** Reconnect a saved PTY by ID, or explicitly warn before replacing a live one. */
   const reconnectNow = useCallback(() => {
+    if (modeRef.current === "ws" && ptyReadyRef.current && !(ptyRetention === "on" && hasCurrentSavedPty()) &&
+        !window.confirm("This terminal is not confirmed as saved. Reconnecting will replace its shell and may stop its running command. Reconnect anyway?")) return;
     setRetryIn(null);
     setConnectSeq((n) => n + 1);
-  }, []);
+  }, [hasCurrentSavedPty, ptyRetention]);
 
   // Update theme & font size dynamically without dropping SSH session!
   useEffect(() => {
@@ -2874,28 +3153,54 @@ export function SshTerminalSession({
             <Trash2 className="h-3.5 w-3.5" />
           </button>
 
-          {/* No-timeout toggle for serverless commands */}
-          <button
-            type="button"
-            onClick={() => {
-              const next = !noTimeout;
-              setNoTimeout(next);
-              try {
-                localStorage.setItem("sushi.noTimeout", next ? "1" : "0");
-              } catch {
-                // private mode — just keep it for this session
-              }
-            }}
-            className={`flex items-center gap-1 rounded-lg border px-2.5 py-1 text-xs transition ${
-              noTimeout
-                ? "border-emerald-500/40 bg-emerald-500/15 text-emerald-200 hover:bg-emerald-500/25"
-                : "border-white/10 bg-white/5 text-slate-200 hover:bg-white/10"
-            }`}
-            title="No timeout (serverless shell): prompts like [y/n] wait forever, and the command keeps running on the host even if the internet drops — output is logged to a /tmp file and keys still reach it"
-          >
-            <Infinity className="h-3.5 w-3.5" />
-            <span className="hidden sm:inline">No timeout</span>
-          </button>
+          {/* Serverless runs and live PTYs have different persistence mechanisms. */}
+          {transportMode === "serverless" ? (
+            <button
+              type="button"
+              onClick={() => {
+                const next = !noTimeout;
+                setNoTimeout(next);
+                try { localStorage.setItem("sushi.noTimeout", next ? "1" : "0"); } catch { /* preference only */ }
+              }}
+              aria-pressed={noTimeout}
+              className={`flex items-center gap-1 rounded-lg border px-2.5 py-1 text-xs transition ${
+                noTimeout
+                  ? "border-emerald-500/40 bg-emerald-500/15 text-emerald-200 hover:bg-emerald-500/25"
+                  : "border-white/10 bg-white/5 text-slate-200 hover:bg-white/10"
+              }`}
+              title="No timeout for serverless commands: keep the command on the host and resume its log and input channel"
+            >
+              <Infinity className="h-3.5 w-3.5" />
+              <span className="hidden sm:inline">No timeout</span>
+            </button>
+          ) : (
+            <>
+              <button
+                type="button"
+                onClick={togglePtyRetention}
+                disabled={!ptyCapability || status !== "connected" || ptyRetention === "pending"}
+                aria-pressed={ptyRetention === "on"}
+                className={`flex items-center gap-1 rounded-lg border px-2.5 py-1 text-xs transition disabled:cursor-not-allowed disabled:opacity-60 ${
+                  ptyRetention === "on"
+                    ? "border-emerald-500/40 bg-emerald-500/15 text-emerald-200 hover:bg-emerald-500/25"
+                    : "border-amber-500/35 bg-amber-500/10 text-amber-100 hover:bg-amber-500/20"
+                }`}
+                title={ptyCapability
+                  ? "Keep this private PTY on the gateway when the tab closes; click to change."
+                  : "This gateway does not advertise private terminal retention. Update it before relying on tab-close resume."}
+              >
+                {ptyRetention === "pending" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Infinity className="h-3.5 w-3.5" />}
+                <span>{ptyRetention === "on" ? "Keep running on" : ptyRetention === "pending" || ptyRetention === "checking" ? "Checking…" : ptyRetention === "unconfirmed" ? "Keep running unconfirmed" : "Keep running off"}</span>
+              </button>
+              {ptyCapability && status === "connected" && (
+                <button type="button" onClick={endPty}
+                  className="flex items-center gap-1 rounded-lg border border-rose-500/35 bg-rose-500/12 px-2.5 py-1 text-xs text-rose-200 hover:bg-rose-500/22"
+                  title="End this SSH terminal and disconnect anyone sharing it">
+                  <Square className="h-3 w-3 fill-current" /> End terminal
+                </button>
+              )}
+            </>
+          )}
 
           {/* Stop all background SSH processes on this host */}
           <button
@@ -2917,7 +3222,7 @@ export function SshTerminalSession({
           {/* Reconnect */}
           <button
             type="button"
-            onClick={() => setConnectSeq((n) => n + 1)}
+            onClick={reconnectNow}
             className="flex items-center gap-1 rounded-lg border border-white/10 bg-white/5 px-2.5 py-1 text-xs text-slate-200 transition hover:bg-white/10"
             title="Reconnect SSH session"
           >
@@ -2926,6 +3231,29 @@ export function SshTerminalSession({
           </button>
         </div>
       </div>
+
+      {transportMode === "ws" && ptyRetention === "on" && status === "connected" && (
+        <div role="status" className="border-b border-emerald-500/20 bg-emerald-500/[0.06] px-4 py-1.5 text-[11px] text-emerald-100">
+          Saved for reattachment in this browser while the gateway stays online. Detached idle limit: {ptyIdleTtlMs >= 3600000 ? `${Math.round(ptyIdleTtlMs / 3600000)}h` : `${Math.round(ptyIdleTtlMs / 60000)}m`}.
+          Interactive prompts may still wait for your answer.
+        </div>
+      )}
+      {transportMode === "ws" && (ptyRetentionError || (status === "connected" && ptyRetention !== "on" && ptyRetention !== "pending")) && (
+        <div role="status" className="border-b border-amber-500/25 bg-amber-500/10 px-4 py-1.5 text-[11px] text-amber-100">
+          {ptyRetentionError || (!ptyCapability
+            ? "This gateway does not support private terminal retention. Update the gateway before closing this tab."
+            : "Keep running is off. Closing the tab may end this SSH terminal and its running command.")}
+        </div>
+      )}
+      {resumeProblem && (
+        <div role="alert" className="flex flex-wrap items-center justify-between gap-2 border-b border-amber-500/25 bg-amber-500/10 px-4 py-2 text-[11px] text-amber-100">
+          <span>No new shell or command was started. Retry the saved terminal, or explicitly forget it and connect a new shell. An ad-hoc connection may need its credentials again.</span>
+          <span className="flex shrink-0 gap-2">
+            <button type="button" onClick={onOpenGatewayModal} className="rounded border border-white/15 px-2 py-1 hover:bg-white/10">Gateway settings</button>
+            <button type="button" onClick={forgetAndStartNew} className="rounded border border-amber-400/40 px-2 py-1 hover:bg-amber-500/20">Forget &amp; connect new shell</button>
+          </span>
+        </div>
+      )}
 
       {/* Following a command that was started before this tab existed. */}
       {reattached && currentRun && (

@@ -190,6 +190,8 @@ export interface SystemCapabilities {
   sharedSsh?: boolean;
   /** Remote account joins accept share-scoped frontend-signed tickets. */
   shareAccountTickets?: boolean;
+  /** Private PTYs can be retained and authenticated owners can reattach. */
+  retainedSshPty?: boolean;
   serverVault: boolean;
   storageBackend?: "disk" | "redis" | "turso" | "firestore" | "none";
   requiresGatewayToken: boolean;

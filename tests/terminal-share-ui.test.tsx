@@ -51,6 +51,7 @@ async function main() {
     assert.equal(number(), "39");
 
     const html = renderToStaticMarkup(<SshTerminalSession
+      tabId="fixture-tab" retainedPtySupported
       profile={{ id: "p", name: "fixture", protocol: "ssh", host: "example.test", port: 22, username: "alice", authMethod: "password", createdAt: 1, updatedAt: 1 }}
       isActive wsAvailable gatewaySettings={{ gatewayUrl: "", gatewayToken: "" }} snippets={[]}
       onOpenCompanionSftp={() => {}} onOpenRdp={() => {}} onOpenGatewayModal={() => {}} />);

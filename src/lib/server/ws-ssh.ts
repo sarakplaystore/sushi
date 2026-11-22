@@ -9,6 +9,7 @@ import {
   generateSharePasscode,
   registerSharedSession,
   getSharedSession,
+  getRetainedSshSession,
   sharedSessionLimits,
 } from "./shared-ssh";
 import { parseShareAccountIssuer, verifyShareTicket, type ShareAccountIssuer } from "./share-ticket";
@@ -84,7 +85,9 @@ export function handleSshConnection(ws: WebSocket, req: IncomingMessage): void {
   let publishedShare: SharedSshSession | null = null;
   let authenticated = false;
   let authInProgress = false;
-  let shareCredentials: ConnectionCredentials | null = null;
+  // Only identity is needed when retaining/sharing; do not keep SSH secrets in
+  // the long-lived socket closure after the connection has been established.
+  let shareCredentials: Pick<ConnectionCredentials, "host" | "port" | "username"> | null = null;
   let lastCols = 100;
   let lastRows = 30;
   const priorOutput: Buffer[] = [];
@@ -166,9 +169,15 @@ export function handleSshConnection(ws: WebSocket, req: IncomingMessage): void {
     finished = true;
     clearTimeout(authTimeout);
     if (shared && participantId) {
-      shared.detach(participantId);
+      const session = shared;
+      session.detach(participantId);
       shared = null;
       participantId = null;
+      // Disabling retention restores normal close-on-detach for a private shell.
+      // Public shares retain their existing detached-sharing behavior.
+      if (!session.isShared && !session.isRetained && session.participantCount === 0) {
+        session.destroy("Terminal closed after retention was disabled.");
+      }
       return;
     }
     cleanup();
@@ -257,6 +266,85 @@ export function handleSshConnection(ws: WebSocket, req: IncomingMessage): void {
     session.broadcastParticipants();
   };
 
+  // ---- private, resumable PTY --------------------------------------------------
+
+  const attachPublisher = (session: SharedSshSession, name?: string) => {
+    shared = session;
+    publishedShare = session;
+    const entry = session.attach(ws, {
+      role: "owner", name, canWrite: true, cols: lastCols, rows: lastRows,
+    });
+    participantId = entry.id;
+    // Legacy unretained shares return to their original private socket on revoke.
+    // Retained sessions instead keep the routing object when sharing stops.
+    session.onRevokedByApi = () => {
+      mintedPasscode = null;
+      if (shared === session) { shared = null; participantId = null; }
+      if (publishedShare === session) publishedShare = null;
+    };
+    return entry;
+  };
+
+  const enableRetention = (): { sessionId?: string; idleTtlMs?: number; error?: string } => {
+    if (shared) {
+      if (shared !== publishedShare || !participantId) return { error: "Only the terminal owner can keep it running." };
+      shared.enableRetention();
+      return { sessionId: shared.retainedId, idleTtlMs: sharedSessionLimits().idleTtlMs };
+    }
+    if (!sshSession || !shellStream || !shareCredentials) return { error: "Connect the terminal first." };
+    const session = new SharedSshSession({
+      host: shareCredentials.host.trim(), port: Number(shareCredentials.port || 22),
+      username: shareCredentials.username.trim(), ssh: sshSession, stream: shellStream,
+      cols: lastCols, rows: lastRows, write: true, passcode: null, privateRetention: true,
+    });
+    const registered = registerSharedSession(session);
+    if (!registered.ok) return { error: registered.error || "Could not keep this terminal running." };
+    for (const chunk of priorOutput) session.handleOutput(chunk);
+    attachPublisher(session);
+    return { sessionId: session.retainedId, idleTtlMs: sharedSessionLimits().idleTtlMs };
+  };
+
+  const resumeRetained = async (
+    sessionId: string,
+    cols: number,
+    rows: number,
+    tokens: { session?: string | null; gateway?: string | null }
+  ) => {
+    // An ID is an identifier, not a bearer credential. Check the gateway key or
+    // the local Sushi account before revealing whether a retained PTY exists.
+    const access = await verifyRequestAccess(withBrowserTokenHeaders(req.headers, tokens))
+      .catch(() => ({ ok: false, error: "Could not verify terminal access." }));
+    if (finished) return;
+    if (!access.ok) {
+      sendJson({ type: "error", code: "RESUME_UNAUTHORIZED", message: access.error || "Sign in to resume this terminal." });
+      closeSocket(1008, "Unauthorized");
+      return;
+    }
+    const session = getRetainedSshSession(sessionId);
+    if (!session) {
+      sendJson({ type: "error", code: "RESUME_NOT_FOUND", message: "The previous terminal is no longer available. It may have ended, expired, or its gateway restarted." });
+      closeSocket(1008, "Terminal not found");
+      return;
+    }
+    authenticated = true;
+    clearTimeout(authTimeout);
+    lastCols = cols;
+    lastRows = rows;
+    sshSession = session.ssh;
+    shellStream = session.stream;
+    shared = session;
+    publishedShare = session;
+    const entry = session.attach(ws, { role: "owner", name: "Host", canWrite: true, cols, rows });
+    participantId = entry.id;
+    sendJson({
+      type: "ready", resumed: true,
+      persistence: { sessionId: session.retainedId, idleTtlMs: sharedSessionLimits().idleTtlMs },
+      replay: session.replay().toString("base64"),
+      ...(session.isShared ? { share: { ...session.summary(), participantId: entry.id } } : {}),
+    });
+    if (session.isShared) session.broadcastParticipants();
+  };
+
   // ---- publishing this socket's shell ------------------------------------------
 
   const startSharing = (options: {
@@ -266,7 +354,7 @@ export function handleSshConnection(ws: WebSocket, req: IncomingMessage): void {
     name?: string;
     accountIssuer?: unknown;
   }) => {
-    if (shared || !sshSession || !shellStream) {
+    if (!sshSession || !shellStream || (shared && (shared !== publishedShare || !participantId || shared.isShared))) {
       sendJson({ type: "share", action: "error", message: "Connect the terminal before sharing it." });
       return;
     }
@@ -274,6 +362,19 @@ export function handleSshConnection(ws: WebSocket, req: IncomingMessage): void {
       ? null : parseShareAccountIssuer(options.accountIssuer);
     if (options.accountIssuer !== undefined && !accountIssuer) {
       sendJson({ type: "share", action: "error", message: "The account verifier or gateway address is invalid." });
+      return;
+    }
+
+    if (shared && participantId) {
+      // Promote a private retained PTY in place; no SSH command is restarted.
+      mintedPasscode = shared.publish({
+        write: options.write !== false,
+        passcode: normalizePasscodeRequest(options.passcode),
+        accountIssuer,
+      });
+      shared.broadcastOwners({ type: "share", action: "started", passcode: mintedPasscode || undefined,
+        share: shared.summary() });
+      shared.broadcastParticipants();
       return;
     }
 
@@ -300,25 +401,7 @@ export function handleSshConnection(ws: WebSocket, req: IncomingMessage): void {
     // twice while a new guest can see output from before sharing was enabled.
     for (const chunk of priorOutput) session.handleOutput(chunk);
 
-    shared = session;
-    publishedShare = session;
-    const entry = session.attach(ws, {
-      role: "owner",
-      name: options.name,
-      canWrite: true,
-      cols: lastCols,
-      rows: lastRows,
-    });
-    participantId = entry.id;
-    // A stop issued from the HTTP API must return this socket to a private shell.
-    session.onRevokedByApi = () => {
-      mintedPasscode = null;
-      if (shared === session) {
-        shared = null;
-        participantId = null;
-      }
-      if (publishedShare === session) publishedShare = null;
-    };
+    const entry = attachPublisher(session, options.name);
 
     const summary = session.summary();
     sendJson({
@@ -333,30 +416,29 @@ export function handleSshConnection(ws: WebSocket, req: IncomingMessage): void {
   };
 
   const stopSharing = () => {
-    if (!shared || !participantId) return;
+    if (!shared || !participantId || !shared.isShared) return;
     const session = shared;
+    mintedPasscode = null;
+    if (session.usesManagedRouting) {
+      // The retained PTY stays private and its owner remains attached.
+      session.revoke("The host stopped sharing this session.", { notifyOwner: true });
+      return;
+    }
     shared = null;
     participantId = null;
-    mintedPasscode = null;
     if (publishedShare === session) publishedShare = null;
-    // Guests are disconnected; the host keeps the shell in their own tab.
     session.revoke("The host stopped sharing this session.");
     sendJson({ type: "share", action: "stopped" });
   };
 
   const rotatePasscode = () => {
-    if (!shared || !participantId) {
+    if (!shared || !participantId || !shared.isShared) {
       sendJson({ type: "error", message: "This terminal is not being shared." });
       return;
     }
     const code = shared.rotatePasscode("auto");
     mintedPasscode = code;
-    sendJson({
-      type: "share",
-      action: "rotated",
-      passcode: code || undefined,
-      share: shared.summary(),
-    });
+    shared.notifyPublisherOfRotation(code);
   };
 
   /** The code shown to the host, kept only so the create message can echo it back. */
@@ -378,6 +460,17 @@ export function handleSshConnection(ws: WebSocket, req: IncomingMessage): void {
     if (msg.type === "auth" && !authenticated) {
       if (authInProgress || finished) return;
       authInProgress = true;
+      const tokens = {
+        session: (typeof msg.sessionToken === "string" ? msg.sessionToken.trim() : "") || reqUrl.searchParams.get("session"),
+        gateway: (typeof msg.gatewayToken === "string" ? msg.gatewayToken.trim() : "") || queryToken,
+      };
+      if (msg.resumeId !== undefined) {
+        const resumeId = typeof msg.resumeId === "string" && /^[A-Za-z0-9_-]{8,64}$/.test(msg.resumeId)
+          ? msg.resumeId : "";
+        await resumeRetained(resumeId, clamp(msg.cols, 100, MIN_COLS, MAX_COLS),
+          clamp(msg.rows, 30, MIN_ROWS, MAX_ROWS), tokens);
+        return;
+      }
       // Joining a shared shell is the one request that carries no SSH credentials.
       const share = asSharePayload(msg.share);
       const joinId = typeof share?.join === "string" ? share.join.trim() : "";
@@ -387,10 +480,7 @@ export function handleSshConnection(ws: WebSocket, req: IncomingMessage): void {
           share ?? {},
           clamp(msg.cols, 100, MIN_COLS, MAX_COLS),
           clamp(msg.rows, 30, MIN_ROWS, MAX_ROWS),
-          {
-            session: (typeof msg.sessionToken === "string" ? msg.sessionToken.trim() : "") || reqUrl.searchParams.get("session"),
-            gateway: (typeof msg.gatewayToken === "string" ? msg.gatewayToken.trim() : "") || queryToken,
-          }
+          tokens
         );
         return;
       }
@@ -422,7 +512,7 @@ export function handleSshConnection(ws: WebSocket, req: IncomingMessage): void {
       clearTimeout(authTimeout);
       lastCols = clamp(msg.cols, 100, MIN_COLS, MAX_COLS);
       lastRows = clamp(msg.rows, 30, MIN_ROWS, MAX_ROWS);
-      shareCredentials = creds;
+      shareCredentials = { host: creds.host, port: creds.port, username: creds.username };
 
       const shareRequest = asSharePayload(msg.share)?.create;
       const createOptions =
@@ -486,10 +576,14 @@ export function handleSshConnection(ws: WebSocket, req: IncomingMessage): void {
             }
 
             shellStream = stream;
+            // Register before acknowledging readiness: a browser crash immediately
+            // after `ready` must not race a best-effort unload handler.
+            const persistence = msg.keepAlive === true ? enableRetention() : undefined;
             sendJson({
               type: "ready",
               fingerprint: sshSession?.fingerprint,
               banner: sshSession?.serverBanner,
+              ...(persistence ? { persistence } : {}),
             });
 
             stream.on("data", (chunk: Buffer) => {
@@ -553,6 +647,39 @@ export function handleSshConnection(ws: WebSocket, req: IncomingMessage): void {
 
     if (!authenticated) return;
 
+    if (msg.type === "persistence") {
+      // Passcode and scoped-ticket guests never gain control over retention or
+      // lifecycle, even if they send protocol frames by hand.
+      if (shared && (shared !== publishedShare || !participantId)) {
+        sendJson({ type: "persistence", action: "error", message: "Only the terminal owner can change retention." });
+        return;
+      }
+      if (msg.action === "enable") {
+        const result = enableRetention();
+        if (result.sessionId && shared) {
+          shared.broadcastOwners({ type: "persistence", action: "enabled", ...result });
+        } else {
+          sendJson({ type: "persistence", action: "error", message: result.error });
+        }
+      } else if (msg.action === "disable") {
+        if (shared) {
+          shared.disableRetention();
+          shared.broadcastOwners({ type: "persistence", action: "disabled", sessionId: shared.retainedId });
+        } else {
+          sendJson({ type: "persistence", action: "disabled" });
+        }
+      } else if (msg.action === "end") {
+        if (shared) {
+          shared.destroy("The terminal owner ended the SSH session.");
+        } else if (shellStream) {
+          sendJson({ type: "exit", reason: "The terminal owner ended the SSH session." });
+          cleanup();
+          closeSocket(1000, "Terminal ended");
+        }
+      }
+      return;
+    }
+
     if (msg.type === "input") {
       const data = msg.data;
       if (typeof data !== "string" || data.length === 0) return;
@@ -602,7 +729,7 @@ export function handleSshConnection(ws: WebSocket, req: IncomingMessage): void {
       } else if (msg.action === "stop" || msg.action === "rotate") {
         // A passcode guest can send arbitrary WebSocket frames. Only the socket
         // that published this shell may change or revoke the share.
-        if (!shared || shared !== publishedShare || !participantId) {
+        if (!shared || !shared.isShared || shared !== publishedShare || !participantId) {
           sendJson({ type: "share", action: "error", message: "Only the host can manage this share." });
           return;
         }

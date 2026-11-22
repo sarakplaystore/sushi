@@ -12,7 +12,24 @@
 
 **Sushi** is a self-hosted web workspace (with optional Vercel deployment) for **SSH**, **SFTP**, and **RDP** remote infrastructure management.
 
-It is designed around a **Hybrid VPS + Serverless Architecture**:
+## One-click Docker install
+
+On a Linux server, run:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/sarakplaystore/sushi/main/scripts/install-vps.sh | bash
+```
+
+Choose the web UI port when prompted (default: **3000**). The installer builds
+Sushi and starts it with Docker Compose and guacd. If Docker is missing, it runs
+the official Docker installation script with administrator privileges. Create
+an admin account and use HTTPS before exposing Sushi publicly.
+
+[Installation details, options and upgrade precautions →](#quick-start)
+
+---
+
+Sushi is designed around a **Hybrid VPS + Serverless Architecture**:
 - **Self-Hosted on a VPS (Docker Compose or Node.js)**: Runs a unified HTTP + WebSocket server (`server.ts`) paired with Apache Guacamole's `guacd` daemon for full interactive `xterm.js` PTY SSH terminals, graphical SFTP file management + remote code editing, and live 60fps HTML5 Remote Desktop (RDP) sessions.
 - **Deployed on Vercel (Serverless Node.js)**: Uses Google Cloud Firestore or a Redis-compatible REST database for a persistent account and cross-device vault (see setup below). Graphical **SFTP** file browsing/uploads/downloads/editing, **Serverless Streaming SSH** execution, and **MS-RDPBCGR X.224 / TLS / NLA** server probes work natively on Vercel Serverless Functions — and you can optionally link any Gateway URL (`wss://...`) inside the UI to unlock persistent WebSocket PTY shells and live browser RDP streaming — hosted on a **VPS**, on **Railway** ([`.railway/railway.ts`](.railway/railway.ts) deploys the gateway *and* `guacd`), or on **Render** ([`render.yaml`](render.yaml)), all three built from the slim [`Dockerfile.gateway`](Dockerfile.gateway).
 
@@ -424,12 +441,8 @@ The database is parsed with SQLite compiled to WebAssembly (`sql.js`) and decryp
 
 ## Quick Start
 
-**Recommended: install Sushi and its WebSocket gateway together with Docker Compose**
-(Web UI + SSH + SFTP + guacd for RDP). On a Linux server, run:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/sarakplaystore/sushi/main/scripts/install-vps.sh | bash
-```
+**Recommended: use the [one-click Docker installer](#one-click-docker-install)**
+for Sushi's Web UI, SSH, SFTP and guacd for RDP on a Linux server.
 
 The installer asks for the **web UI port**, defaulting to `3000`; choose an unused
 port from 1–65535. The app listens on that host port and uses port 3000 inside the

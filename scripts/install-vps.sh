@@ -9,6 +9,7 @@
 #
 #   # or from a checkout, with options:
 #   bash scripts/install-vps.sh --port 8080
+#   bash scripts/install-vps.sh --yes                           # non-interactive restart
 #   bash scripts/install-vps.sh --https sushi.example.com      # + Caddy & automatic HTTPS
 #   bash scripts/install-vps.sh --prebuilt                      # pull ghcr.io image, no build
 #   bash scripts/install-vps.sh --node                          # no Docker: Node.js
@@ -31,6 +32,8 @@ HTTPS_DOMAIN=""
 MODE="build"          # build | prebuilt | node
 INSTALL_DIR="${SUSHI_DIR:-$PWD/sushi}"
 WAIT_SECONDS=180
+ASSUME_YES=0
+COMPOSE_KIND=""
 
 bold() { printf '\033[1m==> %s\033[0m\n' "$*"; }
 ok()   { printf '  \033[32m✔\033[0m %s\n' "$*"; }
@@ -38,22 +41,36 @@ warn() { printf '  \033[33m!\033[0m %s\n' "$*"; }
 die()  { printf '\033[31m✘ %s\033[0m\n' "$*" >&2; exit 1; }
 
 usage() {
-  sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
-  exit 0
+  cat <<'HELP'
+Sushi Docker installer (Linux)
+Usage: bash install-vps.sh [options]
+  --port PORT       Web UI port (1–65535; default 3000)
+  --dir PATH        Install directory (default ./sushi)
+  --yes             Allow restarting an existing running Sushi container
+  --prebuilt        Use the published image instead of building from source
+  --https DOMAIN    Configure Caddy for HTTPS
+  --node            Install with Node.js instead of Docker
+  --timeout SECONDS Time to wait for health (default 180)
+  -h, --help        Show this help
+HELP
 }
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --port) [ $# -ge 2 ] || die "--port requires a value"; PORT="$2"; PORT_EXPLICIT=1; shift 2 ;;
-    --dir) INSTALL_DIR="$2"; shift 2 ;;
-    --https) HTTPS_DOMAIN="$2"; shift 2 ;;
+    --dir) [ $# -ge 2 ] || die "--dir requires a value"; INSTALL_DIR="$2"; shift 2 ;;
+    --https) [ $# -ge 2 ] || die "--https requires a value"; HTTPS_DOMAIN="$2"; shift 2 ;;
     --prebuilt) MODE="prebuilt"; shift ;;
     --node) MODE="node"; shift ;;
-    --timeout) WAIT_SECONDS="$2"; shift 2 ;;
-    -h|--help) usage ;;
+    --timeout) [ $# -ge 2 ] || die "--timeout requires a value"; WAIT_SECONDS="$2"; shift 2 ;;
+    --yes) ASSUME_YES=1; shift ;;
+    -h|--help) usage; exit 0 ;;
     *) die "Unknown option: $1 (try --help)" ;;
   esac
 done
+
+[[ "$WAIT_SECONDS" =~ ^[0-9]{1,6}$ ]] || die "--timeout must be a non-negative number of seconds."
+WAIT_SECONDS="$((10#$WAIT_SECONDS))"
 
 # Keep later cd/Compose/systemd paths stable for relative --dir values.
 case "$INSTALL_DIR" in /*) ;; *) INSTALL_DIR="$PWD/$INSTALL_DIR" ;; esac
@@ -139,24 +156,48 @@ ensure_git_and_curl() {
 }
 
 install_docker() {
-  have docker && return 0
-  warn "Docker not found — installing it (official convenience script)…"
-  curl -fsSL https://get.docker.com | $SUDO sh
-  $SUDO systemctl enable --now docker 2>/dev/null || true
-  if [ "$(id -u)" -ne 0 ] && ! docker info >/dev/null 2>&1; then
-    $SUDO usermod -aG docker "$USER" 2>/dev/null || true
-    warn "Added $USER to the docker group — log out and back in if docker asks for permission."
+  if ! have docker; then
+    warn "Docker not found — installing it (official convenience script)…"
+    local installer
+    installer="$(mktemp)"
+    if ! curl -fsSL https://get.docker.com -o "$installer"; then
+      rm -f "$installer"
+      die "Could not download the Docker installer; no installation was attempted."
+    fi
+    if ! $SUDO sh "$installer" </dev/null; then
+      rm -f "$installer"
+      die "Docker installation failed. See https://docs.docker.com/engine/install/"
+    fi
+    rm -f "$installer"
+    $SUDO systemctl enable --now docker 2>/dev/null || true
+    have docker || die "Docker install failed. See https://docs.docker.com/engine/install/"
   fi
-  have docker || die "Docker install failed. See https://docs.docker.com/engine/install/"
-  ok "Docker installed"
+  if ! $SUDO docker info >/dev/null 2>&1; then
+    die "Cannot access the Docker daemon. Start Docker and check permissions, then rerun (try: sudo docker info)."
+  fi
+  if $SUDO docker compose version >/dev/null 2>&1; then COMPOSE_KIND=v2
+  elif have docker-compose && $SUDO docker-compose version >/dev/null 2>&1; then COMPOSE_KIND=v1
+  else die "Docker Compose is missing. Install the Docker Compose plugin, then rerun."
+  fi
+  if [ "$MODE" = prebuilt ] && [ "$COMPOSE_KIND" = v1 ]; then
+    die "--prebuilt requires Docker Compose v2; install the Compose plugin or omit --prebuilt to build locally."
+  fi
+  ok "Docker daemon and Compose are available"
 }
 
-# Compose v1 fallback keeps older VPS images working.
-compose() {
-  if docker compose version >/dev/null 2>&1; then docker compose "$@"
-  elif have docker-compose; then docker-compose "$@"
-  else die "Docker Compose is missing (install docker-compose-plugin)."
+confirm_existing_container() {
+  local running answer tty_input=""
+  running="$($SUDO docker inspect --format '{{.State.Running}}' sushi 2>/dev/null || true)"
+  [ "$running" = "true" ] || return 0
+  warn "A Sushi container is already running. Rebuilding or restarting it can terminate its active SSH terminals."
+  [ "$ASSUME_YES" -eq 1 ] && return 0
+  if [ -t 0 ]; then tty_input=/dev/stdin
+  elif ( : </dev/tty ) 2>/dev/null; then tty_input=/dev/tty
   fi
+  [ -n "$tty_input" ] || die "No terminal for confirmation. Finish important commands, then rerun with --yes to allow restart."
+  printf 'Continue and potentially restart it? [y/N]: ' >&2
+  IFS= read -r answer <"$tty_input" || die "Installation cancelled; the running container was not changed."
+  case "$answer" in y|Y|yes|YES|Yes) ;; *) die "Installation cancelled; the running container was not changed." ;; esac
 }
 
 ensure_node() {
@@ -185,13 +226,20 @@ ensure_source() {
   if [ -f "$INSTALL_DIR/package.json" ]; then
     ok "Using existing checkout at $INSTALL_DIR"
     if [ -d "$INSTALL_DIR/.git" ]; then
-      ( cd "$INSTALL_DIR" && git pull --ff-only >/dev/null 2>&1 ) && ok "Updated the existing checkout" || warn "Could not git pull — continuing with the local copy"
+      local branch changes
+      branch="$(git -C "$INSTALL_DIR" branch --show-current 2>/dev/null || true)"
+      changes="$(git -C "$INSTALL_DIR" status --porcelain --untracked-files=no 2>/dev/null || true)"
+      if [ "$branch" != main ] || [ -n "$changes" ]; then
+        warn "Checkout is not a clean main branch; using it without pulling. Review it before upgrading."
+      else
+        ( cd "$INSTALL_DIR" && GIT_TERMINAL_PROMPT=0 git pull --ff-only </dev/null >/dev/null 2>&1 ) && ok "Updated the existing checkout" || warn "Could not git pull — continuing with the local copy"
+      fi
     fi
     return 0
   fi
   bold "Downloading Sushi into $INSTALL_DIR…"
   mkdir -p "$(dirname "$INSTALL_DIR")"
-  if git clone --depth 1 --branch main "$REPO_URL" "$INSTALL_DIR"; then ok "Source downloaded"; else die "git clone failed"; fi
+  if GIT_TERMINAL_PROMPT=0 git clone --depth 1 --branch main "$REPO_URL" "$INSTALL_DIR" </dev/null; then ok "Source downloaded"; else die "git clone failed"; fi
 }
 
 write_env() {
@@ -227,20 +275,26 @@ write_env() {
 }
 
 wait_for_http() {
-  local url="http://127.0.0.1:${PORT}/api/system/capabilities" waited=0
+  local url="http://127.0.0.1:${PORT}/api/system/capabilities" waited=0 response=""
   bold "Waiting for Sushi to answer on port ${PORT} (up to ${WAIT_SECONDS}s)…"
   while [ "$waited" -lt "$WAIT_SECONDS" ]; do
-    if curl -fsS -m 5 "$url" >/dev/null 2>&1; then ok "Sushi is answering"; return 0; fi
+    # Check identifying capability fields, not just any 200 response on the port.
+    if response="$(curl -fsS -m 5 "$url" 2>/dev/null)" &&
+       printf '%s' "$response" | grep -Eq '"mode"[[:space:]]*:[[:space:]]*"vps"' &&
+       printf '%s' "$response" | grep -Eq '"websocketSsh"[[:space:]]*:[[:space:]]*true'; then
+      ok "Sushi is answering with WebSocket SSH available"
+      return 0
+    fi
     sleep 3; waited=$((waited + 3))
   done
-  warn "No answer yet — the container may still be starting. Check: docker compose logs -f sushi"
+  warn "Sushi did not answer with the expected capabilities. Check the Compose logs and port ${PORT}."
   return 1
 }
 
 setup_https() {
   [ -n "$HTTPS_DOMAIN" ] || return 0
   bold "Configuring Caddy for automatic HTTPS on $HTTPS_DOMAIN…"
-  if ! have caddy && ! have apt-get; then warn "Skipping Caddy setup (no apt on this host)"; return 0; fi
+  if ! have caddy && ! have apt-get; then die "Cannot configure Caddy automatically on this host. Install Caddy and configure HTTPS manually."; fi
   if ! have caddy; then
     $SUDO apt-get install -y -qq debian-keyring debian-archive-keyring apt-transport-https curl gnupg >/dev/null
     curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | $SUDO gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
@@ -248,12 +302,12 @@ setup_https() {
     $SUDO apt-get update -qq && $SUDO apt-get install -y -qq caddy
   fi
   local conf=/etc/caddy/Caddyfile
-  if $SUDO grep -q "$HTTPS_DOMAIN" "$conf" 2>/dev/null; then ok "Caddy already has a block for $HTTPS_DOMAIN"; else
+  if $SUDO grep -q "$HTTPS_DOMAIN" "$conf" 2>/dev/null; then warn "Caddy already has a block for $HTTPS_DOMAIN. Verify it proxies to 127.0.0.1:$PORT."; else
     printf '\n%s {\n\treverse_proxy 127.0.0.1:%s\n}\n' "$HTTPS_DOMAIN" "$PORT" | $SUDO tee -a "$conf" >/dev/null
     ok "Added reverse_proxy for $HTTPS_DOMAIN → 127.0.0.1:$PORT"
   fi
   $SUDO systemctl reload caddy 2>/dev/null || $SUDO systemctl restart caddy
-  ok "HTTPS enabled (point $HTTPS_DOMAIN's DNS A record at this server)"
+  ok "Caddy reloaded. Point DNS to this server and verify the HTTPS certificate and proxy."
 }
 
 install_systemd_service() {
@@ -263,7 +317,7 @@ install_systemd_service() {
   fi
   bold "Installing a systemd service (start on boot, restart on crash)…"
   local compose_command compose_file=""
-  if docker compose version >/dev/null 2>&1; then compose_command="$(command -v docker) compose"
+  if [ "$COMPOSE_KIND" = v2 ]; then compose_command="$(command -v docker) compose"
   else compose_command="$(command -v docker-compose)"
   fi
   [ "$MODE" = "prebuilt" ] && [ -f docker-compose.prebuilt.yml ] && compose_file="-f docker-compose.prebuilt.yml"
@@ -285,27 +339,31 @@ TimeoutStartSec=0
 WantedBy=multi-user.target
 UNIT
   $SUDO systemctl daemon-reload
-  $SUDO systemctl enable sushi.service >/dev/null 2>&1 || true
-  ok "systemd service installed (systemctl status sushi)"
+  if $SUDO systemctl enable sushi.service >/dev/null 2>&1; then
+    ok "systemd service installed (systemctl status sushi)"
+  else
+    warn "Could not enable sushi.service; check systemd. Docker restart policies remain configured."
+  fi
 }
 
 run_compose() {
-  if docker compose version >/dev/null 2>&1; then
-    if [ -n "$SUDO" ]; then $SUDO -E env PORT="$PORT" docker compose "$@"
-    else env PORT="$PORT" docker compose "$@"
+  if [ "$COMPOSE_KIND" = v2 ]; then
+    if [ -n "$SUDO" ]; then $SUDO -E env PORT="$PORT" docker compose "$@" </dev/null
+    else env PORT="$PORT" docker compose "$@" </dev/null
     fi
-  elif have docker-compose; then
-    if [ -n "$SUDO" ]; then $SUDO -E env PORT="$PORT" docker-compose "$@"
-    else env PORT="$PORT" docker-compose "$@"
+  else
+    if [ -n "$SUDO" ]; then $SUDO -E env PORT="$PORT" docker-compose "$@" </dev/null
+    else env PORT="$PORT" docker-compose "$@" </dev/null
     fi
-  else die "Docker Compose is missing (install docker-compose-plugin)."
   fi
 }
 
 # ------------------------------------------------------------------- install ---
 case "$MODE" in
   build|prebuilt)
+    ensure_git_and_curl
     install_docker
+    confirm_existing_container
     ensure_source
     write_env
     if [ "$MODE" = "prebuilt" ]; then
@@ -336,7 +394,7 @@ case "$MODE" in
     bold "Starting Sushi on port $PORT…"
     PORT="$PORT" HOST=0.0.0.0 NEXT_TELEMETRY_DISABLED=1 nohup npm start > sushi.log 2>&1 &
     echo $! > sushi.pid
-    wait_for_http || warn "Check $INSTALL_DIR/sushi.log"
+    wait_for_http || die "Sushi did not become healthy. Check $INSTALL_DIR/sushi.log."
     setup_https
     ;;
 esac
@@ -358,8 +416,10 @@ if [ "$MODE" = "node" ]; then
 else
   COMPOSE_FILE=""
   [ "$MODE" = "prebuilt" ] && [ -f "$INSTALL_DIR/docker-compose.prebuilt.yml" ] && COMPOSE_FILE="-f docker-compose.prebuilt.yml "
-  echo "  Stop:   cd $INSTALL_DIR && docker compose ${COMPOSE_FILE}down"
-  echo "  Logs:   cd $INSTALL_DIR && docker compose ${COMPOSE_FILE}logs -f sushi"
+  COMPOSE_DISPLAY="docker compose"
+  [ "$COMPOSE_KIND" = v1 ] && COMPOSE_DISPLAY="docker-compose"
+  echo "  Stop:   cd $INSTALL_DIR && ${COMPOSE_DISPLAY} ${COMPOSE_FILE}down"
+  echo "  Logs:   cd $INSTALL_DIR && ${COMPOSE_DISPLAY} ${COMPOSE_FILE}logs -f sushi"
 fi
 echo
 if [ -z "$HTTPS_DOMAIN" ]; then

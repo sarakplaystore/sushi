@@ -28,7 +28,7 @@ for (const mod of stdlibOnly) {
   assert.match(py, new RegExp(`^import ${mod.replace(".", "\\.")}$`, "m"), `install.py imports stdlib ${mod}`);
 }
 assert.ok(!/^import (requests|yaml|click|rich)\b/m.test(py), "install.py needs no third-party packages");
-assert.match(py, /MIN_NODE_MAJOR = 20/, "refuses Node older than 20");
+assert.match(py, /MIN_NODE_MAJOR = 22/, "refuses Node older than 22");
 assert.match(py, /HEALTH_PATH = "\/api\/system\/capabilities"/, "health-checks the real endpoint");
 assert.match(py, /codeload\.github\.com\/\{REPO\}\/tar\.gz/, "falls back to a tarball when git is missing");
 assert.match(py, /npm ci/, "uses npm ci");

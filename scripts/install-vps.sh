@@ -172,20 +172,20 @@ choose_method() {
   fi
   if [ -z "$tty_input" ]; then
     MODE="$recommended"
-    echo "No interactive terminal; using install method $MODE (override with --build / --prebuilt / --node)."
+    echo "No interactive terminal; using install method $MODE. Options: 1) prebuilt, 2) build, 3) node (override with --build / --prebuilt / --node)."
     return 0
   fi
   while :; do
-    printf 'Install method [%s] (build | prebuilt | node): ' "$recommended" >&2
+    printf 'Install method [%s] — enter a number or name:\n  1) Docker prebuilt image (recommended)\n  2) Docker build from source\n  3) Node.js install\nSelection: ' "$recommended" >&2
     IFS= read -r answer <"$tty_input" || die "Method selection cancelled."
     answer="$(printf '%s' "$answer" | tr '[:upper:]' '[:lower:]')"
     if [ -z "$answer" ]; then MODE="$recommended"; return 0; fi
     case "$answer" in
-      p|prebuilt|images|fastest) MODE="prebuilt"; return 0 ;;
-      b|build) MODE="build"; return 0 ;;
-      n|node|nodejs) MODE="node"; return 0 ;;
+      1|p|prebuilt|images|fastest) MODE="prebuilt"; return 0 ;;
+      2|b|build) MODE="build"; return 0 ;;
+      3|n|node|nodejs) MODE="node"; return 0 ;;
     esac
-    warn "Choose build, prebuilt, or node."
+    warn "Choose 1 (prebuilt), 2 (build), or 3 (node)."
   done
 }
 
@@ -396,8 +396,19 @@ confirm_existing_container() {
 ensure_node() {
   if have node; then
     local major; major="$(node -p 'process.versions.node.split(".")[0]')"
-    [ "$major" -ge 20 ] && { ok "Node.js $(node -v)"; return 0; }
-    warn "Node.js $(node -v) is too old for Sushi (needs 20+, 22 recommended)."
+    [ "$major" -ge 22 ] && { ok "Node.js $(node -v)"; return 0; }
+    warn "Node.js $(node -v) is too old for Sushi (needs Node.js 22+)."
+    local tty_input="" answer=""
+    if [ -t 0 ]; then tty_input=/dev/stdin
+    elif ( : </dev/tty ) 2>/dev/null; then tty_input=/dev/tty
+    fi
+    [ -n "$tty_input" ] || die "Node.js upgrade requires confirmation. Rerun in a terminal or install Node.js 22 manually."
+    printf 'Upgrade Node.js to version 22 now? [y/N]: ' >&2
+    IFS= read -r answer <"$tty_input" || die "Node.js upgrade cancelled."
+    case "$answer" in
+      y|Y|yes|YES|Yes) ;;
+      *) die "Node.js upgrade declined; Sushi was not installed." ;;
+    esac
   fi
   warn "Installing Node.js 22…"
   if have apt-get; then

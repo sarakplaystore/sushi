@@ -24,8 +24,8 @@ the flags override both.
 What it does, in order:
   1. Asks you for the web UI port (unless --port / PORT is given) and for the
      install method (unless --docker / --prebuilt / --node is given), then checks
-     that Node.js >= 20 (or Docker) exists — and tells you the one command to
-     install it if not.
+     that Node.js >= 22 (or Docker) exists. If Node.js is outdated, it asks
+     before running the platform package-manager upgrade.
   2. Downloads the latest Sushi source (git clone, falling back to a GitHub
      tarball when git is unavailable).
   3. `npm ci` + `npm run build` with output-streaming, then starts the server.
@@ -60,7 +60,7 @@ import urllib.error
 import urllib.request
 
 REPO = "sarakplaystore/sushi"
-MIN_NODE_MAJOR = 20
+MIN_NODE_MAJOR = 22
 HEALTH_PATH = "/api/system/capabilities"
 DEFAULT_PORT = 3000
 
@@ -153,7 +153,32 @@ NODE_HINT = {
 }
 
 
-def require_node() -> None:
+def _node_upgrade_command() -> list[str] | None:
+    """Return a platform-appropriate command to install the supported Node 22 runtime."""
+    system = platform.system().lower()
+    if system == "darwin" and which("brew"):
+        return ["bash", "-c", "brew upgrade node@22 || brew install node@22"]
+    if system != "linux":
+        return None
+
+    is_root = hasattr(os, "geteuid") and os.geteuid() == 0
+    sudo_binary = which("sudo")
+    if not is_root and not sudo_binary:
+        return None
+    sudo = [] if is_root else [sudo_binary]
+
+    if which("apt-get") and which("curl"):
+        setup = "curl -fsSL https://deb.nodesource.com/setup_22.x | " + " ".join(sudo + ["bash", "-"])
+        install = " ".join(sudo + ["apt-get", "install", "-y", "nodejs"])
+        return ["bash", "-c", f"{setup} && {install}"]
+    if which("dnf"):
+        module_install = " ".join(sudo + ["dnf", "module", "install", "-y", "nodejs:22/common"])
+        package_install = " ".join(sudo + ["dnf", "install", "-y", "nodejs", "npm"])
+        return ["bash", "-c", f"{module_install} || {package_install}"]
+    return None
+
+
+def require_node(source=None) -> None:
     version = node_version()
     if version is None:
         fail(
@@ -161,10 +186,37 @@ def require_node() -> None:
             NODE_HINT.get(platform.system().lower(), "Download it from https://nodejs.org"),
         )
     if version[0] < MIN_NODE_MAJOR:
-        fail(
-            f"Node.js {version[0]}.{version[1]}.{version[2]} is too old — Sushi needs Node.js {MIN_NODE_MAJOR}+ (22 recommended).",
-            NODE_HINT.get(platform.system().lower(), "Download a newer version from https://nodejs.org"),
-        )
+        current = ".".join(map(str, version))
+        command = _node_upgrade_command()
+        if command is None:
+            fail(
+                f"Node.js {current} is too old — Sushi needs Node.js {MIN_NODE_MAJOR}+.",
+                NODE_HINT.get(platform.system().lower(), "Download a newer version from https://nodejs.org"),
+            )
+        tty = ConsoleInput(source)
+        if not tty.available():
+            fail(
+                f"Node.js {current} is too old — Sushi needs Node.js {MIN_NODE_MAJOR}+.",
+                "Rerun in an interactive terminal to approve the Node.js 22 upgrade, or install Node.js 22 manually.",
+            )
+        try:
+            print(f"Node.js {current} is outdated. Upgrade to Node.js 22 now? [y/N]: ", file=sys.stderr, flush=True)
+            try:
+                answer = tty.readline()
+            except OSError:
+                answer = None
+            if (answer or "").strip().lower() not in ("y", "yes"):
+                fail("Node.js upgrade declined; Sushi was not installed.")
+        finally:
+            tty.close()
+        step("Upgrading Node.js to version 22…")
+        if run(command) != 0:
+            fail("Node.js upgrade failed.", "Install Node.js 22 manually and rerun the installer.")
+        version = node_version()
+        if version is None or version[0] < MIN_NODE_MAJOR:
+            fail("Node.js upgrade completed, but the active node command is still too old.", "Check your PATH and install Node.js 22.")
+        ok(f"Node.js upgraded to {version[0]}.{version[1]}.{version[2]}")
+        return
     ok(f"Node.js {version[0]}.{version[1]}.{version[2]}")
 
 
@@ -531,11 +583,24 @@ def choose_method(args: argparse.Namespace, argv: list[str], source=None) -> str
 
     tty = ConsoleInput(source)
     if not tty.available():
-        print(f"No interactive terminal; using install method {recommended} (override with --prebuilt / --docker / --node).")
+        print(
+            f"No interactive terminal; using install method {recommended}. "
+            "Options: 1) prebuilt, 2) build, 3) node "
+            "(override with --prebuilt / --docker / --node)."
+        )
         return recommended
+    method_numbers = {"1": "prebuilt", "2": "build", "3": "node"}
     try:
         while True:
-            print(f"Install method [{recommended}] (build | prebuilt | node): ", file=sys.stderr, flush=True)
+            print(
+                f"Install method [{recommended}] — enter a number or name:\n"
+                f"  1) Docker prebuilt image (recommended)\n"
+                f"  2) Docker build from source\n"
+                f"  3) Node.js install\n"
+                "Selection: ",
+                file=sys.stderr,
+                flush=True,
+            )
             try:
                 answer = tty.readline()
             except OSError:
@@ -545,10 +610,12 @@ def choose_method(args: argparse.Namespace, argv: list[str], source=None) -> str
             answer = answer.strip().lower()
             if not answer:
                 return recommended
+            if answer in method_numbers:
+                return method_numbers[answer]
             for method, aliases in METHOD_ALIASES.items():
                 if answer in aliases:
                     return method
-            warn("Choose build, prebuilt, or node.")
+            warn("Choose 1 (prebuilt), 2 (build), or 3 (node).")
     finally:
         tty.close()
 

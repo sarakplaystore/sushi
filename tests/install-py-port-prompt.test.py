@@ -248,6 +248,29 @@ class PortPromptIntegrationTest(unittest.TestCase):
         self.assertIn("Docker Compose v2 is missing", result.stdout)
 
 
+class NodeUpgradePromptTest(unittest.TestCase):
+    def setUp(self):
+        self.install = load_installer()
+
+    def test_outdated_node_is_upgraded_only_after_yes(self):
+        versions = iter([(18, 19, 0), (22, 1, 0)])
+        calls = []
+        with unittest.mock.patch.object(self.install, "node_version", lambda: next(versions)), \
+             unittest.mock.patch.object(self.install, "_node_upgrade_command", lambda: ["upgrade-node"]), \
+             unittest.mock.patch.object(self.install, "run", lambda command: calls.append(command) or 0):
+            self.install.require_node(source=FakeInput(["yes"]))
+        self.assertEqual(calls, [["upgrade-node"]])
+
+    def test_declining_outdated_node_upgrade_stops_without_running_command(self):
+        calls = []
+        with unittest.mock.patch.object(self.install, "node_version", lambda: (18, 19, 0)), \
+             unittest.mock.patch.object(self.install, "_node_upgrade_command", lambda: ["upgrade-node"]), \
+             unittest.mock.patch.object(self.install, "run", lambda command: calls.append(command) or 0):
+            with self.assertRaises(SystemExit):
+                self.install.require_node(source=FakeInput(["n"]))
+        self.assertEqual(calls, [])
+
+
 class ChooseMethodUnitTest(unittest.TestCase):
     """Module-level tests for the install-method selection helpers."""
 
@@ -273,6 +296,11 @@ class ChooseMethodUnitTest(unittest.TestCase):
         self.assertEqual(self.choose(["--prebuilt"], ["x"]), "prebuilt")
         self.assertEqual(self.choose(["--node"], ["x"]), "node")
         self.assertEqual(self.choose(["--docker"], ["x"]), "build")
+
+    def test_choose_method_accepts_numbered_options(self):
+        self.assertEqual(self.choose([], ["1"]), "prebuilt")
+        self.assertEqual(self.choose([], ["2"]), "build")
+        self.assertEqual(self.choose([], ["3"]), "node")
 
     def test_choose_method_accepts_aliases(self):
         self.assertEqual(self.choose([], ["fastest"]), "prebuilt")

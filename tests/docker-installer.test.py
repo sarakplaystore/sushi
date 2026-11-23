@@ -73,6 +73,21 @@ else printf '%s' '{"mode":"vps","websocketSsh":true}'; fi''')
         return subprocess.run(["bash", str(SCRIPT), "--dir", str(self.target), *args],
                               env=env or self.env, text=True, capture_output=True, timeout=20)
 
+    PROMPT_PATTERNS = (b"Web UI port [", b"Install method [", b"Continue and potentially restart it? [y/N]:")
+
+    @staticmethod
+    def answer_new_prompts(master, output, answers, sent):
+        """Send queued answers for each new prompt that appears, in order."""
+        prompts = sum(output.count(pattern) for pattern in InstallerTest.PROMPT_PATTERNS)
+        while prompts > sent:
+            try:
+                answer = next(answers)
+            except StopIteration:
+                break
+            os.write(master, (answer + "\n").encode())
+            sent += 1
+        return sent
+
     def run_piped_tty(self, answers, *args):
         master, slave = pty.openpty()
         cmd = f"cat {shlex.quote(str(SCRIPT))} | bash -s -- --dir {shlex.quote(str(self.target))} " + " ".join(map(shlex.quote, args))
@@ -85,7 +100,6 @@ else printf '%s' '{"mode":"vps","websocketSsh":true}'; fi''')
         output = b""
         answers = iter(answers)
         sent = 0
-        confirmations = 0
         try:
             deadline = time.monotonic() + 20
             while time.monotonic() < deadline:
@@ -98,12 +112,7 @@ else printf '%s' '{"mode":"vps","websocketSsh":true}'; fi''')
                     if not chunk:
                         break
                     output += chunk
-                    while output.count(b"Web UI port [") > sent:
-                        os.write(master, (next(answers) + "\n").encode())
-                        sent += 1
-                    while output.count(b"Continue and potentially restart it? [y/N]:") > confirmations:
-                        os.write(master, (next(answers) + "\n").encode())
-                        confirmations += 1
+                    sent = self.answer_new_prompts(master, output, answers, sent)
                 if proc.poll() is not None and not readable:
                     break
             proc.wait(timeout=3)
@@ -115,10 +124,11 @@ else printf '%s' '{"mode":"vps","websocketSsh":true}'; fi''')
         return proc.returncode, output.decode(errors="replace")
 
     def test_piped_interactive_prompt_validates_and_persists_port(self):
-        code, output = self.run_piped_tty(["0", "8088"])
+        code, output = self.run_piped_tty(["0", "8088", "build"])
         self.assertEqual(code, 0, output)
         self.assertIn("Web UI port [3000]", output)
         self.assertIn("Enter a port from 1 to 65535", output)
+        self.assertIn("Install method [prebuilt]", output)
         self.assertIn("http://<your-vps-ip>:8088", output)
         content = (self.target / ".env").read_text()
         self.assertEqual([x for x in content.splitlines() if x.startswith("PORT=")], ["PORT=8088"])
@@ -129,9 +139,10 @@ else printf '%s' '{"mode":"vps","websocketSsh":true}'; fi''')
     def test_existing_port_default_and_credentials_survive_reruns(self):
         env = self.target / ".env"
         env.write_text('SUSHI_AUTH_SECRET=keep-this-secret\nPORT=1234\nexport PORT="8080" # current\nOTHER=value\n')
-        code, output = self.run_piped_tty([""])
+        code, output = self.run_piped_tty(["", ""])
         self.assertEqual(code, 0, output)
         self.assertIn("Web UI port [8080]", output)
+        self.assertIn("Install method [prebuilt]", output)
         self.assertIn("SUSHI_AUTH_SECRET=keep-this-secret", env.read_text())
         self.assertIn("OTHER=value", env.read_text())
         self.assertEqual([x for x in env.read_text().splitlines() if x.startswith("PORT=")], ["PORT=8080"])
@@ -173,14 +184,14 @@ else printf '%s' '{"mode":"vps","websocketSsh":true}'; fi''')
         external = self.root / "external.env"
         external.write_text("PORT=3000\nSUSHI_AUTH_SECRET=keep\n")
         env.symlink_to(external)
-        result = self.run_installer("--port", "8081")
+        result = self.run_installer("--port", "8081", "--build")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("symlinked .env", result.stderr)
         self.assertEqual(external.read_text(), "PORT=3000\nSUSHI_AUTH_SECRET=keep\n")
 
     def test_missing_systemd_uses_docker_restart_policy(self):
         self.fake("systemctl", "exit 1")
-        result = self.run_installer("--port", "4321")
+        result = self.run_installer("--port", "4321", "--build")
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         self.assertIn("systemd is unavailable", result.stdout)
         self.assertIn("Sushi is up!", result.stdout)
@@ -190,16 +201,16 @@ else printf '%s' '{"mode":"vps","websocketSsh":true}'; fi''')
         original = "PORT=3000\nSUSHI_AUTH_SECRET=keep\n"
         env_file.write_text(original)
         self.env["TEST_RUNNING"] = "1"
-        result = self.run_installer("--port", "8787")
+        result = self.run_installer("--port", "8787", "--build")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("No terminal for confirmation", result.stderr)
         self.assertEqual(env_file.read_text(), original)
         self.assertNotIn("compose up", self.log.read_text())
-        code, output = self.run_piped_tty(["n"], "--port", "8787")
+        code, output = self.run_piped_tty(["prebuilt", "n"], "--port", "8787")
         self.assertNotEqual(code, 0, output)
         self.assertIn("running container was not changed", output)
         self.assertEqual(env_file.read_text(), original)
-        code, output = self.run_piped_tty(["y"], "--port", "8787")
+        code, output = self.run_piped_tty(["prebuilt", "y"], "--port", "8787")
         self.assertEqual(code, 0, output)
         self.assertIn("PORT=8787", env_file.read_text())
         result = self.run_installer("--port", "8788", "--yes")
@@ -211,18 +222,18 @@ else printf '%s' '{"mode":"vps","websocketSsh":true}'; fi''')
         env_file = self.target / ".env"
         original = "PORT=3000\nSUSHI_AUTH_SECRET=keep\n"
         env_file.write_text(original)
-        result = self.run_installer("--port", "4444", env={**self.env, "TEST_INFO_FAIL": "1"})
+        result = self.run_installer("--port", "4444", "--build", env={**self.env, "TEST_INFO_FAIL": "1"})
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Cannot access the Docker daemon", result.stderr)
         self.assertEqual(env_file.read_text(), original)
-        result = self.run_installer("--port", "4444", env={**self.env, "TEST_NO_V2": "1"})
+        result = self.run_installer("--port", "4444", "--build", env={**self.env, "TEST_NO_V2": "1"})
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Docker Compose is missing", result.stderr)
         self.assertEqual(env_file.read_text(), original)
 
     def test_compose_v1_fallback_is_used_and_reported(self):
         self.fake("docker-compose", 'printf "v1 PORT=%s %s\\n" "${PORT-}" "$*" >> "$TEST_LOG"')
-        result = self.run_installer("--port", "5678", env={**self.env, "TEST_NO_V2": "1"})
+        result = self.run_installer("--port", "5678", "--build", env={**self.env, "TEST_NO_V2": "1"})
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         self.assertIn("v1 PORT=5678 up -d --build", self.log.read_text())
         self.assertIn("docker-compose down", result.stdout)
@@ -231,12 +242,12 @@ else printf '%s' '{"mode":"vps","websocketSsh":true}'; fi''')
     def test_compose_detection_uses_the_same_privileges_as_start(self):
         self.fake("id", 'if [ "$1" = "-u" ]; then echo 1001; else echo test; fi')
         self.fake("sudo", '''export TEST_SUDO=1
-if [ "$1" = "-E" ]; then shift; fi
+if [ "$1" = "-E" ] || [ "$1" = "-n" ]; then shift; fi
 exec "$@"''')
         self.fake("docker", '''printf "docker sudo=%s PORT=%s %s\\n" "${TEST_SUDO:-0}" "${PORT-}" "$*" >> "$TEST_LOG"
 if [ "${TEST_SUDO:-0}" != 1 ]; then exit 1; fi
 if [ "$1" = inspect ]; then exit 1; fi''')
-        result = self.run_installer("--port", "6001")
+        result = self.run_installer("--port", "6001", "--build")
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         self.assertIn("docker sudo=1 PORT=6001 compose up -d --build", self.log.read_text())
 

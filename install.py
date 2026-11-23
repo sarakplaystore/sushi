@@ -29,7 +29,9 @@ What it does, in order:
   2. Downloads the latest Sushi source (git clone, falling back to a GitHub
      tarball when git is unavailable).
   3. `npm ci` + `npm run build` with output-streaming, then starts the server.
-  4. Waits until /api/system/capabilities answers, then prints the URL.
+  4. Waits until /api/system/capabilities answers, then prints the URL — the
+     server's public IPv4 link when it can detect it (or SUSHI_PUBLIC_IP is
+     set), with localhost shown as the local check.
 
 Nothing here needs root: it installs into a directory you own (`./sushi` by
 default) and never touches `data/` once it exists, so re-running the installer
@@ -42,11 +44,13 @@ DISCLAIMER.md and PRIVACY.md in the repository before exposing it to the interne
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import os
 import platform
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tarfile
@@ -250,6 +254,80 @@ def download_source(target: str, branch: str, ref: str | None) -> None:
         for entry in os.listdir(source):
             shutil.move(os.path.join(source, entry), os.path.join(target, entry))
     ok("Source downloaded")
+
+
+# --------------------------------------------------------------------------- #
+# server address (so the summary shows a link you can actually open)
+# --------------------------------------------------------------------------- #
+PUBLIC_IP_ENDPOINTS = (
+    "https://api.ipify.org",
+    "https://ifconfig.me/ip",
+    "https://icanhazip.com",
+)
+
+
+def valid_ipv4(raw: str) -> bool:
+    """True for a strict dotted-quad IPv4 address."""
+    try:
+        ipaddress.IPv4Address(raw.strip())
+    except (ipaddress.AddressValueError, ValueError):
+        return False
+    return True
+
+
+# Ranges reachable only inside the host/provider network, matching
+# install-vps.sh. Kept explicit rather than using IPv4Address.is_private, which
+# also flags reserved documentation ranges such as 203.0.113.0/24.
+LOCAL_IPV4_NETWORKS = (
+    ipaddress.IPv4Network("0.0.0.0/8"),
+    ipaddress.IPv4Network("10.0.0.0/8"),
+    ipaddress.IPv4Network("100.64.0.0/10"),   # carrier-grade NAT
+    ipaddress.IPv4Network("127.0.0.0/8"),
+    ipaddress.IPv4Network("169.254.0.0/16"),
+    ipaddress.IPv4Network("172.16.0.0/12"),
+    ipaddress.IPv4Network("192.168.0.0/16"),
+)
+
+
+def is_private_ipv4(raw: str) -> bool:
+    """True when the address is not reachable from the public internet."""
+    try:
+        address = ipaddress.IPv4Address(raw.strip())
+    except (ipaddress.AddressValueError, ValueError):
+        return False
+    return any(address in network for network in LOCAL_IPV4_NETWORKS)
+
+
+def detect_public_ip() -> str | None:
+    """Best-effort public IPv4 of this machine, or None.
+
+    `SUSHI_PUBLIC_IP` wins when it is a valid IPv4 address. Otherwise a few
+    public "what is my IP" services are asked (short timeouts, first answer
+    wins), and as a last resort the address of the interface that would reach
+    the internet is used — public on many VPSes, private behind cloud NAT.
+    """
+    override = (os.environ.get("SUSHI_PUBLIC_IP") or "").strip()
+    if override:
+        if valid_ipv4(override):
+            return override
+        warn(f"Ignoring SUSHI_PUBLIC_IP={override} (not an IPv4 address); detecting it instead.")
+
+    for endpoint in PUBLIC_IP_ENDPOINTS:
+        try:
+            with urllib.request.urlopen(endpoint, timeout=3) as response:
+                candidate = response.read(64).decode("ascii", "replace").strip()
+        except (urllib.error.URLError, OSError, ValueError):
+            continue
+        if valid_ipv4(candidate):
+            return candidate
+
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.connect(("1.1.1.1", 80))
+            local = probe.getsockname()[0]
+    except OSError:
+        return None
+    return local if valid_ipv4(local) and local != "0.0.0.0" else None
 
 
 # --------------------------------------------------------------------------- #
@@ -626,12 +704,37 @@ def install_with_docker(args: argparse.Namespace, target: str) -> int:
     return 0
 
 
-def print_summary(args: argparse.Namespace, target: str, pid: str | None = None, docker: bool = False) -> None:
+def summary_links(args: argparse.Namespace) -> tuple[str, str | None, str | None]:
+    """Return (local URL, public URL, private-but-detected address).
+
+    The public URL is only offered when Sushi listens on every interface; a
+    localhost address is useless to a browser on another machine, so the
+    detected public IPv4 is preferred whenever it is reachable from outside.
+    """
     shown_host = "localhost" if args.host in {"0.0.0.0", "::"} else args.host
-    url = f"http://{shown_host}:{args.port}"
+    local_url = f"http://{shown_host}:{args.port}"
+    if args.host not in {"0.0.0.0", "::"}:
+        return local_url, None, None
+    detected = detect_public_ip()
+    if not detected:
+        return local_url, None, None
+    if is_private_ipv4(detected):
+        return local_url, None, detected
+    return local_url, f"http://{detected}:{args.port}", None
+
+
+def print_summary(args: argparse.Namespace, target: str, pid: str | None = None, docker: bool = False) -> None:
+    local_url, public_url, private_ip = summary_links(args)
     print()
     print(Style.green(Style.bold("  Sushi is up.")))
-    print(f"  Open:      {Style.bold(url)}")
+    if public_url:
+        print(f"  Open:      {Style.bold(public_url)}")
+        print(f"  Local:     {local_url}")
+    else:
+        print(f"  Open:      {Style.bold(local_url)}")
+        if private_ip:
+            print(f"  Note:      this host's own address is http://{private_ip}:{args.port} "
+                  + Style.dim("(private - open your provider's public IP instead)"))
     print(f"  Directory: {target}")
     print(f"  Data:      {args.data_dir or os.path.join(target, 'data')}  {Style.dim('(back this up — account + encrypted vault)')}")
     print()

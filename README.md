@@ -449,7 +449,12 @@ port from 1–65535. The app listens on that host port and uses port 3000 inside
 container. It will print the URL after the health check. The choice is saved in
 `.env` and offered again when you rerun the installer. Explicit `--port` or the
 `PORT` environment variable bypasses the prompt; with no terminal the saved port
-(or 3000 for a new install) is used. For unattended installs:
+(or 3000 for a new install) is used. When the installer is piped or run over SSH,
+the prompt reads the controlling terminal (`/dev/tty`), so `curl … | bash` and
+remote sessions work — with no terminal at all it falls back to the default.
+**`python3 install.py` behaves the same way**: it prompts for the port before
+downloading or building (Node.js port path included), falling back to the
+default when it cannot prompt. For unattended installs:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/sarakplaystore/sushi/main/scripts/install-vps.sh | bash -s -- --port 8080
@@ -480,7 +485,7 @@ Docker is the primary setup; the other deployment methods remain available:
 | **Docker** (recommended) | `curl -fsSL https://raw.githubusercontent.com/sarakplaystore/sushi/main/scripts/install-vps.sh \| bash` | Installs Docker if missing, starts Sushi + guacd, waits for health, prints the URL. Debian/Ubuntu, Rocky/Alma, Fedora, Arch, Alpine |
 | **Docker, prebuilt image** (fastest, no compile) | `docker run -d --name sushi -p 3000:3000 -v sushi-data:/app/data --restart unless-stopped ghcr.io/sarakplaystore/sushi:latest` | Pulls a multi-arch image (~1 min). Needs a separate `guacd` only if you want *live* RDP |
 | **Docker Compose, no clone** | `curl -fsSLO https://raw.githubusercontent.com/sarakplaystore/sushi/main/docker-compose.prebuilt.yml && docker compose -f docker-compose.prebuilt.yml up -d` | Sushi **+ guacd** from the published image |
-| **Python 3.9+** (no Docker needed) | `python3 install.py` | Cross-platform (Linux, macOS, Windows via WSL). Downloads the source, `npm ci`, builds, starts in the background and health-checks it |
+| **Python 3.9+** (no Docker needed) | `python3 install.py` | Cross-platform (Linux, macOS, Windows via WSL). Prompts for the web UI port, downloads the source, `npm ci`, builds, starts in the background and health-checks it |
 | **Node.js 22 only** | `git clone https://github.com/sarakplaystore/sushi.git && cd sushi && npm ci && npm run build && npm start` | The manual equivalent |
 | **Vercel** | Import the repo, add Turso/Firestore/Redis | See [Deploy to Vercel](#3-deploy-to-vercel--optional-companion-gateway-vps-railway-or-render) |
 | **Vercel + native PTY** | Vercel for the UI, Railway or Render for [`Dockerfile.gateway`](Dockerfile.gateway) | See [Deploy to Vercel](#3-deploy-to-vercel--optional-companion-gateway-vps-railway-or-render) — no server to maintain |

@@ -38,6 +38,10 @@ assert.match(py, /sushi\.pid/, "writes a pid file");
 assert.match(py, /--docker/, "supports the Docker path");
 assert.match(py, /--foreground/, "can run in the foreground");
 assert.match(py, /--no-start/, "can install+build without starting");
+assert.match(py, /Web UI port/, "prompts for the web UI port when --port/PORT are omitted");
+assert.match(py, /dev\/tty/, "reads the controlling terminal when piped or run over SSH");
+assert.match(py, /isatty/, "detects when stdin is a terminal");
+assert.match(py, /No interactive terminal/, "prints a note and uses the default when no terminal exists");
 assert.match(py, /Start Sushi|installer/i, "has a user-facing banner");
 assert.match(py, /DISCLAIMER\.md/, "points at the disclaimer");
 // Helps, rather than failing silently, when Node is missing.
@@ -49,6 +53,7 @@ const help = run("python3", ["install.py", "--help"]);
 for (const flag of ["--dir", "--port", "--host", "--branch", "--docker", "--foreground", "--no-start", "--timeout"]) {
   assert.ok(help.includes(flag), `--help documents ${flag}`);
 }
+assert.ok(help.includes("prompted interactively"), "--help explains the interactive port prompt");
 assert.equal(run("python3", ["install.py", "--version"]).trim(), "Sushi installer 1.0.0");
 
 // ---- shell installer ------------------------------------------------------------

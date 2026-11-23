@@ -5,13 +5,21 @@ Sushi — one-click installer (Python 3.9+, no third-party packages).
     python3 install.py                  # install + build + start in the background
     python3 install.py --foreground     # install + build + run in this terminal
     python3 install.py --docker         # use Docker Compose instead of Node.js
-    python3 install.py --port 8080      # pick a port
+    python3 install.py --port 8080      # pick a port without prompting
     python3 install.py --dir ~/sushi    # pick an install directory
     python3 install.py --no-start       # install + build only
 
+Without --port or a PORT environment variable, the installer asks for the web UI
+port before doing anything else. The prompt reads stdin when it is a terminal and
+falls back to the controlling terminal (/dev/tty) when the installer is piped or
+run over SSH — so `curl ... | bash` and remote sessions both work. In a fully
+unattended run (no terminal), it uses 3000 (or the port saved in an existing
+.env) and prints a note explaining that --port overrides it.
+
 What it does, in order:
-  1. Checks that Node.js >= 20 (or Docker, with --docker) exists — and tells you
-     the one command to install it if not.
+  1. Asks you for the web UI port (unless --port / PORT is given), then checks
+     that Node.js >= 20 (or Docker, with --docker) exists — and tells you the
+     one command to install it if not.
   2. Downloads the latest Sushi source (git clone, falling back to a GitHub
      tarball when git is unavailable).
   3. `npm ci` + `npm run build` with output-streaming, then starts the server.
@@ -31,6 +39,7 @@ import argparse
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -235,6 +244,194 @@ def wait_for_health(port: int, timeout_seconds: int = 180, proc: subprocess.Pope
 
 
 # --------------------------------------------------------------------------- #
+# web UI port selection (prompt when --port / PORT are not given)
+# --------------------------------------------------------------------------- #
+def is_valid_port_value(raw: str) -> bool:
+    return raw.isdigit() and 1 <= int(raw) <= 65535
+
+
+def read_saved_port(target: str) -> str | None:
+    """Read the PORT saved in an existing .env (the shell installer's behaviour).
+
+    Last assignment wins. Returns the raw value (string), or None when there is
+    no .env or no PORT line; an unparseable value is returned as-is and left for
+    the caller to reject.
+    """
+    env_file = os.path.join(target, ".env")
+    if os.path.islink(env_file) or not os.path.isfile(env_file):
+        return None
+    try:
+        with open(env_file, "r", encoding="utf-8", errors="replace") as handle:
+            content = handle.read()
+    except OSError:
+        return None
+    port = None
+    for line in content.splitlines():
+        match = re.match(r"^\s*(?:export\s+)?PORT\s*=(.*)$", line)
+        if not match:
+            continue
+        value = match.group(1)
+        value = re.sub(r"\s*#.*$", "", value).strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        if value:
+            port = value
+    return port
+
+
+def _open_controlling_tty():
+    """Return an fd for the controlling terminal, or None when there is none."""
+    try:
+        flags = os.O_RDWR | (getattr(os, "O_NOCTTY", 0) if hasattr(os, "O_NOCTTY") else 0)
+        return os.open("/dev/tty", flags)
+    except OSError:
+        return None
+
+
+class ConsoleInput:
+    """Line source for the port prompt.
+
+    Prefers stdin when it is a terminal (plain `python3 install.py`), otherwise
+    falls back to the controlling terminal — the way the shell installer behaves
+    when it runs piped (`curl ... | bash`) or over an SSH session. Returns no
+    availability for fully unattended runs (no terminal at all).
+    """
+
+    def __init__(self, source=None):
+        # `source` lets tests inject a line-based fake.
+        self._input = None
+        self._fd = None
+        if source is not None:
+            self._input = source
+            return
+        if sys.stdin.isatty():
+            self._input = sys.stdin
+            return
+        fd = _open_controlling_tty()
+        if fd is None:
+            return
+        self._fd = fd
+        try:
+            self._input = open(fd, "r")
+        except OSError:
+            self._fd = None
+
+    def available(self) -> bool:
+        return self._input is not None
+
+    def readline(self) -> str | None:
+        if self._input is None:
+            return None
+        return self._input.readline()
+
+    def close(self) -> None:
+        if self._input is not None and self._fd is not None:
+            try:
+                self._input.close()
+            except Exception:
+                pass
+            try:
+                os.close(self._fd)
+            except OSError:
+                pass
+
+
+def choose_port(args: argparse.Namespace, target: str, source=None) -> int:
+    """Pick the web UI port.
+
+    --port or the PORT environment variable wins; otherwise ask interactively
+    (default: saved .env port, else 3000). No terminal → use the default with a
+    printed note, so unattended/CI installs never block.
+    """
+    explicit_flag = args.port is not None
+    env_port = (os.environ.get("PORT") or "").strip()
+    if explicit_flag or env_port:
+        raw = str(args.port).strip() if explicit_flag else env_port
+        if not is_valid_port_value(raw):
+            fail(f"Invalid web UI port '{raw}' (choose 1–65535).")
+        return int(raw)
+
+    saved = read_saved_port(target)
+    if saved is not None and not is_valid_port_value(saved):
+        fail(
+            f"Invalid PORT in {os.path.join(target, '.env')}.",
+            "Fix it or supply --port.",
+        )
+    default = int(saved) if saved else DEFAULT_PORT
+
+    tty = ConsoleInput(source)
+    if not tty.available():
+        print(f"No interactive terminal; using web UI port {default} (override with --port).")
+        return default
+    try:
+        while True:
+            print(f"Web UI port [{default}]: ", file=sys.stderr, flush=True)
+            try:
+                answer = tty.readline()
+            except OSError:
+                answer = None
+            if not answer:
+                fail("Port selection cancelled.")
+            answer = answer.strip()
+            if not answer:
+                return default
+            if is_valid_port_value(answer):
+                return int(answer)
+            warn("Enter a port from 1 to 65535.")
+    finally:
+        tty.close()
+
+
+def write_env_port(target: str, port: int) -> None:
+    """Create or update the .env PORT in the Docker install path.
+
+    Keeps every other line (credentials, data volume keys) untouched, like the
+    shell installer. The PORT line is normalized to a single `PORT=<n>`, the
+    file is chmod 600, and a symlinked .env is never rewritten.
+    """
+    env_file = os.path.join(target, ".env")
+    if os.path.lexists(env_file) and os.path.islink(env_file):
+        fail("Refusing to replace a symlinked .env; use a regular file instead.")
+    created = False
+    if not os.path.isfile(env_file):
+        example = os.path.join(target, ".env.example")
+        if os.path.isfile(example):
+            shutil.copyfile(example, env_file)
+        secret = os.urandom(24).hex()
+        with open(env_file, "a", encoding="utf-8") as handle:
+            handle.write(f"\n# generated by install.py\nSUSHI_AUTH_SECRET={secret}\n")
+        created = True
+
+    with open(env_file, "r", encoding="utf-8") as handle:
+        lines = handle.read().splitlines()
+    kept = [line for line in lines if not re.match(r"^\s*(?:export\s+)?PORT\s*=", line)]
+    kept.append(f"PORT={port}")
+
+    tmp = None
+    try:
+        fd, tmp = tempfile.mkstemp(prefix=".env.port.", dir=target)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            for line in kept:
+                handle.write(line + "\n")
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        os.replace(tmp, env_file)
+    except Exception:
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+        raise
+    if created:
+        ok(f"Created .env with a random SUSHI_AUTH_SECRET (port {port})")
+    else:
+        ok("Updated the port in .env")
+
+
+# --------------------------------------------------------------------------- #
 # node install path
 # --------------------------------------------------------------------------- #
 def install_with_node(args: argparse.Namespace, target: str) -> int:
@@ -316,17 +513,7 @@ def install_with_docker(args: argparse.Namespace, target: str) -> int:
     require_docker()
     download_source(target, args.branch, None)
 
-    env_file = os.path.join(target, ".env")
-    if not os.path.isfile(env_file):
-        example = os.path.join(target, ".env.example")
-        if os.path.isfile(example):
-            shutil.copyfile(example, env_file)
-        secret = os.urandom(24).hex()
-        with open(env_file, "a", encoding="utf-8") as handle:
-            handle.write(f"\n# generated by install.py\nSUSHI_AUTH_SECRET={secret}\nPORT={args.port}\n")
-        ok(f"Created .env with a random SUSHI_AUTH_SECRET (port {args.port})")
-    else:
-        ok("Keeping your existing .env")
+    write_env_port(target, args.port)
 
     step("Building and starting Sushi + guacd with Docker Compose…")
     if run(["docker", "compose", "up", "-d", "--build"], cwd=target) != 0:
@@ -374,7 +561,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         epilog="Docs: https://github.com/sarakplaystore/sushi#quick-start",
     )
     parser.add_argument("--dir", default="sushi", help="install directory (default: ./sushi)")
-    parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", DEFAULT_PORT)), help=f"HTTP port (default: {DEFAULT_PORT})")
+    parser.add_argument("--port", type=str, default=None, help=f"HTTP port (default: {DEFAULT_PORT}; prompted interactively when omitted)")
     parser.add_argument("--host", default="0.0.0.0", help="bind address (default: 0.0.0.0)")
     parser.add_argument("--data-dir", default=None, help="where auth.json / vault.enc.json live (default: <dir>/data)")
     parser.add_argument("--branch", default="main", help="git branch or tag to install (default: main)")
@@ -396,6 +583,9 @@ def main(argv: list[str]) -> int:
     print()
 
     step(f"Install directory: {target}")
+
+    args.port = choose_port(args, target)
+
     os.makedirs(target, exist_ok=True)
 
     if args.docker:

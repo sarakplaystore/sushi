@@ -18,6 +18,7 @@ import termios
 import time
 import unittest
 import unittest.mock
+import urllib.error
 from importlib import util
 from pathlib import Path
 
@@ -432,6 +433,136 @@ class ChoosePortUnitTest(unittest.TestCase):
         with self.assertRaises(SystemExit):
             self.install.write_env_port(str(self.target), 8088)
         self.assertEqual(external.read_text(), "PORT=3000\n")
+
+
+class PublicAddressUnitTest(unittest.TestCase):
+    """Module-level tests for the public-IP detection used by the summary."""
+
+    def setUp(self):
+        self.install = load_installer()
+
+    def test_valid_ipv4(self):
+        for good in ("198.51.100.9", " 203.0.113.7 ", "8.8.8.8"):
+            self.assertTrue(self.install.valid_ipv4(good), good)
+        for bad in ("", "example.com", "1.2.3", "1.2.3.4.5", "256.1.1.1", "::1", "not-an-ip"):
+            self.assertFalse(self.install.valid_ipv4(bad), bad)
+
+    def test_is_private_ipv4(self):
+        for private in ("10.0.0.5", "192.168.1.10", "172.16.0.1", "127.0.0.1", "169.254.10.1"):
+            self.assertTrue(self.install.is_private_ipv4(private), private)
+        for public in ("203.0.113.7", "198.51.100.9", "8.8.8.8", "172.32.0.1"):
+            self.assertFalse(self.install.is_private_ipv4(public), public)
+        self.assertFalse(self.install.is_private_ipv4("nope"))
+
+    def test_env_override_wins_without_lookup(self):
+        with unittest.mock.patch.dict(os.environ, {"SUSHI_PUBLIC_IP": "198.51.100.9"}, clear=True), \
+             unittest.mock.patch.object(self.install.urllib.request, "urlopen",
+                                        side_effect=AssertionError("lookup must not run")):
+            self.assertEqual(self.install.detect_public_ip(), "198.51.100.9")
+
+    def test_invalid_override_warns_and_falls_back_to_lookup(self):
+        stdout = io.StringIO()
+        with unittest.mock.patch.dict(os.environ, {"SUSHI_PUBLIC_IP": "nope"}, clear=True), \
+             unittest.mock.patch.object(self.install.urllib.request, "urlopen",
+                                        lambda *a, **k: io.BytesIO(b"203.0.113.7\n")), \
+             unittest.mock.patch.object(self.install.sys, "stdout", stdout):
+            self.assertEqual(self.install.detect_public_ip(), "203.0.113.7")
+        self.assertIn("Ignoring SUSHI_PUBLIC_IP=nope", stdout.getvalue())
+
+    def test_lookup_skips_unusable_answers(self):
+        answers = iter([io.BytesIO(b"<html>not an ip</html>"), io.BytesIO(b"203.0.113.7")])
+        with unittest.mock.patch.dict(os.environ, {}, clear=True), \
+             unittest.mock.patch.object(self.install.urllib.request, "urlopen",
+                                        lambda *a, **k: next(answers)):
+            self.assertEqual(self.install.detect_public_ip(), "203.0.113.7")
+
+    def test_falls_back_to_the_interface_address(self):
+        class FakeSocket:
+            def __init__(self, *args, **kwargs):
+                self.address = None
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def connect(self, address):
+                self.address = address
+
+            def getsockname(self):
+                return ("10.1.2.3", 5555)
+
+        with unittest.mock.patch.dict(os.environ, {}, clear=True), \
+             unittest.mock.patch.object(self.install.urllib.request, "urlopen",
+                                        side_effect=urllib.error.URLError("offline")), \
+             unittest.mock.patch.object(self.install.socket, "socket", FakeSocket):
+            self.assertEqual(self.install.detect_public_ip(), "10.1.2.3")
+
+    def test_returns_none_when_everything_fails(self):
+        class BrokenSocket:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def connect(self, address):
+                raise OSError("network is unreachable")
+
+        with unittest.mock.patch.dict(os.environ, {}, clear=True), \
+             unittest.mock.patch.object(self.install.urllib.request, "urlopen",
+                                        side_effect=OSError("offline")), \
+             unittest.mock.patch.object(self.install.socket, "socket", BrokenSocket):
+            self.assertIsNone(self.install.detect_public_ip())
+
+
+class SummaryLinkTest(unittest.TestCase):
+    """The summary must offer a link a browser on another machine can open."""
+
+    def setUp(self):
+        self.install = load_installer()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.target = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def summary(self, host="0.0.0.0", detected="203.0.113.7", docker=False):
+        import argparse
+        args = argparse.Namespace(host=host, port=3000, data_dir=None,
+                                  foreground=False, method="node")
+        stdout = io.StringIO()
+        with unittest.mock.patch.object(self.install, "detect_public_ip", lambda: detected), \
+             unittest.mock.patch.object(self.install.sys, "stdout", stdout):
+            self.install.print_summary(args, str(self.target), pid="4242", docker=docker)
+        return stdout.getvalue()
+
+    def test_public_ip_becomes_the_open_link(self):
+        out = self.summary()
+        self.assertIn("http://203.0.113.7:3000", out)
+        self.assertIn("Local:     http://localhost:3000", out)
+
+    def test_private_address_is_not_offered_as_the_open_link(self):
+        out = self.summary(detected="10.0.0.5")
+        self.assertIn("Open:      http://localhost:3000", out)
+        self.assertNotIn("Open:      http://10.0.0.5", out)
+        self.assertIn("http://10.0.0.5:3000", out)
+        self.assertIn("private", out)
+
+    def test_no_detection_keeps_the_localhost_link(self):
+        out = self.summary(detected=None)
+        self.assertIn("Open:      http://localhost:3000", out)
+        self.assertNotIn("private", out)
+
+    def test_explicit_bind_host_is_used_without_detection(self):
+        out = self.summary(host="127.0.0.1", detected="203.0.113.7")
+        self.assertIn("Open:      http://127.0.0.1:3000", out)
+        self.assertNotIn("203.0.113.7", out)
+        self.assertNotIn("Local:", out)
 
 
 if __name__ == "__main__":

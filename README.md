@@ -20,10 +20,13 @@ On a Linux server, run:
 curl -fsSL https://raw.githubusercontent.com/sarakplaystore/sushi/main/scripts/install-vps.sh | bash
 ```
 
-Choose the web UI port when prompted (default: **3000**). The installer builds
-Sushi and starts it with Docker Compose and guacd. If Docker is missing, it runs
-the official Docker installation script with administrator privileges. Create
-an admin account and use HTTPS before exposing Sushi publicly.
+Choose the web UI port when prompted (default: **3000**), then optionally enter a
+domain (press **Enter** to skip) if you want Caddy in front of it with automatic
+HTTPS. The installer builds Sushi and starts it with Docker Compose and guacd,
+then prints the server's public IP link — e.g. `http://203.0.113.10:3000` — so you
+can open it right away. If Docker is missing, it runs the official Docker
+installation script with administrator privileges. Create an admin account and
+use HTTPS before exposing Sushi publicly.
 
 [Installation details, options and upgrade precautions →](#quick-start)
 
@@ -459,6 +462,11 @@ The install-method prompt behaves the same way: explicit flags bypass it, an emp
 answer takes the recommendation, and with no terminal at all the installer uses the
 recommendation (prebuilt when Docker works, otherwise Node.js) and prints a note
 instead of blocking.
+A third, **optional** prompt asks for a domain for HTTPS: press **Enter** to keep
+plain `http://<ip>:<port>`, or type e.g. `sushi.example.com` to add Caddy with
+automatic HTTPS (`--domain` / `--https` bypass the prompt, `--no-domain` never asks).
+The installer detects the server's public IPv4 (or uses `SUSHI_PUBLIC_IP` when set)
+and finishes with a ready-to-open link, plus the direct IP link when HTTPS is used.
 **`python3 install.py` behaves the same way**: it prompts for the method and the
 port before downloading or building (Node.js port path included), falling back to
 the recommendation and the default when it cannot prompt. For unattended installs:
@@ -499,7 +507,8 @@ Docker is the primary setup; the other deployment methods remain available:
 | **Vercel + native PTY** | Vercel for the UI, Railway or Render for [`Dockerfile.gateway`](Dockerfile.gateway) | See [Deploy to Vercel](#3-deploy-to-vercel--optional-companion-gateway-vps-railway-or-render) — no server to maintain |
 
 Useful installer flags: `--port 8080`, `--dir ~/sushi`, `--https your.domain` (adds Caddy with
-automatic HTTPS), `--yes` (allow restarting an existing Sushi container), `--prebuilt` (pull the published image — recommended),
+automatic HTTPS; `--domain your.domain` is an alias), `--no-domain` (skip the optional domain
+prompt), `--yes` (allow restarting an existing Sushi container), `--prebuilt` (pull the published image — recommended),
 `--build` (compile from source; Python: `--docker`), `--node` (no Docker: Node.js), and
 `--foreground` (Python: keep it in this terminal). The VPS installer preserves credentials and data on reruns, updating only `PORT`
 in an existing `.env`. The Compose volume is not deleted by ordinary `docker compose down`

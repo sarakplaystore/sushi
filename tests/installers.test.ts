@@ -80,8 +80,13 @@ assert.match(sh, /--port|--https|--prebuilt|--node/, "documents its flags");
 assert.match(sh, /--build/, "supports the build-from-source path");
 assert.match(sh, /Install method/, "prompts for the install method");
 assert.match(sh, /prebuilt/, "recommends the prebuilt image when Docker works");
+assert.match(sh, /detect_public_ip/, "detects the server's public IPv4 for the summary link");
+assert.match(sh, /Domain for HTTPS \(optional/, "offers an optional domain prompt");
+assert.match(sh, /--no-domain/, "can skip the domain prompt");
+assert.match(sh, /VPS IP link/, "prints the direct IP link next to an HTTPS URL");
 const shHelp = run("bash", ["scripts/install-vps.sh", "--help"]);
 assert.ok(shHelp.includes("--prebuilt") && shHelp.includes("--https"), "--help shows real options");
+assert.ok(shHelp.includes("--domain") && shHelp.includes("--no-domain"), "shell --help documents the domain options");
 assert.ok(shHelp.includes("--build") && shHelp.includes("--node"), "shell --help documents the methods");
 assert.ok(!/set -euo pipefail/.test(shHelp), "--help does not leak the script body");
 

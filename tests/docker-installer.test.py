@@ -46,11 +46,24 @@ class InstallerTest(unittest.TestCase):
         self.log = self.root / "calls"
         self.unit = self.root / "unit"
         self.fake("id", 'if [ "$1" = "-u" ]; then echo 0; else echo test; fi')
+        # Deterministic addressing: no public IP in the sandbox, so the summary
+        # keeps the "<your-vps-ip>" placeholder unless a test supplies one.
+        self.fake("ip", '''case "$*" in
+  *"route get"*) echo "1.1.1.1 via 10.0.0.1 dev eth0 src 10.0.0.5 uid 0" ;;
+esac''')
+        self.fake("hostname", 'echo "10.0.0.5"')
+        self.fake("getent", "exit 1")
+        self.fake("caddy", 'printf "caddy %s\\n" "$*" >> "$TEST_LOG"')
         self.fake("docker", '''printf "docker PORT=%s %s\\n" "${PORT-}" "$*" >> "$TEST_LOG"
 if [ "$1" = info ] && [ "${TEST_INFO_FAIL:-0}" = 1 ]; then exit 1; fi
 if [ "$1" = inspect ]; then [ "${TEST_RUNNING:-0}" = 1 ] && echo true; exit 0; fi
 if [ "$1" = compose ] && [ "$2" = version ] && [ "${TEST_NO_V2:-0}" = 1 ]; then exit 1; fi''')
         self.fake("curl", '''printf "curl %s\\n" "$*" >> "$TEST_LOG"
+if [ "${TEST_CURL_IP+x}" ]; then
+  case "$*" in
+    *ipify*|*ifconfig*|*icanhazip*) printf '%s' "$TEST_CURL_IP"; exit 0 ;;
+  esac
+fi
 if [ "${TEST_CURL_RESPONSE+x}" ]; then printf '%s' "$TEST_CURL_RESPONSE"
 else printf '%s' '{"mode":"vps","websocketSsh":true}'; fi''')
         self.fake("sleep", "exit 0")
@@ -73,7 +86,9 @@ else printf '%s' '{"mode":"vps","websocketSsh":true}'; fi''')
         return subprocess.run(["bash", str(SCRIPT), "--dir", str(self.target), *args],
                               env=env or self.env, text=True, capture_output=True, timeout=20)
 
-    PROMPT_PATTERNS = (b"Web UI port [", b"Install method [", b"Continue and potentially restart it? [y/N]:")
+    PROMPT_PATTERNS = (b"Web UI port [", b"Install method [",
+                       b"Domain for HTTPS (optional, Enter to skip):",
+                       b"Continue and potentially restart it? [y/N]:")
 
     @staticmethod
     def answer_new_prompts(master, output, answers, sent):
@@ -88,14 +103,14 @@ else printf '%s' '{"mode":"vps","websocketSsh":true}'; fi''')
             sent += 1
         return sent
 
-    def run_piped_tty(self, answers, *args):
+    def run_piped_tty(self, answers, *args, env=None):
         master, slave = pty.openpty()
         cmd = f"cat {shlex.quote(str(SCRIPT))} | bash -s -- --dir {shlex.quote(str(self.target))} " + " ".join(map(shlex.quote, args))
         def setup():
             os.setsid()
             fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
         proc = subprocess.Popen(["bash", "-c", cmd], stdin=slave, stdout=slave, stderr=slave,
-                                env=self.env, preexec_fn=setup, close_fds=True)
+                                env=env or self.env, preexec_fn=setup, close_fds=True)
         os.close(slave)
         output = b""
         answers = iter(answers)
@@ -124,7 +139,7 @@ else printf '%s' '{"mode":"vps","websocketSsh":true}'; fi''')
         return proc.returncode, output.decode(errors="replace")
 
     def test_piped_interactive_prompt_validates_and_persists_port(self):
-        code, output = self.run_piped_tty(["0", "8088", "build"])
+        code, output = self.run_piped_tty(["0", "8088", "build", ""])
         self.assertEqual(code, 0, output)
         self.assertIn("Web UI port [3000]", output)
         self.assertIn("Enter a port from 1 to 65535", output)
@@ -136,10 +151,84 @@ else printf '%s' '{"mode":"vps","websocketSsh":true}'; fi''')
         self.assertIn("127.0.0.1:8088/api/system/capabilities", self.log.read_text())
         self.assertEqual((self.target / ".env").stat().st_mode & 0o777, 0o600)
 
+    def test_summary_shows_the_detected_public_ip_link(self):
+        result = self.run_installer("--port", "4321", "--build",
+                                    env={**self.env, "TEST_CURL_IP": "203.0.113.7"})
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertIn("http://203.0.113.7:4321", result.stdout)
+        self.assertIn("Sushi is up!", result.stdout)
+        self.assertNotIn("<your-vps-ip>", result.stdout)
+        self.assertIn("curl -fsS -m 4 https://api.ipify.org", self.log.read_text())
+        # The direct IP link is still printed when HTTPS is layered on top.
+        result = self.run_installer("--port", "4322", "--build", "--domain", "sushi.example.com",
+                                    env={**self.env, "TEST_CURL_IP": "203.0.113.7"})
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertIn("Sushi is up!  https://sushi.example.com", result.stdout)
+        self.assertIn("VPS IP link:  http://203.0.113.7:4322", result.stdout)
+        self.assertIn("reverse_proxy 127.0.0.1:4322", self.unit.read_text())
+
+    def test_public_ip_override_is_validated_and_private_fallback_is_labelled(self):
+        result = self.run_installer("--port", "4321", "--build",
+                                    env={**self.env, "SUSHI_PUBLIC_IP": "198.51.100.9"})
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertIn("http://198.51.100.9:4321", result.stdout)
+        result = self.run_installer("--port", "4321", "--build",
+                                    env={**self.env, "SUSHI_PUBLIC_IP": "not-an-ip"})
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertIn("Ignoring SUSHI_PUBLIC_IP=not-an-ip", result.stderr)
+        self.assertIn("http://<your-vps-ip>:4321", result.stdout)
+        # Without a public lookup the fake host IP (10.0.0.5) is private, not a link.
+        self.assertIn("local/private", result.stdout)
+        self.assertIn("it is behind NAT", result.stdout)
+        self.assertNotIn("http://10.0.0.5:4321 (direct", result.stdout)
+
+    def test_domain_prompt_is_optional_and_skips_https_on_enter(self):
+        code, output = self.run_piped_tty(["build", ""], "--port", "8089")
+        self.assertEqual(code, 0, output)
+        self.assertIn("Domain for HTTPS (optional, Enter to skip):", output)
+        self.assertIn("http://<your-vps-ip>:8089", output)
+        self.assertNotIn("Configuring Caddy", output)
+        self.assertIn("--https your.domain", output)
+
+    def test_domain_prompt_validates_normalizes_and_configures_caddy(self):
+        code, output = self.run_piped_tty(["build", "not a domain", "https://Sushi.Example.com/"],
+                                          "--port", "8090")
+        self.assertEqual(code, 0, output)
+        self.assertIn("Enter a domain like sushi.example.com", output)
+        self.assertIn("Sushi is up!  https://sushi.example.com", output)
+        self.assertIn("VPS IP link:  http://<your-vps-ip>:8090", output)
+        self.assertIn("reverse_proxy 127.0.0.1:8090", self.unit.read_text())
+        self.assertIn("systemctl reload caddy", self.log.read_text())
+
+    def test_domain_prompt_reports_dns_mismatch(self):
+        self.fake("getent", 'echo "192.0.2.99  STREAM sushi.example.com"')
+        code, output = self.run_piped_tty(["build", "sushi.example.com"], "--port", "8092",
+                                          env={**self.env, "TEST_CURL_IP": "203.0.113.7"})
+        self.assertEqual(code, 0, output)
+        self.assertIn("sushi.example.com resolves to 192.0.2.99, not 203.0.113.7", output)
+
+    def test_domain_flag_validates_normalizes_and_bypasses_the_prompt(self):
+        result = self.run_installer("--port", "8091", "--build", "--domain", "HTTPS://Sushi.Example.com/",
+                                    env={**self.env, "TEST_CURL_IP": "203.0.113.7"})
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertNotIn("Domain for HTTPS", result.stdout)
+        self.assertIn("Sushi is up!  https://sushi.example.com", result.stdout)
+        self.assertIn("VPS IP link:  http://203.0.113.7:8091", result.stdout)
+        for value in ("not a domain", "example", "https://"):
+            result = self.run_installer("--port", "8091", "--build", "--domain", value)
+            self.assertNotEqual(result.returncode, 0, value)
+            self.assertIn("Invalid domain", result.stderr)
+
+    def test_no_domain_flag_skips_the_prompt(self):
+        code, output = self.run_piped_tty(["build"], "--port", "8093", "--no-domain")
+        self.assertEqual(code, 0, output)
+        self.assertNotIn("Domain for HTTPS", output)
+        self.assertIn("http://<your-vps-ip>:8093", output)
+
     def test_existing_port_default_and_credentials_survive_reruns(self):
         env = self.target / ".env"
         env.write_text('SUSHI_AUTH_SECRET=keep-this-secret\nPORT=1234\nexport PORT="8080" # current\nOTHER=value\n')
-        code, output = self.run_piped_tty(["", ""])
+        code, output = self.run_piped_tty(["", "", ""])
         self.assertEqual(code, 0, output)
         self.assertIn("Web UI port [8080]", output)
         self.assertIn("Install method [prebuilt]", output)
@@ -206,11 +295,11 @@ else printf '%s' '{"mode":"vps","websocketSsh":true}'; fi''')
         self.assertIn("No terminal for confirmation", result.stderr)
         self.assertEqual(env_file.read_text(), original)
         self.assertNotIn("compose up", self.log.read_text())
-        code, output = self.run_piped_tty(["prebuilt", "n"], "--port", "8787")
+        code, output = self.run_piped_tty(["prebuilt", "", "n"], "--port", "8787")
         self.assertNotEqual(code, 0, output)
         self.assertIn("running container was not changed", output)
         self.assertEqual(env_file.read_text(), original)
-        code, output = self.run_piped_tty(["prebuilt", "y"], "--port", "8787")
+        code, output = self.run_piped_tty(["prebuilt", "", "y"], "--port", "8787")
         self.assertEqual(code, 0, output)
         self.assertIn("PORT=8787", env_file.read_text())
         result = self.run_installer("--port", "8788", "--yes")

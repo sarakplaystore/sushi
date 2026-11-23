@@ -3,9 +3,10 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/sarakplaystore/sushi/main/scripts/install-vps.sh | bash
 #
-#   # The installer asks for the web UI port (default: 3000).
-#   # For unattended installs, pass a port explicitly:
-#   curl -fsSL https://raw.githubusercontent.com/sarakplaystore/sushi/main/scripts/install-vps.sh | bash -s -- --port 8080
+#   # The installer asks for the install method (prebuilt Docker is recommended)
+#   # and the web UI port (default: 3000).
+#   # For unattended installs, pass explicit flags:
+#   curl -fsSL https://raw.githubusercontent.com/sarakplaystore/sushi/main/scripts/install-vps.sh | bash -s -- --prebuilt --port 8080
 #
 #   # or from a checkout, with options:
 #   bash scripts/install-vps.sh --port 8080
@@ -29,11 +30,14 @@ PORT="${PORT:-}"
 PORT_EXPLICIT=0
 [ -n "$PORT" ] && PORT_EXPLICIT=1
 HTTPS_DOMAIN=""
-MODE="build"          # build | prebuilt | node
+FORCED_METHOD=""      # explicit --build / --prebuilt / --node, last flag wins
+MODE="build"          # the effective install method (build | prebuilt | node)
 INSTALL_DIR="${SUSHI_DIR:-$PWD/sushi}"
 WAIT_SECONDS=180
 ASSUME_YES=0
 COMPOSE_KIND=""
+
+have() { command -v "$1" >/dev/null 2>&1; }
 
 bold() { printf '\033[1m==> %s\033[0m\n' "$*"; }
 ok()   { printf '  \033[32m✔\033[0m %s\n' "$*"; }
@@ -47,9 +51,10 @@ Usage: bash install-vps.sh [options]
   --port PORT       Web UI port (1–65535; default 3000)
   --dir PATH        Install directory (default ./sushi)
   --yes             Allow restarting an existing running Sushi container
-  --prebuilt        Use the published image instead of building from source
-  --https DOMAIN    Configure Caddy for HTTPS
+  --build           Build the image from source with Docker Compose
+  --prebuilt        Pull the published image instead of building (fastest)
   --node            Install with Node.js instead of Docker
+  --https DOMAIN    Configure Caddy for HTTPS
   --timeout SECONDS Time to wait for health (default 180)
   -h, --help        Show this help
 HELP
@@ -60,8 +65,9 @@ while [ $# -gt 0 ]; do
     --port) [ $# -ge 2 ] || die "--port requires a value"; PORT="$2"; PORT_EXPLICIT=1; shift 2 ;;
     --dir) [ $# -ge 2 ] || die "--dir requires a value"; INSTALL_DIR="$2"; shift 2 ;;
     --https) [ $# -ge 2 ] || die "--https requires a value"; HTTPS_DOMAIN="$2"; shift 2 ;;
-    --prebuilt) MODE="prebuilt"; shift ;;
-    --node) MODE="node"; shift ;;
+    --build) FORCED_METHOD="build"; shift ;;
+    --prebuilt) FORCED_METHOD="prebuilt"; shift ;;
+    --node) FORCED_METHOD="node"; shift ;;
     --timeout) [ $# -ge 2 ] || die "--timeout requires a value"; WAIT_SECONDS="$2"; shift 2 ;;
     --yes) ASSUME_YES=1; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -91,6 +97,10 @@ saved_port() {
     END { if (port != "") print port }
   ' "$INSTALL_DIR/.env"
 }
+
+bold "Sushi installer — self-hosted web SSH · SFTP · RDP workspace"
+echo "  install dir: $INSTALL_DIR"
+echo
 
 valid_port() {
   [[ "$1" =~ ^[0-9]{1,5}$ ]] && [ "$((10#$1))" -ge 1 ] && [ "$((10#$1))" -le 65535 ]
@@ -128,21 +138,54 @@ choose_port() {
 
 choose_port
 
-bold "Sushi installer — self-hosted web SSH · SFTP · RDP workspace"
-echo "  install dir: $INSTALL_DIR"
-echo "  port:        $PORT"
-echo "  mode:        $MODE"
-echo
-
 # ---------------------------------------------------------------- privileges ---
 SUDO=""
 if [ "$(id -u)" -ne 0 ]; then
   if command -v sudo >/dev/null 2>&1; then SUDO="sudo"; else die "Run as root or install sudo."; fi
 fi
 
-# ------------------------------------------------------------- prerequisites ---
-have() { command -v "$1" >/dev/null 2>&1; }
+# -------------------------------------------------------------- install method ---
+choose_method() {
+  if [ -n "$FORCED_METHOD" ]; then MODE="$FORCED_METHOD"; return 0; fi
+  # Detection uses the current user's Docker access, falling back to
+  # non-interactive sudo (no password prompt). When Docker works, the
+  # fastest fit is the prebuilt image; otherwise Node.js.
+  local recommended="node"
+  if have docker && docker info >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+    recommended="prebuilt"
+  elif have docker && command -v sudo >/dev/null 2>&1 && sudo -n docker info >/dev/null 2>&1 && sudo -n docker compose version >/dev/null 2>&1; then
+    recommended="prebuilt"
+  fi
+  local tty_input="" answer=""
+  if [ -t 0 ]; then tty_input=/dev/stdin
+  elif ( : </dev/tty ) 2>/dev/null; then tty_input=/dev/tty
+  fi
+  if [ -z "$tty_input" ]; then
+    MODE="$recommended"
+    echo "No interactive terminal; using install method $MODE (override with --build / --prebuilt / --node)."
+    return 0
+  fi
+  while :; do
+    printf 'Install method [%s] (build | prebuilt | node): ' "$recommended" >&2
+    IFS= read -r answer <"$tty_input" || die "Method selection cancelled."
+    answer="$(printf '%s' "$answer" | tr '[:upper:]' '[:lower:]')"
+    if [ -z "$answer" ]; then MODE="$recommended"; return 0; fi
+    case "$answer" in
+      p|prebuilt|images|fastest) MODE="prebuilt"; return 0 ;;
+      b|build) MODE="build"; return 0 ;;
+      n|node|nodejs) MODE="node"; return 0 ;;
+    esac
+    warn "Choose build, prebuilt, or node."
+  done
+}
 
+choose_method
+
+echo "  port:        $PORT"
+echo "  mode:        $MODE"
+echo
+
+# ------------------------------------------------------------- prerequisites ---
 ensure_git_and_curl() {
   have git && have curl && return 0
   warn "Installing git and curl…"

@@ -444,7 +444,10 @@ The database is parsed with SQLite compiled to WebAssembly (`sql.js`) and decryp
 **Recommended: use the [one-click Docker installer](#one-click-docker-install)**
 for Sushi's Web UI, SSH, SFTP and guacd for RDP on a Linux server.
 
-The installer asks for the **web UI port**, defaulting to `3000`; choose an unused
+The installer asks for the **install method**, recommending the prebuilt Docker
+image (fastest — it pulls the published image instead of compiling); the
+choices are prebuilt Docker, source-built Docker Compose, or Node.js without
+Docker. It also asks for the **web UI port**, defaulting to `3000`; choose an unused
 port from 1–65535. The app listens on that host port and uses port 3000 inside the
 container. It will print the URL after the health check. The choice is saved in
 `.env` and offered again when you rerun the installer. Explicit `--port` or the
@@ -452,9 +455,13 @@ container. It will print the URL after the health check. The choice is saved in
 (or 3000 for a new install) is used. When the installer is piped or run over SSH,
 the prompt reads the controlling terminal (`/dev/tty`), so `curl … | bash` and
 remote sessions work — with no terminal at all it falls back to the default.
-**`python3 install.py` behaves the same way**: it prompts for the port before
-downloading or building (Node.js port path included), falling back to the
-default when it cannot prompt. For unattended installs:
+The install-method prompt behaves the same way: explicit flags bypass it, an empty
+answer takes the recommendation, and with no terminal at all the installer uses the
+recommendation (prebuilt when Docker works, otherwise Node.js) and prints a note
+instead of blocking.
+**`python3 install.py` behaves the same way**: it prompts for the method and the
+port before downloading or building (Node.js port path included), falling back to
+the recommendation and the default when it cannot prompt. For unattended installs:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/sarakplaystore/sushi/main/scripts/install-vps.sh | bash -s -- --port 8080
@@ -482,7 +489,8 @@ Docker is the primary setup; the other deployment methods remain available:
 
 | You have | Run this | Notes |
 | --- | --- | --- |
-| **Docker** (recommended) | `curl -fsSL https://raw.githubusercontent.com/sarakplaystore/sushi/main/scripts/install-vps.sh \| bash` | Installs Docker if missing, starts Sushi + guacd, waits for health, prints the URL. Debian/Ubuntu, Rocky/Alma, Fedora, Arch, Alpine |
+| **Docker, prebuilt image** (recommended, fastest) | `curl -fsSL https://raw.githubusercontent.com/sarakplaystore/sushi/main/scripts/install-vps.sh \| bash` | Asks for the install method — prebuilt is the default (pulls the published image instead of compiling). Installs Docker if missing, starts Sushi + guacd, waits for health, prints the URL. Debian/Ubuntu, Rocky/Alma, Fedora, Arch, Alpine |
+| **Docker, source build** | `curl -fsSL https://raw.githubusercontent.com/sarakplaystore/sushi/main/scripts/install-vps.sh \| bash -s -- --build` | Same, but compiles from source with `docker compose up -d --build` |
 | **Docker, prebuilt image** (fastest, no compile) | `docker run -d --name sushi -p 3000:3000 -v sushi-data:/app/data --restart unless-stopped ghcr.io/sarakplaystore/sushi:latest` | Pulls a multi-arch image (~1 min). Needs a separate `guacd` only if you want *live* RDP |
 | **Docker Compose, no clone** | `curl -fsSLO https://raw.githubusercontent.com/sarakplaystore/sushi/main/docker-compose.prebuilt.yml && docker compose -f docker-compose.prebuilt.yml up -d` | Sushi **+ guacd** from the published image |
 | **Python 3.9+** (no Docker needed) | `python3 install.py` | Cross-platform (Linux, macOS, Windows via WSL). Prompts for the web UI port, downloads the source, `npm ci`, builds, starts in the background and health-checks it |
@@ -491,14 +499,15 @@ Docker is the primary setup; the other deployment methods remain available:
 | **Vercel + native PTY** | Vercel for the UI, Railway or Render for [`Dockerfile.gateway`](Dockerfile.gateway) | See [Deploy to Vercel](#3-deploy-to-vercel--optional-companion-gateway-vps-railway-or-render) — no server to maintain |
 
 Useful installer flags: `--port 8080`, `--dir ~/sushi`, `--https your.domain` (adds Caddy with
-automatic HTTPS), `--yes` (allow restarting an existing Sushi container), `--prebuilt` (skip the build), `--node` (no Docker: Node.js), and
+automatic HTTPS), `--yes` (allow restarting an existing Sushi container), `--prebuilt` (pull the published image — recommended),
+`--build` (compile from source; Python: `--docker`), `--node` (no Docker: Node.js), and
 `--foreground` (Python: keep it in this terminal). The VPS installer preserves credentials and data on reruns, updating only `PORT`
 in an existing `.env`. The Compose volume is not deleted by ordinary `docker compose down`
 (do not add `-v`). Restarting or upgrading the container **ends its active SSH PTYs**;
 let important interactive commands finish first.
 
 > **Prebuilt image:** the prebuilt options require the GHCR image to be available for your
-> architecture. If it is unavailable, use the recommended source-building installer above.
+> architecture. If it is unavailable, choose the source-build method (or pass `--build`).
 
 ### 0. One-click deploys
 
@@ -539,8 +548,9 @@ docker compose up -d --build
 Or run the one-step installer (any Linux distro, adds `--https your.domain` for Caddy):
 
 ```bash
-bash scripts/install-vps.sh                 # build locally
-bash scripts/install-vps.sh --prebuilt      # pull ghcr.io image instead
+bash scripts/install-vps.sh                 # asks — prebuilt Docker is the default
+bash scripts/install-vps.sh --prebuilt      # pull the published image, no compile
+bash scripts/install-vps.sh --build         # build from source
 bash scripts/install-vps.sh --node          # no Docker: Node.js
 ```
 

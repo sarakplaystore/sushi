@@ -107,6 +107,18 @@ class TtyHarness:
         output = b""
         answers = iter(answers)
         sent = 0
+
+        def answer_new_prompts():
+            nonlocal sent
+            count = output.count(b"Web UI port [") + output.count(b"Install method [")
+            while count > sent:
+                try:
+                    answer = next(answers)
+                except StopIteration:
+                    return
+                os.write(master, (answer + "\n").encode())
+                sent += 1
+
         try:
             deadline = time.monotonic() + timeout
             while time.monotonic() < deadline:
@@ -119,12 +131,7 @@ class TtyHarness:
                     if not chunk:
                         break
                     output += chunk
-                    while output.count(b"Web UI port [") > sent:
-                        try:
-                            os.write(master, (next(answers) + "\n").encode())
-                        except StopIteration:
-                            break
-                        sent += 1
+                    answer_new_prompts()
                 if proc.poll() is not None and not readable:
                     break
             proc.wait(timeout=3)
@@ -154,32 +161,58 @@ class PortPromptIntegrationTest(unittest.TestCase):
     def piped_cmd(self, *extra):
         return (
             f"cat {shlex.quote(str(INSTALLER))} | {shlex.quote(sys.executable)} - "
-            f"--docker --dir {shlex.quote(str(self.target))} "
+            f"--dir {shlex.quote(str(self.target))} "
             + " ".join(map(shlex.quote, map(str, extra)))
         )
 
-    def test_piped_install_prompts_on_controlling_tty(self):
-        code, output = self.harness.run_piped(self.piped_cmd(), ["0", "8088"])
+    def test_piped_install_prompts_and_method_selection_on_controlling_tty(self):
+        code, output = self.harness.run_piped(self.piped_cmd(), ["0", "8088", "build"])
         self.assertEqual(code, 1, output)
         self.assertIn("Web UI port [3000]", output)
         self.assertIn("Enter a port from 1 to 65535", output)
+        self.assertIn("Install method [node]", output)
         self.assertIn("Docker Compose v2 is missing", output)
         self.assertFalse((self.target / ".env").exists())
 
     def test_stdin_tty_prompts_and_validates(self):
-        args = [sys.executable, str(INSTALLER), "--docker", "--dir", str(self.target)]
-        code, output = self.harness.run_stdin_tty(args, ["0", "not-a-port", "8088"])
+        args = [sys.executable, str(INSTALLER), "--dir", str(self.target)]
+        code, output = self.harness.run_stdin_tty(args, ["0", "not-a-port", "8088", "build"])
         self.assertEqual(code, 1, output)
         self.assertIn("Web UI port [3000]", output)
         self.assertIn("Enter a port from 1 to 65535", output)
+        self.assertIn("Install method [node]", output)
         self.assertIn("Docker Compose v2 is missing", output)
 
-    def test_saved_port_becomes_the_default(self):
+    def test_saved_port_becomes_the_default_and_method_default_is_shown(self):
         self.target.mkdir(parents=True, exist_ok=True)
         (self.target / ".env").write_text("SUSHI_AUTH_SECRET=keep-this-secret\nPORT=4321\n")
-        code, output = self.harness.run_piped(self.piped_cmd(), [""])
+        code, output = self.harness.run_piped(self.piped_cmd(), ["", "build"])
         self.assertEqual(code, 1, output)
         self.assertIn("Web UI port [4321]", output)
+        self.assertIn("Install method [node]", output)
+
+    def test_no_terminal_explicit_docker_skips_method_note(self):
+        # No tty + an explicit --docker: no port/method prompts, no notes.
+        args = [sys.executable, str(INSTALLER), "--docker", "--dir", str(self.target)]
+        code, output = self.harness.run_plain(args)
+        self.assertEqual(code, 1, output)
+        self.assertIn("No interactive terminal; using web UI port 3000", output)
+        self.assertNotIn("using install method", output)
+        self.assertIn("Docker Compose v2 is missing", output)
+
+    def test_no_terminal_uses_recommended_method_and_reports(self):
+        # No tty + no method flag: the method note prints, then the flow stops
+        # in the Node.js path at the (stubbed) npm step — nothing is downloaded.
+        npm = self.bin / "npm"
+        npm.write_text("#!/bin/sh\nexit 1\n")
+        npm.chmod(0o755)
+        self.target.mkdir(parents=True, exist_ok=True)
+        (self.target / "install.py").write_text("")
+        args = [sys.executable, str(INSTALLER), "--dir", str(self.target)]
+        code, output = self.harness.run_plain(args)
+        self.assertEqual(code, 1, output)
+        self.assertIn("No interactive terminal; using install method node", output)
+        self.assertIn("Could not install dependencies", output)
 
     def test_no_terminal_uses_default_and_reports(self):
         args = [sys.executable, str(INSTALLER), "--docker", "--dir", str(self.target)]
@@ -212,6 +245,85 @@ class PortPromptIntegrationTest(unittest.TestCase):
         self.assertNotIn("No interactive terminal", result.stdout)
         self.assertNotIn("Web UI port [", result.stdout)
         self.assertIn("Docker Compose v2 is missing", result.stdout)
+
+
+class ChooseMethodUnitTest(unittest.TestCase):
+    """Module-level tests for the install-method selection helpers."""
+
+    def setUp(self):
+        self.install = load_installer()
+
+    def choose(self, argv, answers=None):
+        import argparse
+        args = argparse.Namespace()
+        source = FakeInput(answers) if answers is not None else None
+        return self.install.choose_method(args, argv, source=source)
+
+    def test_explicit_flag_precedence_last_flag_wins(self):
+        self.assertEqual(self.install.explicit_method(["--docker"]), "build")
+        self.assertEqual(self.install.explicit_method(["--prebuilt"]), "prebuilt")
+        self.assertEqual(self.install.explicit_method(["--node"]), "node")
+        self.assertEqual(self.install.explicit_method(["--docker", "--prebuilt"]), "prebuilt")
+        self.assertEqual(self.install.explicit_method(["--prebuilt", "--node"]), "node")
+        self.assertIsNone(self.install.explicit_method(["--dir", "sushi", "--port", "8080"]))
+
+    def test_explicit_method_skips_prompt(self):
+        source = FakeInput(["node"])
+        self.assertEqual(self.choose(["--prebuilt"], ["x"]), "prebuilt")
+        self.assertEqual(self.choose(["--node"], ["x"]), "node")
+        self.assertEqual(self.choose(["--docker"], ["x"]), "build")
+
+    def test_choose_method_accepts_aliases(self):
+        self.assertEqual(self.choose([], ["fastest"]), "prebuilt")
+        self.assertEqual(self.choose([], ["p"]), "prebuilt")
+        self.assertEqual(self.choose([], ["images"]), "prebuilt")
+        self.assertEqual(self.choose([], ["docker"]), "build")
+        self.assertEqual(self.choose([], ["b"]), "build")
+        self.assertEqual(self.choose([], ["nodejs"]), "node")
+        self.assertEqual(self.choose([], ["n"]), "node")
+
+    def test_choose_method_reprompts_on_invalid_input(self):
+        self.assertEqual(self.choose([], ["nope", "build"]), "build")
+
+    def test_choose_method_empty_line_uses_recommended(self):
+        with unittest.mock.patch.object(self.install, "recommended_method", lambda: "prebuilt"):
+            self.assertEqual(self.choose([], [""]), "prebuilt")
+
+    def test_recommended_method_falls_back_to_node_without_docker(self):
+        with unittest.mock.patch.object(self.install, "docker_available", lambda: False):
+            self.assertEqual(self.install.recommended_method(), "node")
+        with unittest.mock.patch.object(self.install, "docker_available", lambda: True):
+            self.assertEqual(self.install.recommended_method(), "prebuilt")
+
+    def test_docker_available_stub(self):
+        tmp = Path(tempfile.mkdtemp())
+        bin_dir = tmp / "bin"
+        bin_dir.mkdir()
+        try:
+            docker = bin_dir / "docker"
+            docker.write_text("#!/bin/sh\nexit 0\n")
+            docker.chmod(0o755)
+            with unittest.mock.patch.dict(os.environ, {"PATH": str(bin_dir)}, clear=True):
+                self.assertTrue(self.install.docker_available())
+            docker.write_text("#!/bin/sh\nif [ \"$1\" = compose ]; then exit 1; fi\nexit 0\n")
+            docker.chmod(0o755)
+            with unittest.mock.patch.dict(os.environ, {"PATH": str(bin_dir)}, clear=True):
+                self.assertFalse(self.install.docker_available())
+            with unittest.mock.patch.dict(os.environ, {"PATH": str(tmp / "empty")}, clear=True):
+                self.assertFalse(self.install.docker_available())
+        finally:
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_no_terminal_prints_note_and_uses_recommended(self):
+        import argparse
+        stdout = io.StringIO()
+        with unittest.mock.patch.object(self.install.sys, "stdin", io.StringIO()), \
+             unittest.mock.patch.object(self.install.sys, "stdout", stdout), \
+             unittest.mock.patch.object(self.install, "_open_controlling_tty", lambda: None):
+            args = argparse.Namespace()
+            self.assertEqual(self.install.choose_method(args, [], source=None), "node")
+        self.assertIn("using install method node", stdout.getvalue())
 
 
 class ChoosePortUnitTest(unittest.TestCase):

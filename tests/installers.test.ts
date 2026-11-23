@@ -42,6 +42,10 @@ assert.match(py, /Web UI port/, "prompts for the web UI port when --port/PORT ar
 assert.match(py, /dev\/tty/, "reads the controlling terminal when piped or run over SSH");
 assert.match(py, /isatty/, "detects when stdin is a terminal");
 assert.match(py, /No interactive terminal/, "prints a note and uses the default when no terminal exists");
+assert.match(py, /--prebuilt/, "supports the prebuilt image path");
+assert.match(py, /--node/, "forces the Node.js install");
+assert.match(py, /Install method/, "prompts for the install method");
+assert.match(py, /prebuilt/, "recommends the fastest prebuilt image when Docker works");
 assert.match(py, /Start Sushi|installer/i, "has a user-facing banner");
 assert.match(py, /DISCLAIMER\.md/, "points at the disclaimer");
 // Helps, rather than failing silently, when Node is missing.
@@ -54,6 +58,8 @@ for (const flag of ["--dir", "--port", "--host", "--branch", "--docker", "--fore
   assert.ok(help.includes(flag), `--help documents ${flag}`);
 }
 assert.ok(help.includes("prompted interactively"), "--help explains the interactive port prompt");
+assert.ok(help.includes("--prebuilt"), "--help documents --prebuilt");
+assert.ok(help.includes("--node"), "--help documents --node");
 assert.equal(run("python3", ["install.py", "--version"]).trim(), "Sushi installer 1.0.0");
 
 // ---- shell installer ------------------------------------------------------------
@@ -71,8 +77,12 @@ assert.match(sh, /api\/system\/capabilities/, "health-checks after starting");
 assert.match(sh, /if \[ ! -f \.env \]/, "never deletes an existing .env");
 assert.match(sh, /apt-get|dnf|apk/, "handles multiple distros");
 assert.match(sh, /--port|--https|--prebuilt|--node/, "documents its flags");
+assert.match(sh, /--build/, "supports the build-from-source path");
+assert.match(sh, /Install method/, "prompts for the install method");
+assert.match(sh, /prebuilt/, "recommends the prebuilt image when Docker works");
 const shHelp = run("bash", ["scripts/install-vps.sh", "--help"]);
 assert.ok(shHelp.includes("--prebuilt") && shHelp.includes("--https"), "--help shows real options");
+assert.ok(shHelp.includes("--build") && shHelp.includes("--node"), "shell --help documents the methods");
 assert.ok(!/set -euo pipefail/.test(shHelp), "--help does not leak the script body");
 
 // ---- prebuilt compose + image publishing ---------------------------------------

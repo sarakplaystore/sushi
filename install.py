@@ -4,22 +4,28 @@ Sushi — one-click installer (Python 3.9+, no third-party packages).
 
     python3 install.py                  # install + build + start in the background
     python3 install.py --foreground     # install + build + run in this terminal
-    python3 install.py --docker         # use Docker Compose instead of Node.js
+    python3 install.py --prebuilt       # pull the published image (fastest; Docker)
+    python3 install.py --docker         # use Docker Compose and build from source
+    python3 install.py --node           # force the Node.js install
     python3 install.py --port 8080      # pick a port without prompting
     python3 install.py --dir ~/sushi    # pick an install directory
     python3 install.py --no-start       # install + build only
 
 Without --port or a PORT environment variable, the installer asks for the web UI
-port before doing anything else. The prompt reads stdin when it is a terminal and
-falls back to the controlling terminal (/dev/tty) when the installer is piped or
-run over SSH — so `curl ... | bash` and remote sessions both work. In a fully
-unattended run (no terminal), it uses 3000 (or the port saved in an existing
-.env) and prints a note explaining that --port overrides it.
+port before doing anything else. Likewise, without --docker / --prebuilt / --node
+it asks how to install — the recommendation is the fastest fit for this VPS (the
+pull-and-run prebuilt image when Docker works, Node.js otherwise). Both prompts
+read stdin when it is a terminal and fall back to the controlling terminal
+(/dev/tty) when the installer is piped or run over SSH — so `curl ... | bash` and
+remote sessions both work. In a fully unattended run (no terminal), the installer
+uses the default port and recommended method and prints a note explaining that
+the flags override both.
 
 What it does, in order:
-  1. Asks you for the web UI port (unless --port / PORT is given), then checks
-     that Node.js >= 20 (or Docker, with --docker) exists — and tells you the
-     one command to install it if not.
+  1. Asks you for the web UI port (unless --port / PORT is given) and for the
+     install method (unless --docker / --prebuilt / --node is given), then checks
+     that Node.js >= 20 (or Docker) exists — and tells you the one command to
+     install it if not.
   2. Downloads the latest Sushi source (git clone, falling back to a GitHub
      tarball when git is unavailable).
   3. `npm ci` + `npm run build` with output-streaming, then starts the server.
@@ -156,6 +162,31 @@ def require_node() -> None:
             NODE_HINT.get(platform.system().lower(), "Download a newer version from https://nodejs.org"),
         )
     ok(f"Node.js {version[0]}.{version[1]}.{version[2]}")
+
+
+def _quiet_run(cmd: list[str]) -> int:
+    """Run a command quietly and return its exit code."""
+    try:
+        result = subprocess.run(cmd, capture_output=True, timeout=30)
+        return result.returncode
+    except (OSError, subprocess.SubprocessError):
+        return 1
+
+
+def docker_available() -> bool:
+    """True when Docker can actually be used in this shell (no sudo needed)."""
+    if which("docker") is None:
+        return False
+    if _quiet_run(["docker", "compose", "version"]) != 0:
+        return False
+    if _quiet_run(["docker", "info"]) != 0:
+        return False
+    return True
+
+
+def recommended_method() -> str:
+    """Fastest fit for this VPS: the pulled prebuilt image when Docker works."""
+    return "prebuilt" if docker_available() else "node"
 
 
 def require_docker() -> None:
@@ -382,6 +413,68 @@ def choose_port(args: argparse.Namespace, target: str, source=None) -> int:
         tty.close()
 
 
+# --------------------------------------------------------------------------- #
+# install method selection (Docker prebuilt / Docker build / Node.js)
+# --------------------------------------------------------------------------- #
+METHOD_ALIASES = {
+    "prebuilt": ("prebuilt", "p", "images", "fastest"),
+    "build": ("build", "b", "docker"),
+    "node": ("node", "n", "nodejs"),
+}
+
+EXPLICIT_METHOD_FLAGS = {
+    "--docker": "build",
+    "--prebuilt": "prebuilt",
+    "--node": "node",
+}
+
+
+def explicit_method(argv: list[str]) -> str | None:
+    """Explicit --docker/--prebuilt/--node (last flag wins), or None."""
+    chosen = None
+    for token in argv:
+        if token in EXPLICIT_METHOD_FLAGS:
+            chosen = EXPLICIT_METHOD_FLAGS[token]
+    return chosen
+
+
+def choose_method(args: argparse.Namespace, argv: list[str], source=None) -> str:
+    """Pick the install method.
+
+    --docker / --prebuilt / --node win outright; otherwise ask interactively
+    (the recommendation is the fastest fit for this VPS). No terminal → use the
+    recommendation with a printed note, so unattended installs never block.
+    """
+    explicit = explicit_method(argv)
+    if explicit:
+        return explicit
+
+    recommended = recommended_method()
+
+    tty = ConsoleInput(source)
+    if not tty.available():
+        print(f"No interactive terminal; using install method {recommended} (override with --prebuilt / --docker / --node).")
+        return recommended
+    try:
+        while True:
+            print(f"Install method [{recommended}] (build | prebuilt | node): ", file=sys.stderr, flush=True)
+            try:
+                answer = tty.readline()
+            except OSError:
+                answer = None
+            if not answer:
+                fail("Method selection cancelled.")
+            answer = answer.strip().lower()
+            if not answer:
+                return recommended
+            for method, aliases in METHOD_ALIASES.items():
+                if answer in aliases:
+                    return method
+            warn("Choose build, prebuilt, or node.")
+    finally:
+        tty.close()
+
+
 def write_env_port(target: str, port: int) -> None:
     """Create or update the .env PORT in the Docker install path.
 
@@ -515,9 +608,17 @@ def install_with_docker(args: argparse.Namespace, target: str) -> int:
 
     write_env_port(target, args.port)
 
-    step("Building and starting Sushi + guacd with Docker Compose…")
-    if run(["docker", "compose", "up", "-d", "--build"], cwd=target) != 0:
-        fail("Docker Compose failed.", "Run `docker compose up --build` in the directory to see the error.")
+    prebuilt = args.method == "prebuilt"
+    if prebuilt:
+        step("Pulling the published image and starting Sushi + guacd…")
+        cmd = ["docker", "compose", "-f", "docker-compose.prebuilt.yml", "up", "-d"]
+        fail_hint = "Run `docker compose -f docker-compose.prebuilt.yml up -d` in the directory to see the error."
+    else:
+        step("Building and starting Sushi + guacd with Docker Compose…")
+        cmd = ["docker", "compose", "up", "-d", "--build"]
+        fail_hint = "Run `docker compose up --build` in the directory to see the error."
+    if run(cmd, cwd=target) != 0:
+        fail("Docker Compose failed.", fail_hint)
 
     if not wait_for_health(args.port, args.timeout):
         warn("The container is running but has not answered yet — check `docker compose logs -f sushi`.")
@@ -535,8 +636,9 @@ def print_summary(args: argparse.Namespace, target: str, pid: str | None = None,
     print(f"  Data:      {args.data_dir or os.path.join(target, 'data')}  {Style.dim('(back this up — account + encrypted vault)')}")
     print()
     if docker:
-        print(f"  Stop:      cd {target} && docker compose down")
-        print(f"  Logs:      cd {target} && docker compose logs -f sushi")
+        compose_file = "-f docker-compose.prebuilt.yml " if getattr(args, "method", None) == "prebuilt" else ""
+        print(f"  Stop:      cd {target} && docker compose {compose_file}down")
+        print(f"  Logs:      cd {target} && docker compose {compose_file}logs -f sushi")
     elif args.foreground:
         print("  Stop:      Ctrl+C")
     else:
@@ -565,7 +667,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--host", default="0.0.0.0", help="bind address (default: 0.0.0.0)")
     parser.add_argument("--data-dir", default=None, help="where auth.json / vault.enc.json live (default: <dir>/data)")
     parser.add_argument("--branch", default="main", help="git branch or tag to install (default: main)")
-    parser.add_argument("--docker", action="store_true", help="use Docker Compose (Sushi + guacd) instead of Node.js")
+    parser.add_argument("--docker", action="store_true", help="force Docker Compose with a build from source (Sushi + guacd)")
+    parser.add_argument("--prebuilt", action="store_true", help="pull the published Sushi image instead of building (fastest; Docker must work)")
+    parser.add_argument("--node", action="store_true", help="force the Node.js install (no Docker)")
     parser.add_argument("--foreground", action="store_true", help="keep the server attached to this terminal")
     parser.add_argument("--no-start", action="store_true", help="install and build, but do not start the server")
     parser.add_argument("--timeout", type=int, default=180, help="seconds to wait for the health check (default: 180)")
@@ -585,12 +689,14 @@ def main(argv: list[str]) -> int:
     step(f"Install directory: {target}")
 
     args.port = choose_port(args, target)
+    args.method = choose_method(args, argv)
+    print(Style.dim(f"  Port {args.port} · Method: {args.method}"))
 
     os.makedirs(target, exist_ok=True)
 
-    if args.docker:
-        return install_with_docker(args, target)
-    return install_with_node(args, target)
+    if args.method == "node":
+        return install_with_node(args, target)
+    return install_with_docker(args, target)
 
 
 if __name__ == "__main__":

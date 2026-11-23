@@ -447,10 +447,11 @@ The database is parsed with SQLite compiled to WebAssembly (`sql.js`) and decryp
 **Recommended: use the [one-click Docker installer](#one-click-docker-install)**
 for Sushi's Web UI, SSH, SFTP and guacd for RDP on a Linux server.
 
-The installer asks for the **install method**, recommending the prebuilt Docker
-image (fastest — it pulls the published image instead of compiling); the
-choices are prebuilt Docker, source-built Docker Compose, or Node.js without
-Docker. It also asks for the **web UI port**, defaulting to `3000`; choose an unused
+The installer shows a numbered **install method** menu: **1** prebuilt Docker
+image (recommended, fastest — it pulls the published image instead of compiling),
+**2** source-built Docker Compose, or **3** Node.js without Docker. Type a number
+or method name; Enter accepts the recommendation. It also asks for the **web UI
+port**, defaulting to `3000`; choose an unused
 port from 1–65535. The app listens on that host port and uses port 3000 inside the
 container. It will print the URL after the health check. The choice is saved in
 `.env` and offered again when you rerun the installer. Explicit `--port` or the
@@ -470,7 +471,9 @@ and finishes with a ready-to-open link, plus the direct IP link when HTTPS is us
 **`python3 install.py` behaves the same way**: it prompts for the method and the
 port before downloading or building (Node.js port path included), falls back to
 the recommendation and the default when it cannot prompt, and prints the same
-public IP link for its Node.js and Docker paths. For unattended installs:
+public IP link for its Node.js and Docker paths. If the Node.js path detects an
+outdated Node.js runtime, it asks before upgrading to version 22; decline to
+cancel safely. For unattended installs:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/sarakplaystore/sushi/main/scripts/install-vps.sh | bash -s -- --port 8080

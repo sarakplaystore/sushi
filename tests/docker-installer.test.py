@@ -139,7 +139,7 @@ else printf '%s' '{"mode":"vps","websocketSsh":true}'; fi''')
         return proc.returncode, output.decode(errors="replace")
 
     def test_piped_interactive_prompt_validates_and_persists_port(self):
-        code, output = self.run_piped_tty(["0", "8088", "build", ""])
+        code, output = self.run_piped_tty(["0", "8088", "2", ""])
         self.assertEqual(code, 0, output)
         self.assertIn("Web UI port [3000]", output)
         self.assertIn("Enter a port from 1 to 65535", output)

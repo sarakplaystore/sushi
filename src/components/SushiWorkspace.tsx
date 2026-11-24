@@ -293,21 +293,6 @@ export function SushiWorkspace() {
   }, [leaveAllHostsView]);
 
   /**
-   * Switches to the All-hosts view and gives it a real URL (`/?view=hosts`), so it can
-   * be bookmarked, reloaded and shared. `/hosts` itself is served by the route handler
-   * (a redirect into this view when the vault is encrypted, or the real table when the
-   * deployment configured a clear-text inventory).
-   */
-  const enterAllHostsView = useCallback(() => {
-    allHostsViewRef.current = true;
-    setAllHostsView({ enabled: true, deepLinkHostId: null });
-    if (typeof window !== "undefined") {
-      // A fresh list URL: any `?host=` already consumed must not linger.
-      window.history.replaceState(null, "", `${window.location.pathname}?view=hosts`);
-    }
-  }, []);
-
-  /**
    * `/?view=hosts` renders the All-hosts list. The server-rendered `/hosts` route
    * redirects here when the vault is end-to-end encrypted (it cannot read the list),
    * and any `?host=` / `?protocol=` on a one-machine link is left in place for the
@@ -2672,21 +2657,6 @@ export function SushiWorkspace() {
             Launchpad
           </button>
 
-          {/* One URL listing every host (SSH / SFTP / RDP merged). It is a view of
-              this workspace: only the browser can open the vault and read the names. */}
-          <button
-            type="button"
-            onClick={enterAllHostsView}
-            aria-pressed={allHostsView.enabled}
-            className={`flex shrink-0 items-center gap-1 rounded-t-xl border border-b-0 border-white/8 px-3 py-2 text-xs transition hover:bg-white/8 hover:text-white ${
-              allHostsView.enabled ? "bg-[#171d2b] text-white" : "text-slate-400"
-            }`}
-            title="Every host on one page, with SSH, SFTP and RDP side by side"
-          >
-            <Server className="h-3.5 w-3.5" />
-            All hosts
-          </button>
-
           {/* Active Session Tabs */}
           {tabs.map((tab) => {
             const active = activeTabId === tab.id;
@@ -3608,13 +3578,6 @@ export function SushiWorkspace() {
                     className="rounded-lg border border-white/10 px-2.5 py-1.5 text-slate-300 hover:bg-white/8"
                   >
                     Show quick connect
-                  </button>
-                  <button
-                    type="button"
-                    onClick={enterAllHostsView}
-                    className="rounded-lg border border-white/10 px-2.5 py-1.5 text-slate-300 hover:bg-white/8"
-                  >
-                    All hosts &amp; API →
                   </button>
                 </div>
               </div>

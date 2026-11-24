@@ -308,6 +308,15 @@ export function SushiWorkspace() {
   }, []);
 
   const [tabs, setTabs] = useState<SessionTab[]>([]);
+  const [sshTabFolders, setSshTabFolders] = useState<Array<{ id: string; name: string; tabIds: string[] }>>(() => {
+    try {
+      if (typeof window === "undefined") return [];
+      const parsed = JSON.parse(localStorage.getItem("sushi.sshTabFolders") || "[]");
+      return Array.isArray(parsed) ? parsed.filter((item) => item && typeof item.id === "string" && typeof item.name === "string" && Array.isArray(item.tabIds)) : [];
+    } catch { return []; }
+  });
+  const [openSshFolderId, setOpenSshFolderId] = useState<string | null>(null);
+  const draggedSshTabIdRef = useRef<string | null>(null);
   const [broadcastCommand, setBroadcastCommand] = useState<{ id: number; command: string } | null>(null);
   const [activeTabId, setActiveTabId] = useState<string>("launchpad");
 
@@ -2187,7 +2196,51 @@ export function SushiWorkspace() {
     () => new Set(tabs.filter((tab) => tab.protocol === "ssh").map((tab) => unifiedHostKey(tab.profile))),
     [tabs]
   );
+  useEffect(() => {
+    try { localStorage.setItem("sushi.sshTabFolders", JSON.stringify(sshTabFolders)); } catch { /* optional organization preference */ }
+  }, [sshTabFolders]);
+  useEffect(() => {
+    if (!tabsHydratedRef.current) return;
+    const openIds = new Set(tabs.filter((tab) => tab.protocol === "ssh").map((tab) => tab.id));
+    setSshTabFolders((previous) => previous
+      .map((folder) => ({ ...folder, tabIds: folder.tabIds.filter((id) => openIds.has(id)) }))
+      .filter((folder) => folder.tabIds.length > 1));
+  }, [tabs]);
+  const tabBarItems = useMemo(() => {
+    const items: Array<{ kind: "tab"; tab: SessionTab } | { kind: "folder"; folder: (typeof sshTabFolders)[number] }> = [];
+    const consumed = new Set<string>();
+    for (const tab of tabs) {
+      if (consumed.has(tab.id)) continue;
+      const folder = sshTabFolders.find((item) => item.tabIds.includes(tab.id));
+      if (!folder) {
+        items.push({ kind: "tab", tab });
+        continue;
+      }
+      const validIds = new Set(folder.tabIds);
+      const members = tabs.filter((candidate) => validIds.has(candidate.id) && candidate.protocol === "ssh");
+      if (members.length < 2) {
+        items.push({ kind: "tab", tab });
+        continue;
+      }
+      members.forEach((member) => consumed.add(member.id));
+      items.push({ kind: "folder", folder: { ...folder, tabIds: members.map((member) => member.id) } });
+    }
+    return items;
+  }, [sshTabFolders, tabs]);
   unifiedHostsRef.current = unifiedHosts;
+
+  const createHostFolder = useCallback(async (entries: UnifiedHost[], folderName: string) => {
+    const keys = new Set(entries.map((entry) => unifiedHostKey({ host: entry.host, username: entry.username })));
+    const nextHosts = hosts.map((host) =>
+      keys.has(unifiedHostKey(host)) ? { ...host, group: folderName } : host
+    );
+    try {
+      const saved = await persistVault(nextHosts, snippets);
+      setHosts(saved.hosts);
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : "Could not move these hosts into a folder.");
+    }
+  }, [hosts, persistVault, snippets]);
 
   /**
    * One click on a merged host opens the protocol you picked (or the best one): an
@@ -2339,6 +2392,40 @@ export function SushiWorkspace() {
     );
   }
 
+  const handleDropSshTabOnTab = (event: React.DragEvent<HTMLDivElement>, targetTabId: string) => {
+    event.preventDefault();
+    const sourceId = event.dataTransfer.getData("text/plain") || draggedSshTabIdRef.current;
+    if (!sourceId || sourceId === targetTabId) return;
+    const sourceTab = tabsRef.current.find((tab) => tab.id === sourceId && tab.protocol === "ssh");
+    const targetTab = tabsRef.current.find((tab) => tab.id === targetTabId && tab.protocol === "ssh");
+    if (!sourceTab || !targetTab) return;
+    const folderName = window.prompt("Name this SSH folder:", "");
+    if (!folderName?.trim()) return;
+    const absorbed = sshTabFolders.filter((folder) => folder.tabIds.includes(sourceId) || folder.tabIds.includes(targetTabId));
+    const memberIds = new Set([sourceId, targetTabId, ...absorbed.flatMap((folder) => folder.tabIds)]);
+    setSshTabFolders((previous) => [
+      ...previous.filter((folder) => !absorbed.some((item) => item.id === folder.id)),
+      { id: `ssh-folder-${randomUUID()}`, name: folderName.trim(), tabIds: [...memberIds] },
+    ]);
+    draggedSshTabIdRef.current = null;
+  };
+
+  const handleDropSshTabOnFolder = (event: React.DragEvent<HTMLDivElement>, folderId: string) => {
+    event.preventDefault();
+    const sourceId = event.dataTransfer.getData("text/plain") || draggedSshTabIdRef.current;
+    if (!sourceId || !tabsRef.current.some((tab) => tab.id === sourceId && tab.protocol === "ssh")) return;
+    setSshTabFolders((previous) => {
+      const target = previous.find((folder) => folder.id === folderId);
+      if (!target || target.tabIds.includes(sourceId)) return previous;
+      const sourceFolder = previous.find((folder) => folder.id !== folderId && folder.tabIds.includes(sourceId));
+      const members = new Set([...target.tabIds, sourceId, ...(sourceFolder?.tabIds ?? [])]);
+      return previous.filter((folder) => folder.id !== sourceFolder?.id).map((folder) =>
+        folder.id === folderId ? { ...folder, tabIds: [...members] } : folder
+      );
+    });
+    draggedSshTabIdRef.current = null;
+  };
+
   return (
     <div className="flex h-full w-full overflow-hidden bg-[#090b10] text-slate-100">
       {/* Mobile navigation overlays the workspace; the desktop sidebar remains collapsible. */}
@@ -2446,6 +2533,7 @@ export function SushiWorkspace() {
                   onOpen={(entry, protocol) => openUnifiedHost(entry, protocol)}
                   onEdit={handleEditHost}
                   activeSshHostKeys={activeSshHostKeys}
+                  onCreateFolder={createHostFolder}
                 />
               </div>
             </>
@@ -2460,6 +2548,7 @@ export function SushiWorkspace() {
               onOpen={(entry, protocol) => openUnifiedHost(entry, protocol)}
               onEdit={handleEditHost}
               activeSshHostKeys={activeSshHostKeys}
+              onCreateFolder={createHostFolder}
               onNewHost={() => {
                 setEditingProfile(null);
                 setHostModalIntent(null);
@@ -2633,7 +2722,58 @@ export function SushiWorkspace() {
           </button>
 
           {/* Active Session Tabs */}
-          {tabs.map((tab) => {
+          {tabBarItems.map((item) => {
+            if (item.kind === "folder") {
+              const folder = item.folder;
+              const members = tabs.filter((candidate) => folder.tabIds.includes(candidate.id));
+              const selected = members.find((candidate) => candidate.id === activeTabId) ?? members[0];
+              return (
+                <div
+                  key={folder.id}
+                  className="relative shrink-0"
+                  onDragOver={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = "move"; }}
+                  onDrop={(event) => handleDropSshTabOnFolder(event, folder.id)}
+                >
+                  <button
+                    type="button"
+                    onClick={() => selected && selectActiveTab(selected.id)}
+                    onContextMenu={(event) => {
+                      event.preventDefault();
+                      const nextName = window.prompt("Rename SSH folder:", folder.name);
+                      if (nextName?.trim()) setSshTabFolders((previous) => previous.map((item) => item.id === folder.id ? { ...item, name: nextName.trim() } : item));
+                    }}
+                    className={`flex items-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-xs transition ${members.some((candidate) => candidate.id === activeTabId) ? "border-[#ff6b57]/35 bg-[#171d2b] text-white" : "border-white/8 text-slate-300 hover:bg-white/[0.04]"}`}
+                    title={`${folder.name}: ${members.map((member) => member.title).join(", ")} · right-click to rename`}
+                  >
+                    <FolderKanban className="h-3.5 w-3.5 text-amber-300" />
+                    <span className="max-w-24 truncate">{folder.name}</span>
+                    <span className="rounded bg-white/10 px-1 text-[10px]">{members.length}</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setOpenSshFolderId((current) => current === folder.id ? null : folder.id)}
+                    className="absolute -right-1 -top-1 z-10 h-3.5 w-3.5 rounded-full bg-[#222a38] text-[9px] leading-none text-slate-300 hover:bg-[#ff6b57]"
+                    aria-label={`Show ${folder.name} sessions`}
+                  >
+                    ▾
+                  </button>
+                  {openSshFolderId === folder.id && (
+                    <div className="absolute left-0 top-full z-50 mt-1 min-w-44 rounded-xl border border-white/12 bg-[#151b26] p-1.5 shadow-xl">
+                      <div className="flex items-center justify-between px-2 py-1 text-[10px] font-semibold uppercase tracking-wide text-slate-500">
+                        <span>{folder.name}</span>
+                        <button type="button" onClick={() => setSshTabFolders((previous) => previous.filter((item) => item.id !== folder.id))} className="text-slate-400 hover:text-white" title="Ungroup sessions">Ungroup</button>
+                      </div>
+                      {members.map((member) => (
+                        <button key={member.id} type="button" onClick={() => { selectActiveTab(member.id); setOpenSshFolderId(null); }} className={`block w-full truncate rounded-lg px-2 py-1.5 text-left text-xs ${activeTabId === member.id ? "bg-white/10 text-white" : "text-slate-300 hover:bg-white/6"}`}>
+                          {member.title}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              );
+            }
+            const tab = item.tab;
             const active = activeTabId === tab.id;
             const Icon =
               tab.protocol === "rdp"
@@ -2651,6 +2791,19 @@ export function SushiWorkspace() {
             return (
               <div
                 key={tab.id}
+                draggable={tab.protocol === "ssh"}
+                onDragStart={(event) => {
+                  if (tab.protocol !== "ssh") return;
+                  draggedSshTabIdRef.current = tab.id;
+                  event.dataTransfer.setData("text/plain", tab.id);
+                  event.dataTransfer.effectAllowed = "move";
+                }}
+                onDragEnd={() => { draggedSshTabIdRef.current = null; }}
+                onDragOver={(event) => {
+                  if (tab.protocol === "ssh") { event.preventDefault(); event.dataTransfer.dropEffect = "move"; }
+                }}
+                onDrop={(event) => { if (tab.protocol === "ssh") handleDropSshTabOnTab(event, tab.id); }}
+                title={tab.protocol === "ssh" ? "Drag onto another SSH tab to create a folder" : undefined}
                 className={`group flex max-w-[220px] shrink-0 items-center gap-2 rounded-lg border px-3 py-1.5 text-xs transition ${
                   active
                     ? "border-white/12 bg-[#171d2b] text-white"

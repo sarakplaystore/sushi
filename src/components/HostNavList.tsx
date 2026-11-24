@@ -46,6 +46,8 @@ export interface HostNavListProps {
   onNewHost?: () => void;
   /** Machine keys for SSH sessions currently open in workspace tabs. */
   activeSshHostKeys?: ReadonlySet<string>;
+  /** Groups dragged hosts into a named folder in the vault. */
+  onCreateFolder?: (entries: UnifiedHost[], folderName: string) => void;
   /** A dense variant for the drawer, a roomier one for a full screen. */
   variant?: "drawer" | "page";
 }
@@ -63,6 +65,7 @@ export function HostNavList({
   onEdit,
   onNewHost,
   activeSshHostKeys,
+  onCreateFolder,
   variant = "drawer",
 }: HostNavListProps) {
   const localSearchRef = useRef<HTMLInputElement | null>(null);
@@ -190,6 +193,8 @@ export function HostNavList({
                   onOpen={onOpen}
                   onEdit={onEdit}
                   activeSsh={Boolean(activeSshHostKeys?.has(unifiedHostKey({ host: entry.host, username: entry.username })))}
+                  onCreateFolder={onCreateFolder}
+                  allHosts={hosts}
                 />
               ))}
             </div>
@@ -206,12 +211,16 @@ function HostRow({
   onOpen,
   onEdit,
   activeSsh,
+  onCreateFolder,
+  allHosts,
 }: {
   entry: UnifiedHost;
   roomy: boolean;
   onOpen: HostNavListProps["onOpen"];
   onEdit: HostNavListProps["onEdit"];
   activeSsh: boolean;
+  onCreateFolder?: HostNavListProps["onCreateFolder"];
+  allHosts: UnifiedHost[];
 }) {
   const ProtoIcon = entry.protocols.rdp
     ? Monitor
@@ -223,7 +232,31 @@ function HostRow({
   const machineHasManyProfiles = Object.values(entry.protocols).filter(Boolean).length > 1;
 
   return (
-    <div className="group flex min-w-0 items-center gap-1 rounded-xl px-2 py-1.5 transition hover:bg-white/[0.06]">
+    <div
+      draggable={Boolean(onCreateFolder)}
+      onDragStart={(event) => {
+        if (!onCreateFolder) return;
+        event.dataTransfer.setData("text/plain", entry.id);
+        event.dataTransfer.effectAllowed = "move";
+      }}
+      onDragOver={(event) => {
+        if (onCreateFolder) {
+          event.preventDefault();
+          event.dataTransfer.dropEffect = "move";
+        }
+      }}
+      onDrop={(event) => {
+        if (!onCreateFolder) return;
+        event.preventDefault();
+        const sourceId = event.dataTransfer.getData("text/plain");
+        const source = allHosts.find((host) => host.id === sourceId);
+        if (!source || source.id === entry.id) return;
+        const folderName = window.prompt(`Create a folder for ${source.name} and ${entry.name}:`, "");
+        if (folderName?.trim()) onCreateFolder([source, entry], folderName.trim());
+      }}
+      title={onCreateFolder ? "Drag onto another host to create a folder" : undefined}
+      className="group flex min-w-0 items-center gap-1 rounded-xl px-2 py-1.5 transition hover:bg-white/[0.06]"
+    >
       <button
         type="button"
         onClick={() => onOpen(entry)}

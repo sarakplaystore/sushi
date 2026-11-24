@@ -2470,17 +2470,6 @@ export function SushiWorkspace() {
               <button
                 type="button"
                 onClick={() => {
-                  const command = window.prompt("Command to run in all open SSH sessions:");
-                  if (command?.trim()) setBroadcastCommand({ id: Date.now(), command: command.trim() });
-                }}
-                className="flex w-full items-center gap-2 rounded-lg border border-[#ff6b57]/25 bg-[#ff6b57]/8 px-2.5 py-2 text-left text-xs font-medium text-[#ff9a8b] hover:bg-[#ff6b57]/15"
-                title="Run a command in every open SSH terminal"
-              >
-                <Terminal className="h-3.5 w-3.5" /> Run command on all
-              </button>
-              <button
-                type="button"
-                onClick={() => {
                   const sshTabs = tabsRef.current.filter((tab) => tab.protocol === "ssh");
                   if (sshTabs.length === 0) return;
                   if (!window.confirm(`Close all ${sshTabs.length} open SSH session${sshTabs.length === 1 ? "" : "s"}? Running commands may be stopped unless the session is retained.`)) return;
@@ -3613,6 +3602,10 @@ export function SushiWorkspace() {
                     onStopHostRuns={() => clearHostResumableRuns(tab.profile)}
                     resumeRun={tabResumes[tab.id] ?? null}
                     broadcastCommand={broadcastCommand}
+                    onBroadcastCommand={() => {
+                      const command = window.prompt("Command to run in all open SSH sessions:");
+                      if (command?.trim()) setBroadcastCommand({ id: Date.now(), command: command.trim() });
+                    }}
                   />
                 )}
                 {tab.protocol === "sftp" && (

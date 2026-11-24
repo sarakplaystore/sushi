@@ -157,7 +157,8 @@ interface SshTerminalSessionProps {
    */
   resumeRun?: ResumableRun | null;
   broadcastCommand?: { id: number; command: string } | null;
-  onBroadcastCommand: () => void;
+  onBroadcastCommand?: () => void;
+  onCheckAllSshStatus?: () => void;
 }
 
 const TERMINAL_THEMES: Record<
@@ -242,6 +243,7 @@ export function SshTerminalSession({
   resumeRun,
   broadcastCommand,
   onBroadcastCommand,
+  onCheckAllSshStatus,
 }: SshTerminalSessionProps) {
   const [stoppingBg, setStoppingBg] = useState(false);
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -3232,12 +3234,22 @@ export function SshTerminalSession({
 
           <button
             type="button"
-            onClick={onBroadcastCommand}
+            onClick={() => onBroadcastCommand?.()}
             className="flex items-center gap-1 rounded-lg border border-[#ff6b57]/30 bg-[#ff6b57]/10 px-2.5 py-1 text-xs text-[#ff9a8b] transition hover:bg-[#ff6b57]/20"
             title="Run a command in every open SSH terminal"
           >
-            <Terminal className="h-3.5 w-3.5" />
+            <Cpu className="h-3.5 w-3.5" />
             <span className="hidden sm:inline">Broadcast command</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => onCheckAllSshStatus?.()}
+            className="flex items-center gap-1 rounded-lg border border-sky-500/30 bg-sky-500/10 px-2.5 py-1 text-xs text-sky-200 transition hover:bg-sky-500/20"
+            title="Check OS, kernel, CPU, RAM, disk space and uptime on every open SSH session"
+          >
+            <Cpu className="h-3.5 w-3.5" />
+            <span className="hidden sm:inline">Check status</span>
           </button>
 
           {/* Reconnect */}

@@ -3606,6 +3606,10 @@ export function SushiWorkspace() {
                       const command = window.prompt("Command to run in all open SSH sessions:");
                       if (command?.trim()) setBroadcastCommand({ id: Date.now(), command: command.trim() });
                     }}
+                    onCheckAllSshStatus={() => setBroadcastCommand({
+                      id: Date.now(),
+                      command: "printf '\\n--- BASIC HOST STATUS ---\\n'; printf 'Host: '; hostname; printf '\\nOS: '; (grep -m1 '^PRETTY_NAME=' /etc/os-release 2>/dev/null || uname -s); printf 'Kernel: '; uname -r; printf 'Architecture: '; uname -m; printf '\\nUptime: '; uptime; printf 'CPU cores: '; (nproc 2>/dev/null || getconf _NPROCESSORS_ONLN); printf '\\nRAM:\\n'; (free -h 2>/dev/null || head -5 /proc/meminfo); printf '\\nDisk space (/):\\n'; df -hP /"
+                    })}
                   />
                 )}
                 {tab.protocol === "sftp" && (

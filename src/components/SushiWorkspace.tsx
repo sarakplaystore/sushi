@@ -81,6 +81,7 @@ import {
   openableProtocols,
   parseHostDeepLink,
   resolveHostDeepLink,
+  unifiedHostKey,
 } from "@/lib/client/unified-hosts";
 import { workspaceDeepLinkFromSearch } from "@/lib/client/all-hosts";
 import {
@@ -2182,6 +2183,10 @@ export function SushiWorkspace() {
    * The vault itself is untouched: edit/delete still act on the real profiles.
    */
   const unifiedHosts = useMemo(() => mergeHosts(hosts), [hosts]);
+  const activeSshHostKeys = useMemo(
+    () => new Set(tabs.filter((tab) => tab.protocol === "ssh").map((tab) => unifiedHostKey(tab.profile))),
+    [tabs]
+  );
   unifiedHostsRef.current = unifiedHosts;
 
   /**
@@ -2440,6 +2445,7 @@ export function SushiWorkspace() {
                   onSearchChange={setHostSearch}
                   onOpen={(entry, protocol) => openUnifiedHost(entry, protocol)}
                   onEdit={handleEditHost}
+                  activeSshHostKeys={activeSshHostKeys}
                 />
               </div>
             </>
@@ -2453,6 +2459,7 @@ export function SushiWorkspace() {
               searchInputRef={searchInputRef}
               onOpen={(entry, protocol) => openUnifiedHost(entry, protocol)}
               onEdit={handleEditHost}
+              activeSshHostKeys={activeSshHostKeys}
               onNewHost={() => {
                 setEditingProfile(null);
                 setHostModalIntent(null);

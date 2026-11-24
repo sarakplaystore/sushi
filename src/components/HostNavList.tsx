@@ -17,6 +17,7 @@ import {
   filterUnifiedHostsByProtocol,
   groupUnifiedHosts,
   openableProtocols,
+  unifiedHostKey,
 } from "@/lib/client/unified-hosts";
 
 /**
@@ -43,6 +44,8 @@ export interface HostNavListProps {
   onEdit: (entry: UnifiedHost) => void;
   /** Opens the "new connection" dialog (shown next to search). */
   onNewHost?: () => void;
+  /** Machine keys for SSH sessions currently open in workspace tabs. */
+  activeSshHostKeys?: ReadonlySet<string>;
   /** A dense variant for the drawer, a roomier one for a full screen. */
   variant?: "drawer" | "page";
 }
@@ -59,6 +62,7 @@ export function HostNavList({
   onOpen,
   onEdit,
   onNewHost,
+  activeSshHostKeys,
   variant = "drawer",
 }: HostNavListProps) {
   const localSearchRef = useRef<HTMLInputElement | null>(null);
@@ -185,6 +189,7 @@ export function HostNavList({
                   roomy={roomy}
                   onOpen={onOpen}
                   onEdit={onEdit}
+                  activeSsh={Boolean(activeSshHostKeys?.has(unifiedHostKey({ host: entry.host, username: entry.username })))}
                 />
               ))}
             </div>
@@ -200,11 +205,13 @@ function HostRow({
   roomy,
   onOpen,
   onEdit,
+  activeSsh,
 }: {
   entry: UnifiedHost;
   roomy: boolean;
   onOpen: HostNavListProps["onOpen"];
   onEdit: HostNavListProps["onEdit"];
+  activeSsh: boolean;
 }) {
   const ProtoIcon = entry.protocols.rdp
     ? Monitor
@@ -241,11 +248,16 @@ function HostRow({
               {protocols.map((protocol) => (
                 <span
                   key={protocol}
-                  className="rounded bg-white/8 px-1 text-[9px] font-semibold uppercase text-slate-400"
-                  title={`${protocol.toUpperCase()} · ${
-                    entry.ports[protocol] ?? (protocol === "rdp" ? 3389 : 22)
+                  className={`inline-flex items-center gap-0.5 rounded px-1 text-[9px] font-semibold uppercase ${
+                    protocol === "ssh" && activeSsh
+                      ? "bg-emerald-500/20 text-emerald-300"
+                      : "bg-white/8 text-slate-400"
                   }`}
+                  title={protocol === "ssh" && activeSsh
+                    ? "SSH session open"
+                    : `${protocol.toUpperCase()} · ${entry.ports[protocol] ?? (protocol === "rdp" ? 3389 : 22)}`}
                 >
+                  {protocol === "ssh" && activeSsh && <span aria-hidden="true" className="h-1.5 w-1.5 rounded-full bg-emerald-400" />}
                   {protocol}
                 </span>
               ))}

@@ -156,6 +156,7 @@ interface SshTerminalSessionProps {
    * delivered to the run that is already going.
    */
   resumeRun?: ResumableRun | null;
+  broadcastCommand?: { id: number; command: string } | null;
 }
 
 const TERMINAL_THEMES: Record<
@@ -238,6 +239,7 @@ export function SshTerminalSession({
   onRunChange,
   onStopHostRuns,
   resumeRun,
+  broadcastCommand,
 }: SshTerminalSessionProps) {
   const [stoppingBg, setStoppingBg] = useState(false);
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -2703,6 +2705,13 @@ export function SshTerminalSession({
       void runServerlessCommand(cmd);
     }
   };
+
+  const lastBroadcastIdRef = useRef(0);
+  useEffect(() => {
+    if (!broadcastCommand || broadcastCommand.id === lastBroadcastIdRef.current) return;
+    lastBroadcastIdRef.current = broadcastCommand.id;
+    executeSnippet(broadcastCommand.command);
+  }, [broadcastCommand]);
 
   const handleStopBackgroundProcesses = async () => {
     if (stoppingBg) return;

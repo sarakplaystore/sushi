@@ -34,6 +34,7 @@ import {
   Infinity as InfinityIcon,
   Square,
   Heart,
+  Trash2,
 } from "lucide-react";
 import type { AuthStatusResponse, AuthStorageProblem } from "@/types/auth";
 import type {
@@ -1737,7 +1738,7 @@ export function SushiWorkspace() {
     [hosts]
   );
 
-  const closeSessionTab = (tabId: string, e?: React.MouseEvent) => {
+  const closeSessionTab = (tabId: string, e?: React.MouseEvent, skipSshConfirmation = false) => {
     e?.stopPropagation();
     const tab = tabsRef.current.find((item) => item.id === tabId);
     const savedPty = loadRetainedPtys().find((entry) => entry.tabId === tabId);
@@ -1745,7 +1746,7 @@ export function SushiWorkspace() {
     const isWs = safety ? safety.transport === "ws" || Boolean(savedPty) : Boolean(effectiveWsSsh || gatewaySettings.gatewayUrl.trim() || savedPty);
     const confirmed = Boolean(savedPty && tab && safety?.confirmedSessionId === savedPty.sessionId &&
       retainedPtyMatches(savedPty, gatewaySettings.gatewayUrl, tab.profile));
-    if (tab?.protocol === "ssh" && isWs && !confirmed &&
+    if (!skipSshConfirmation && tab?.protocol === "ssh" && isWs && !confirmed &&
         !window.confirm("This terminal is not confirmed as saved for reattachment. Closing it may stop its running command. Close it anyway?")) return;
     // A confirmed retained PTY stays in local history; serverless run history uses
     // its own mechanism. Closing an ordinary unretained WS shell ends that shell.
@@ -1764,9 +1765,11 @@ export function SushiWorkspace() {
     const prev = tabsRef.current;
     const idx = prev.findIndex((t) => t.id === tabId);
     const next = prev.filter((t) => t.id !== tabId);
+    tabsRef.current = next;
     let nextActive = activeTabIdRef.current;
     if (activeTabIdRef.current === tabId) {
       nextActive = next.length === 0 ? "launchpad" : next[Math.max(0, idx - 1)].id;
+      activeTabIdRef.current = nextActive;
       setActiveTabId(nextActive);
     }
     setTabs(next);
@@ -2475,6 +2478,37 @@ export function SushiWorkspace() {
             />
           )}
 
+          {/* SSH-wide actions live with the connection list rather than the tab strip. */}
+          {tabs.some((tab) => tab.protocol === "ssh") && (
+            <div className="shrink-0 space-y-1.5 border-t border-white/8 p-3">
+              <div className="px-1 text-[10px] font-semibold uppercase tracking-wider text-slate-500">Open SSH sessions</div>
+              <button
+                type="button"
+                onClick={() => {
+                  const command = window.prompt("Command to run in all open SSH sessions:");
+                  if (command?.trim()) setBroadcastCommand({ id: Date.now(), command: command.trim() });
+                }}
+                className="flex w-full items-center gap-2 rounded-lg border border-[#ff6b57]/25 bg-[#ff6b57]/8 px-2.5 py-2 text-left text-xs font-medium text-[#ff9a8b] hover:bg-[#ff6b57]/15"
+                title="Run a command in every open SSH terminal"
+              >
+                <Terminal className="h-3.5 w-3.5" /> Run command on all
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  const sshTabs = tabsRef.current.filter((tab) => tab.protocol === "ssh");
+                  if (sshTabs.length === 0) return;
+                  if (!window.confirm(`Close all ${sshTabs.length} open SSH session${sshTabs.length === 1 ? "" : "s"}? Running commands may be stopped unless the session is retained.`)) return;
+                  sshTabs.forEach((tab) => closeSessionTab(tab.id, undefined, true));
+                }}
+                className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-xs text-slate-300 hover:bg-white/8 hover:text-white"
+                title="Close all open SSH terminal sessions"
+              >
+                <Trash2 className="h-3.5 w-3.5 text-slate-400" /> Close all SSH
+              </button>
+            </div>
+          )}
+
           {/* Sidebar Bottom Controls */}
           <div className="shrink-0 space-y-1.5 border-t border-white/8 p-3">
             <button
@@ -2652,21 +2686,6 @@ export function SushiWorkspace() {
             <Server className="h-3.5 w-3.5" />
             All hosts
           </button>
-
-          {/* Run one command in every currently open SSH terminal. */}
-          {tabs.some((tab) => tab.protocol === "ssh") && (
-            <button
-              type="button"
-              onClick={() => {
-                const command = window.prompt("Command to run in all open SSH sessions:");
-                if (command?.trim()) setBroadcastCommand({ id: Date.now(), command: command.trim() });
-              }}
-              className="ml-auto flex shrink-0 items-center gap-1.5 rounded-lg border border-[#ff6b57]/30 bg-[#ff6b57]/10 px-2.5 py-1.5 text-[11px] font-medium text-[#ff9a8b] hover:bg-[#ff6b57]/20"
-              title="Run a command in every open SSH terminal"
-            >
-              <Terminal className="h-3.5 w-3.5" /> Run on all SSH
-            </button>
-          )}
 
           {/* Active Session Tabs */}
           {tabs.map((tab) => {

@@ -3599,7 +3599,6 @@ export function SushiWorkspace() {
                     onPtySafetyChange={handlePtySafetyChange}
                     onConnected={() => handleSessionConnected(tab.profile, tab.profile.id)}
                     onRunChange={(run) => handleRunUpdated(run, tab.id)}
-                    onStopHostRuns={() => clearHostResumableRuns(tab.profile)}
                     resumeRun={tabResumes[tab.id] ?? null}
                     broadcastCommand={broadcastCommand}
                     onBroadcastCommand={() => {

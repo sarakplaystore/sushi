@@ -322,6 +322,7 @@ export function SushiWorkspace() {
   }, []);
 
   const [tabs, setTabs] = useState<SessionTab[]>([]);
+  const [broadcastCommand, setBroadcastCommand] = useState<{ id: number; command: string } | null>(null);
   const [activeTabId, setActiveTabId] = useState<string>("launchpad");
 
   // ---------------------------------------------------------------------------
@@ -2652,6 +2653,21 @@ export function SushiWorkspace() {
             All hosts
           </button>
 
+          {/* Run one command in every currently open SSH terminal. */}
+          {tabs.some((tab) => tab.protocol === "ssh") && (
+            <button
+              type="button"
+              onClick={() => {
+                const command = window.prompt("Command to run in all open SSH sessions:");
+                if (command?.trim()) setBroadcastCommand({ id: Date.now(), command: command.trim() });
+              }}
+              className="ml-auto flex shrink-0 items-center gap-1.5 rounded-lg border border-[#ff6b57]/30 bg-[#ff6b57]/10 px-2.5 py-1.5 text-[11px] font-medium text-[#ff9a8b] hover:bg-[#ff6b57]/20"
+              title="Run a command in every open SSH terminal"
+            >
+              <Terminal className="h-3.5 w-3.5" /> Run on all SSH
+            </button>
+          )}
+
           {/* Active Session Tabs */}
           {tabs.map((tab) => {
             const active = activeTabId === tab.id;
@@ -3614,6 +3630,7 @@ export function SushiWorkspace() {
                     onRunChange={(run) => handleRunUpdated(run, tab.id)}
                     onStopHostRuns={() => clearHostResumableRuns(tab.profile)}
                     resumeRun={tabResumes[tab.id] ?? null}
+                    broadcastCommand={broadcastCommand}
                   />
                 )}
                 {tab.protocol === "sftp" && (

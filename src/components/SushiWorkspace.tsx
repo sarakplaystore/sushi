@@ -26,7 +26,6 @@ import {
   HardDriveDownload,
   RefreshCw,
   ChevronUp,
-  ChevronDown,
   AlertCircle,
   ShieldAlert,
   Clock,
@@ -317,7 +316,6 @@ export function SushiWorkspace() {
     } catch { return []; }
   });
   const [openSshFolderId, setOpenSshFolderId] = useState<string | null>(null);
-  const [sshSidebarExpanded, setSshSidebarExpanded] = useState(true);
   const draggedSshTabIdRef = useRef<string | null>(null);
   const [broadcastCommand, setBroadcastCommand] = useState<{ id: number; command: string } | null>(null);
   const [activeTabId, setActiveTabId] = useState<string>("launchpad");
@@ -2558,41 +2556,6 @@ export function SushiWorkspace() {
                 setMobileSidebarOpen(false);
               }}
             />
-          )}
-
-          {tabs.some((tab) => tab.protocol === "ssh") && (
-            <section className="shrink-0 border-t border-white/8 px-3 py-2">
-              <button
-                type="button"
-                onClick={() => setSshSidebarExpanded((expanded) => !expanded)}
-                aria-expanded={sshSidebarExpanded}
-                className="flex w-full items-center justify-between rounded-lg px-1 py-1.5 text-left text-[10px] font-semibold uppercase tracking-wider text-slate-500 hover:text-slate-300"
-              >
-                <span className="flex items-center gap-2">
-                  Open SSH sessions
-                  <span className="rounded bg-white/8 px-1.5 py-0.5 text-[9px] text-slate-400">{tabs.filter((tab) => tab.protocol === "ssh").length}</span>
-                </span>
-                <ChevronDown className={`h-4 w-4 transition-transform ${sshSidebarExpanded ? "rotate-180" : ""}`} aria-hidden="true" />
-              </button>
-              {sshSidebarExpanded && (
-                <div className="mt-1 max-h-36 space-y-0.5 overflow-y-auto">
-                  {tabs.filter((tab) => tab.protocol === "ssh").map((tab) => (
-                    <button
-                      key={tab.id}
-                      type="button"
-                      onClick={() => { selectActiveTab(tab.id); setMobileSidebarOpen(false); }}
-                      aria-current={activeTabId === tab.id ? "page" : undefined}
-                      className={`flex w-full min-w-0 items-center gap-2 rounded-lg px-2 py-1.5 text-left text-xs transition ${activeTabId === tab.id ? "bg-white/8 text-white" : "text-slate-400 hover:bg-white/[0.04] hover:text-slate-200"}`}
-                      title={`Switch to ${tab.title}`}
-                    >
-                      <Terminal className="h-3.5 w-3.5 shrink-0 text-emerald-400" />
-                      <span className="truncate">{tab.title}</span>
-                      {activeTabId === tab.id && <span className="ml-auto h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-400" aria-label="Active session" />}
-                    </button>
-                  ))}
-                </div>
-              )}
-            </section>
           )}
 
           {/* Sidebar Bottom Controls */}

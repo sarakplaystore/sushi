@@ -34,7 +34,6 @@ import {
   Infinity as InfinityIcon,
   Square,
   Heart,
-  Trash2,
 } from "lucide-react";
 import type { AuthStatusResponse, AuthStorageProblem } from "@/types/auth";
 import type {
@@ -2463,26 +2462,6 @@ export function SushiWorkspace() {
             />
           )}
 
-          {/* SSH-wide actions live with the connection list rather than the tab strip. */}
-          {tabs.some((tab) => tab.protocol === "ssh") && (
-            <div className="shrink-0 space-y-1.5 border-t border-white/8 p-3">
-              <div className="px-1 text-[10px] font-semibold uppercase tracking-wider text-slate-500">Open SSH sessions</div>
-              <button
-                type="button"
-                onClick={() => {
-                  const sshTabs = tabsRef.current.filter((tab) => tab.protocol === "ssh");
-                  if (sshTabs.length === 0) return;
-                  if (!window.confirm(`Close all ${sshTabs.length} open SSH session${sshTabs.length === 1 ? "" : "s"}? Running commands may be stopped unless the session is retained.`)) return;
-                  sshTabs.forEach((tab) => closeSessionTab(tab.id, undefined, true));
-                }}
-                className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-xs text-slate-300 hover:bg-white/8 hover:text-white"
-                title="Close all open SSH terminal sessions"
-              >
-                <Trash2 className="h-3.5 w-3.5 text-slate-400" /> Close all SSH
-              </button>
-            </div>
-          )}
-
           {/* Sidebar Bottom Controls */}
           <div className="shrink-0 space-y-1.5 border-t border-white/8 p-3">
             <button
@@ -3609,6 +3588,12 @@ export function SushiWorkspace() {
                       id: Date.now(),
                       command: "printf '\\n--- BASIC HOST STATUS ---\\n'; printf 'Host: '; hostname; printf '\\nOS: '; (grep -m1 '^PRETTY_NAME=' /etc/os-release 2>/dev/null || uname -s); printf 'Kernel: '; uname -r; printf 'Architecture: '; uname -m; printf '\\nUptime: '; uptime; printf 'CPU cores: '; (nproc 2>/dev/null || getconf _NPROCESSORS_ONLN); printf '\\nRAM:\\n'; (free -h 2>/dev/null || head -5 /proc/meminfo); printf '\\nDisk space (/):\\n'; df -hP /"
                     })}
+                    onCloseAllSsh={() => {
+                      const sshTabs = tabsRef.current.filter((tab) => tab.protocol === "ssh");
+                      if (sshTabs.length === 0) return;
+                      if (!window.confirm(`Close all ${sshTabs.length} open SSH session${sshTabs.length === 1 ? "" : "s"}? Running commands may be stopped unless the session is retained.`)) return;
+                      sshTabs.forEach((tab) => closeSessionTab(tab.id, undefined, true));
+                    }}
                   />
                 )}
                 {tab.protocol === "sftp" && (

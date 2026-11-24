@@ -115,7 +115,7 @@ import {
   type SshConnectFailure,
 } from "@/lib/client/ssh-retry";
 import { SshConnectErrorCard } from "@/components/SshConnectErrorCard";
-import { fetchRunStatus, stopHostBackgroundProcesses } from "@/lib/client/run-status";
+import { fetchRunStatus } from "@/lib/client/run-status";
 import type { ResumableRun } from "@/lib/client/session-resume";
 import { TranslatePanel } from "@/components/TranslatePanel";
 
@@ -149,7 +149,6 @@ interface SshTerminalSessionProps {
    * Called after stopping all background SSH processes on this host so any
    * persisted resumable runs for this host are also cleared in the workspace.
    */
-  onStopHostRuns?: () => void;
   /**
    * A run to take over: the command line is replayed in the terminal and, when the
    * command is still alive on the host, its output log is redrawn and keystrokes are
@@ -239,13 +238,11 @@ export function SshTerminalSession({
   onPtySafetyChange,
   onConnected,
   onRunChange,
-  onStopHostRuns,
   resumeRun,
   broadcastCommand,
   onBroadcastCommand,
   onCheckAllSshStatus,
 }: SshTerminalSessionProps) {
-  const [stoppingBg, setStoppingBg] = useState(false);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<import("@xterm/xterm").Terminal | null>(null);
   const fitAddonRef = useRef<import("@xterm/addon-fit").FitAddon | null>(null);
@@ -355,17 +352,6 @@ export function SshTerminalSession({
       ptyControlTimerRef.current = null;
     }, 5000);
   }, [clearPtyControlTimer, sendShareControl]);
-
-  const togglePtyRetention = useCallback(() => {
-    if (!ptyCapability || !ptyReadyRef.current || ptyRetention === "pending") return;
-    const action = ptyRetention === "on" ? "disable" : "enable";
-    if (action === "disable" && !window.confirm(
-      "Turn off Keep running? Closing the last tab will end this private SSH terminal unless it is still shared."
-    )) return;
-    // A deliberate user choice must not be undone by a later capability probe.
-    autoRetentionAttemptedRef.current = true;
-    requestPtyRetention(action);
-  }, [ptyCapability, ptyRetention, requestPtyRetention]);
 
   // Capabilities can arrive after the socket has opened (for example after a
   // gateway retry). Apply them only to the gateway that owns this live PTY, and
@@ -2717,84 +2703,6 @@ export function SshTerminalSession({
     executeSnippet(broadcastCommand.command);
   }, [broadcastCommand]);
 
-  const handleStopBackgroundProcesses = async () => {
-    if (stoppingBg) return;
-    setStoppingBg(true);
-    try {
-      // Cancel any active command in this tab first.
-      if (execBusyRef.current) {
-        userCancelledExecRef.current = true;
-        try {
-          stdinRef.current?.sendSignal("INT");
-          stdinRef.current?.sendInput("\x03");
-          stdinRef.current?.close();
-        } catch {
-          // ignore
-        }
-        abortExecRef.current?.abort();
-      }
-      if (keyChannelRef.current) {
-        void sendKeyChannelInput(keyChannelRef.current, "\x03", gatewaySettings);
-      } else if (detachedRun) {
-        void sendKeyChannelInput(detachedRun, "\x03", gatewaySettings);
-      }
-
-      const result = await stopHostBackgroundProcesses(
-        {
-          host: profile.host,
-          port: profile.port,
-          username: profile.username,
-          authMethod: profile.authMethod,
-          password: profile.password,
-          privateKey: profile.privateKey,
-          passphrase: profile.passphrase,
-        },
-        gatewaySettings
-      );
-
-      setDetachedRun(null);
-      currentRunRef.current = null;
-      setCurrentRun(null);
-      setReattached(false);
-      setTrackingRun(false);
-      onRunChange?.(null);
-      onStopHostRuns?.();
-
-      const term = termRef.current;
-      if (term) {
-        if (!result.ok) {
-          term.write(
-            `\r\n\x1b[31m✗ Failed to stop background SSH processes: ${result.error || "connection error"}\x1b[0m\r\n`
-          );
-        } else if (result.stoppedCount > 0 || result.cleanedChannels > 0) {
-          const namesSuffix =
-            result.processes.length > 0
-              ? ` (${result.processes.join(", ")})`
-              : "";
-          term.write(
-            `\r\n\x1b[32m✓ Stopped ${result.stoppedCount} background SSH process${result.stoppedCount === 1 ? "" : "es"}${namesSuffix}.\x1b[0m`
-          );
-          if (modeRef.current === "serverless" && !execBusyRef.current) {
-            writePrompt(term);
-          } else {
-            term.write("\r\n");
-          }
-        } else {
-          term.write(
-            `\r\n\x1b[90m• No background SSH processes were running on ${profile.host}.\x1b[0m`
-          );
-          if (modeRef.current === "serverless" && !execBusyRef.current) {
-            writePrompt(term);
-          } else {
-            term.write("\r\n");
-          }
-        }
-        term.focus();
-      }
-    } finally {
-      setStoppingBg(false);
-    }
-  };
 
   return (
     <div
@@ -3166,7 +3074,7 @@ export function SshTerminalSession({
             <Trash2 className="h-3.5 w-3.5" />
           </button>
 
-          {/* Serverless runs and live PTYs have different persistence mechanisms. */}
+          {/* Keep the gateway PTY retained automatically where supported. */}
           {transportMode === "serverless" ? (
             <button
               type="button"
@@ -3186,51 +3094,13 @@ export function SshTerminalSession({
               <Infinity className="h-3.5 w-3.5" />
               <span className="hidden sm:inline">No timeout</span>
             </button>
-          ) : (
-            <>
-              <button
-                type="button"
-                onClick={togglePtyRetention}
-                disabled={!ptyCapability || status !== "connected" || ptyRetention === "pending"}
-                aria-pressed={ptyRetention === "on"}
-                className={`flex items-center gap-1 rounded-lg border px-2.5 py-1 text-xs transition disabled:cursor-not-allowed disabled:opacity-60 ${
-                  ptyRetention === "on"
-                    ? "border-emerald-500/40 bg-emerald-500/15 text-emerald-200 hover:bg-emerald-500/25"
-                    : "border-amber-500/35 bg-amber-500/10 text-amber-100 hover:bg-amber-500/20"
-                }`}
-                title={ptyCapability
-                  ? "Keep this private PTY on the gateway when the tab closes; click to change."
-                  : "This gateway does not advertise private terminal retention. Update it before relying on tab-close resume."}
-              >
-                {ptyRetention === "pending" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Infinity className="h-3.5 w-3.5" />}
-                <span>{ptyRetention === "on" ? "Keep running on" : ptyRetention === "pending" || ptyRetention === "checking" ? "Checking…" : ptyRetention === "unconfirmed" ? "Keep running unconfirmed" : "Keep running off"}</span>
-              </button>
-              {ptyCapability && status === "connected" && (
-                <button type="button" onClick={endPty}
-                  className="flex items-center gap-1 rounded-lg border border-rose-500/35 bg-rose-500/12 px-2.5 py-1 text-xs text-rose-200 hover:bg-rose-500/22"
-                  title="End this SSH terminal and disconnect anyone sharing it">
-                  <Square className="h-3 w-3 fill-current" /> End terminal
-                </button>
-              )}
-            </>
-          )}
-
-          {/* Stop all background SSH processes on this host */}
-          <button
-            type="button"
-            onClick={() => void handleStopBackgroundProcesses()}
-            disabled={stoppingBg}
-            className="flex items-center gap-1.5 rounded-lg border border-rose-500/35 bg-rose-500/12 px-2.5 py-1 text-xs font-medium text-rose-200 transition hover:bg-rose-500/22 disabled:opacity-50"
-            title="Stop all background SSH processes and detached commands on this host"
-          >
-            {stoppingBg ? (
-              <Loader2 className="h-3 w-3 animate-spin" />
-            ) : (
-              <Square className="h-3 w-3 fill-current" />
-            )}
-            <span className="hidden sm:inline">Stop Background</span>
-            <span className="sm:hidden">Stop BG</span>
-          </button>
+          ) : ptyCapability && status === "connected" ? (
+            <button type="button" onClick={endPty}
+              className="flex items-center gap-1 rounded-lg border border-rose-500/35 bg-rose-500/12 px-2.5 py-1 text-xs text-rose-200 hover:bg-rose-500/22"
+              title="End this SSH terminal and disconnect anyone sharing it">
+              <Square className="h-3 w-3 fill-current" /> End terminal
+            </button>
+          ) : null}
 
           <button
             type="button"
